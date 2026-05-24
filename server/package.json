@@ -1,0 +1,9 @@
+{
+  "name": "claudesurf-mcp",
+  "version": "1.0.0",
+  "description": "MCP server bridging Claude Code to Chrome via WebSocket",
+  "main": "server.js",
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}

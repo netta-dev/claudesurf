@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "ClaudeSurf",
+  "version": "1.0.0",
+  "description": "Lets Claude Code read and interact with your Chrome browser",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "tabs",
+    "alarms",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
