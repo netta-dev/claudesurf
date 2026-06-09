@@ -15,6 +15,11 @@ const connectedExtensions = new Set();
 const sessionBindings = new Map();
 const pendingRequests = new Map();
 let requestId = 0;
+// [debug] never pruned — lets us tell a brand-new sessionId (MCP respawn) from a
+// sessionId we've seen before that lost its binding (socket churn / profile change).
+const seenSessions = new Set();
+// [debug] stable short label per extension socket so logs can name profiles.
+let socketSeq = 0;
 
 function log(...args) {
   console.log('[ClaudeSurf daemon]', ...args);
@@ -56,15 +61,33 @@ async function pickProfileForSession() {
     throw new Error('All Chrome extension sockets closed during profile probe');
   }
   // Highest timestamp wins; first-connected breaks ties (reduce only swaps on strictly greater).
-  return live.reduce((best, r) => (r.ts > best.ts ? r : best)).socket;
+  const winner = live.reduce((best, r) => (r.ts > best.ts ? r : best)).socket;
+  // [debug] show every candidate's focus timestamp + which one won. If the winner
+  // differs from the session's previous profile, that's the "wrong window" path.
+  log('[debug] focus probe:', live.map((r) => `ext#${r.socket.__csId}=${r.ts}`).join(' '),
+    '-> picked ext#' + winner.__csId);
+  return winner;
 }
 
 async function getOrBindSessionSocket(sessionId) {
+  const short = sessionId.slice(0, 8);
   const bound = sessionBindings.get(sessionId);
   if (bound && connectedExtensions.has(bound) && bound.readyState === 1) {
+    log(`[debug] session ${short}: REUSE binding -> ext#${bound.__csId}`);
     return bound;
   }
+  // [debug] why are we (re)binding? Three cases, and they point at different bugs:
+  //   - never seen   => a brand-new sessionId reached the daemon (MCP respawn / new session)
+  //   - bound-gone   => we had a binding but its socket closed (service-worker death during
+  //                     an idle gap, e.g. a compaction) — about to re-pick from current focus
+  //   - no-binding   => seen before but not currently bound (binding was dropped earlier)
+  const reason = !seenSessions.has(sessionId) ? 'never-seen'
+    : (bound ? 'bound-socket-gone' : 'no-current-binding');
+  seenSessions.add(sessionId);
   const picked = await pickProfileForSession();
+  const rebindToDifferent = bound && bound !== picked;
+  log(`[debug] session ${short}: BIND (${reason}) -> ext#${picked.__csId}`
+    + (rebindToDifferent ? ` [CHANGED from ext#${bound.__csId} — expect a NEW window in ext#${picked.__csId}]` : ''));
   sessionBindings.set(sessionId, picked);
   return picked;
 }
@@ -126,7 +149,8 @@ const httpServer = http.createServer(async (req, res) => {
 const wss = new WebSocketServer({ server: httpServer });
 
 wss.on('connection', (socket) => {
-  log('Chrome extension connected');
+  socket.__csId = ++socketSeq;
+  log(`Chrome extension connected (ext#${socket.__csId}, ${connectedExtensions.size + 1} total)`);
   connectedExtensions.add(socket);
 
   socket.on('message', (data) => {
@@ -147,11 +171,16 @@ wss.on('connection', (socket) => {
   });
 
   socket.on('close', () => {
-    log('Chrome extension disconnected');
     connectedExtensions.delete(socket);
+    // [debug] which sessions just lost their binding? Each of these will re-pick a
+    // profile on its next tool call. If a service worker dies during a compaction's
+    // idle gap, the session re-binds and may land elsewhere -> new window.
+    const dropped = [];
     for (const [sid, s] of sessionBindings.entries()) {
-      if (s === socket) sessionBindings.delete(sid);
+      if (s === socket) { sessionBindings.delete(sid); dropped.push(sid.slice(0, 8)); }
     }
+    log(`Chrome extension disconnected (ext#${socket.__csId}); dropped ${dropped.length} binding(s)`
+      + (dropped.length ? ': ' + dropped.join(', ') : ''));
     for (const [id, entry] of pendingRequests.entries()) {
       if (entry.socket === socket) {
         pendingRequests.delete(id);

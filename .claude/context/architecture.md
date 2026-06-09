@@ -2,7 +2,7 @@
 
 ## Three layers
 
-- **`server/server.js`** — one process per Claude Code session, MCP stdio bridge. Generates a `SESSION_ID` (UUID v4) at startup; tags every HTTP request to the daemon with it.
+- **`server/server.js`** — one process per Claude Code session, MCP stdio bridge. Tags every HTTP request to the daemon with a `SESSION_ID` that's stable for the Claude Code session (from `CLAUDE_CODE_SESSION_ID`), so a respawned MCP process reuses the same window.
 - **`server/daemon.js`** — one persistent process, owns all WebSocket connections to Chrome extension instances (one per Chrome profile). Routes each `sessionId` to a chosen extension and remembers the binding.
 - **`extension/`** — manifest v3 Chrome extension, one loaded per Chrome profile. Receives `sessionId` on every action; maintains a `sessionId → windowId` map in `chrome.storage.session`; targets ops at the active non-pinned tab inside that session's dedicated window.
 
@@ -35,7 +35,7 @@ Action names starting with `__claudesurf_` are daemon-initiated internal RPC and
 - `sessionName:<sessionId>` → `{ name, description }` (per-session)
 - `lastFocusedAt` → millisecond timestamp (per-profile, not per-session)
 
-No `chrome.storage.local`. No persistence across browser restarts by design — sessionIds are themselves ephemeral.
+No `chrome.storage.local`. No persistence across browser restarts by design — `chrome.storage.session` is cleared on restart, so windows aren't reattached even though the `SESSION_ID` is now stable.
 
 ## Non-obvious gotchas
 

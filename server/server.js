@@ -9,7 +9,22 @@ const readline = require('readline');
 const crypto = require('crypto');
 
 const DAEMON_PORT = 7865;
-const SESSION_ID = crypto.randomUUID();
+// Identity must stay stable for the life of the Claude Code session so the extension
+// reuses the *same* dedicated window across MCP reconnects/respawns. A per-process
+// `crypto.randomUUID()` changed whenever this process was respawned, which orphaned the
+// old window. Prefer Claude Code's own session id (the same UUID used by --resume/
+// --continue) — it's unique per session, so two `claude` runs in one dir still get
+// separate windows. Fall back to a hash of the project dir, then a random id, for
+// Claude Code versions predating these env vars.
+const SESSION_ID_SOURCE =
+  process.env.CLAUDE_CODE_SESSION_ID ? 'CLAUDE_CODE_SESSION_ID'
+    : process.env.CLAUDE_PROJECT_DIR ? 'CLAUDE_PROJECT_DIR(hash)'
+      : 'randomUUID';
+const SESSION_ID =
+  process.env.CLAUDE_CODE_SESSION_ID
+  || (process.env.CLAUDE_PROJECT_DIR
+    ? 'dir-' + crypto.createHash('sha256').update(process.env.CLAUDE_PROJECT_DIR).digest('hex').slice(0, 32)
+    : crypto.randomUUID());
 
 function sendToDaemon(action, params = {}) {
   return new Promise((resolve, reject) => {
@@ -183,4 +198,8 @@ async function handleMcpMessage(msg) {
   }
 }
 
-log('MCP server started (session ' + SESSION_ID.slice(0, 8) + ' [' + SESSION_ID + '], daemon port ' + DAEMON_PORT + ')');
+// [debug] pid/ppid let us tell a *respawned* MCP process (new pid + new SESSION_ID,
+// same ppid = same Claude Code CLI) from a genuinely new Claude session. If a fresh
+// line with the same ppid appears right after a compaction, the UUID changed = a new
+// window-lookup key = a new window.
+log('MCP server started (session ' + SESSION_ID.slice(0, 8) + ' [' + SESSION_ID + '] via ' + SESSION_ID_SOURCE + ', daemon port ' + DAEMON_PORT + ', pid ' + process.pid + ', ppid ' + process.ppid + ')');

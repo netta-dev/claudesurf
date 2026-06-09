@@ -13,7 +13,7 @@ Claude Code session N ─┘                    └─ …                      
 ```
 
 - **`daemon.js`** — one persistent process. Owns WebSocket connections to all loaded extension instances + serves an HTTP API. Run it once. Routes each Claude session to a Chrome profile based on which profile had OS focus when the session first called a tool; bindings stick for the daemon's lifetime.
-- **`server.js`** — thin MCP stdio bridge, one per Claude Code session. Generates a session ID at startup, forwards requests to the daemon via HTTP.
+- **`server.js`** — thin MCP stdio bridge, one per Claude Code session. Uses Claude Code's own session id (`CLAUDE_CODE_SESSION_ID`, falling back to a hash of `CLAUDE_PROJECT_DIR`, then a random id) as a stable session identity, so the dedicated window is reused across MCP reconnects/respawns. Forwards requests to the daemon via HTTP.
 - **`extension/`** — manifest v3 Chrome extension. Per-session dedicated window: pinned `session.html` marker tab + working tab Claude navigates. Load the extension once per Chrome profile you want to be eligible for routing.
 
 ## Setup

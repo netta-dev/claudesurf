@@ -145,13 +145,22 @@ async function getOrCreateSessionWindow(sessionId) {
   const storageKey = SESSION_KEY_PREFIX + sessionId;
   const stored = await chrome.storage.session.get(storageKey);
   const existingId = stored[storageKey];
+  const shortDbg = sessionId.slice(0, 8);
   if (typeof existingId === 'number') {
     try {
       await chrome.windows.get(existingId);
+      console.log(`[ClaudeSurf][debug] session ${shortDbg}: REUSE window ${existingId}`);
       return existingId;
     } catch {
+      // Stored window is gone (user closed it, or this is a different profile that
+      // happens to have a stale entry). Falls through to create a fresh one.
+      console.log(`[ClaudeSurf][debug] session ${shortDbg}: stored window ${existingId} gone -> recreating`);
       await chrome.storage.session.remove(storageKey);
     }
+  } else {
+    // [debug] No window mapping for this sessionId in THIS profile. Either a brand-new
+    // session, or the same session re-routed here from another profile (Mechanism 2).
+    console.log(`[ClaudeSurf][debug] session ${shortDbg}: NO window mapping in this profile -> creating NEW window`);
   }
 
   const shortId = sessionId.slice(0, 8);
