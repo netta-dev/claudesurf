@@ -105,7 +105,7 @@ If you close the dedicated window, the next tool call from that session creates 
 
 ## Troubleshooting
 
-- **"Cannot reach ClaudeSurf daemon"**: Start the daemon with `node server/daemon.js`
+- **"Cannot reach ClaudeSurf daemon"**: Start it with `systemctl --user restart claudesurf` (or `node server/daemon.js` if you didn't install the service — see above). The MCP bridge retries connection-refused for a few seconds, so a quick restart is usually invisible.
 - **"Chrome extension not connected"**: Load the extension at `chrome://extensions/`. Check service worker console for `[ClaudeSurf] Connected to server`. Check `curl localhost:7865/health` for `extensionsConnected > 0`.
 - **Session window went to the wrong profile**: bindings are decided at first-call time based on which profile had OS focus. Restart Claude Code (new session ID) while focused on the desired profile, or close and reopen the working window.
 - **Content script errors / "navigate to a URL first"**: `chrome://`, extension pages, `view-source:`, `file://`, and `about:blank` block content scripts. Use a regular http(s) page.

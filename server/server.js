@@ -8,7 +8,14 @@ const http = require('http');
 const readline = require('readline');
 const crypto = require('crypto');
 
-const DAEMON_PORT = 7865;
+const DAEMON_PORT = Number(process.env.CLAUDESURF_DAEMON_PORT) || 7865;
+// The daemon runs as a systemd user service (Restart=always), so a crash is back in
+// ~3s. Retry connection-refused over that window so a restart is invisible to the agent
+// instead of surfacing a spurious failure. Only ECONNREFUSED is retried — it means the
+// request never reached the daemon, so re-sending can't double-execute a tool action.
+const CONNECT_RETRIES = 6;
+const RETRY_DELAY_MS = 1000;
+const DAEMON_DOWN_MSG = 'Cannot reach ClaudeSurf daemon. Start it with: systemctl --user restart claudesurf';
 // Identity must stay stable for the life of the Claude Code session so the extension
 // reuses the *same* dedicated window across MCP reconnects/respawns. A per-process
 // `crypto.randomUUID()` changed whenever this process was respawned, which orphaned the
@@ -26,7 +33,7 @@ const SESSION_ID =
     ? 'dir-' + crypto.createHash('sha256').update(process.env.CLAUDE_PROJECT_DIR).digest('hex').slice(0, 32)
     : crypto.randomUUID());
 
-function sendToDaemon(action, params = {}) {
+function sendOnce(action, params) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ sessionId: SESSION_ID, action, params });
     const req = http.request({
@@ -52,7 +59,11 @@ function sendToDaemon(action, params = {}) {
       });
     });
     req.on('error', (e) => {
-      reject(new Error('Cannot reach ClaudeSurf daemon. Run: node /home/z/workspaces/claudesurf/server/daemon.js'));
+      // Tag so the retry wrapper can tell a connection failure (and whether it's the
+      // safe-to-retry ECONNREFUSED) from a daemon-returned error.
+      e.isDaemonConnError = true;
+      e.canRetry = e.code === 'ECONNREFUSED';
+      reject(e);
     });
     req.setTimeout(35000, () => {
       req.destroy();
@@ -60,6 +71,27 @@ function sendToDaemon(action, params = {}) {
     });
     req.end(body);
   });
+}
+
+// Retrying wrapper: rides out a daemon restart on ECONNREFUSED, then maps any connection
+// failure to a clear "start the service" message. Timeouts and daemon-returned errors
+// (e.g. "extension not connected") pass through unchanged.
+async function sendToDaemon(action, params = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await sendOnce(action, params);
+    } catch (e) {
+      if (e.isDaemonConnError) {
+        if (e.canRetry && attempt < CONNECT_RETRIES) {
+          log('daemon refused connection, retrying (' + (attempt + 1) + '/' + CONNECT_RETRIES + ')');
+          await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+          continue;
+        }
+        throw new Error(DAEMON_DOWN_MSG);
+      }
+      throw e;
+    }
+  }
 }
 
 // --- MCP protocol over stdio ---
