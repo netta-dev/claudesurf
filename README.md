@@ -67,6 +67,9 @@ mkdir -p ~/.config/systemd/user
 cat > ~/.config/systemd/user/claudesurf.service << 'EOF'
 [Unit]
 Description=ClaudeSurf daemon
+# Never give up restarting — otherwise systemd parks it in "failed" after 5 quick
+# restarts, defeating Restart=always for a long-lived daemon.
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/bin/node /home/z/workspaces/claudesurf/server/daemon.js
