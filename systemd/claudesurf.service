@@ -1,0 +1,15 @@
+[Unit]
+Description=ClaudeSurf daemon
+# Never give up restarting — otherwise systemd parks it in "failed" after 5 quick
+# restarts, defeating Restart=always for a long-lived daemon.
+StartLimitIntervalSec=0
+
+[Service]
+# %h = the running user's home, so this one unit works for any user's clone.
+# Listens on the default extension port 7865 + this user's command socket.
+ExecStart=/usr/bin/node %h/workspaces/claudesurf/server/daemon.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

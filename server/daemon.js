@@ -1,13 +1,28 @@
 #!/usr/bin/env node
 
-// Persistent daemon process — run once, stays up.
+// Persistent daemon process — run once, stays up. One per OS user.
 // Owns the WebSocket connections to one or more Chrome extension instances
-// (one per Chrome profile) and exposes an HTTP API for MCP server instances.
+// (one per Chrome profile) and exposes a command API for MCP server instances.
+//
+// TWO channels, deliberately split so a second OS user can't reach this user's Chrome:
+//   - Command channel (/api + /health): a Unix domain socket, 0600, in this user's
+//     runtime dir. Only the same OS user's server.js can send commands. This is the
+//     hard, kernel-enforced isolation boundary — see socket-path.js.
+//   - Extension channel: a loopback TCP port (Chrome extensions can only speak ws://
+//     TCP, not Unix sockets). We can't stop another user's Chrome from *connecting*, so
+//     the daemon resolves each connection's real peer uid via /proc and rejects any that
+//     isn't this user's — so a foreign Chrome can neither register here nor intercept
+//     what this user browses.
 
 const http = require('http');
+const net = require('net');
+const fs = require('fs');
 const { WebSocketServer } = require('ws');
+const { daemonSocketPath } = require('./socket-path');
 
-const PORT = 7865;
+const WS_PORT = Number(process.env.CLAUDESURF_WS_PORT) || 7865;
+const SOCK = daemonSocketPath();
+const MY_UID = process.getuid();
 const FOCUS_PROBE_TIMEOUT_MS = 500;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -23,6 +38,31 @@ let socketSeq = 0;
 
 function log(...args) {
   console.log('[ClaudeSurf daemon]', ...args);
+}
+
+// Resolve the OS uid owning the peer end of a loopback TCP connection by matching the
+// peer's port against /proc/net/tcp{,6}. Chrome extensions connect over TCP, so
+// SO_PEERCRED (the clean Unix-socket way) isn't available — this is the Linux-specific
+// substitute. The peer's socket row has local_port = the peer's ephemeral port and
+// rem_port = our WS listen port; requiring rem_port === WS_PORT excludes the daemon's
+// own mirror-image accept()ed socket. Returns null if it can't be resolved (caller
+// treats null as "not us" and rejects — fail closed).
+function peerUidForPort(peerPort) {
+  for (const file of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    let data;
+    try { data = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    for (const line of data.split('\n').slice(1)) {
+      const p = line.trim().split(/\s+/);
+      if (p.length < 8) continue;
+      const localPort = parseInt(p[1].split(':')[1], 16);
+      const remPort = parseInt(p[2].split(':')[1], 16);
+      if (localPort === peerPort && remPort === WS_PORT) {
+        const uid = parseInt(p[7], 10);
+        return Number.isNaN(uid) ? null : uid;
+      }
+    }
+  }
+  return null;
 }
 
 function sendToSocket(socket, action, params, sessionId, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
@@ -45,6 +85,9 @@ function sendToSocket(socket, action, params, sessionId, timeoutMs = DEFAULT_REQ
   });
 }
 
+// Every extension here belongs to this same OS user (peer-uid filtered at connect), so
+// the only thing to disambiguate is multiple Chrome *profiles* of this one user — done
+// by most-recently-focused, exactly as before.
 async function pickProfileForSession() {
   const sockets = [...connectedExtensions];
   if (sockets.length === 1) return sockets[0];
@@ -100,8 +143,8 @@ async function sendToExtension(action, params = {}, sessionId = null) {
   return sendToSocket(socket, action, params, sessionId);
 }
 
-// HTTP server handles API requests from MCP server instances
-const httpServer = http.createServer(async (req, res) => {
+// --- Command channel: Unix domain socket (0600), same-user only ---
+const commandServer = http.createServer(async (req, res) => {
   if (req.method === 'POST' && req.url === '/api') {
     let body = '';
     req.on('data', (chunk) => { body += chunk; });
@@ -145,12 +188,25 @@ const httpServer = http.createServer(async (req, res) => {
   }
 });
 
-// WebSocket server for Chrome extension, shares the HTTP server
-const wss = new WebSocketServer({ server: httpServer });
+// --- Extension channel: loopback TCP + WebSocket, peer-uid filtered ---
+const wsHttpServer = http.createServer((req, res) => {
+  res.writeHead(426, { 'Content-Type': 'text/plain' });
+  res.end('This port serves the ClaudeSurf extension WebSocket only.');
+});
+const wss = new WebSocketServer({ server: wsHttpServer });
 
-wss.on('connection', (socket) => {
+wss.on('connection', (socket, req) => {
+  const peerPort = req.socket.remotePort;
+  const peerUid = peerUidForPort(peerPort);
+  if (peerUid !== MY_UID) {
+    // A Chrome running as a different OS user (or an unresolvable peer). Refuse it, so a
+    // foreign Chrome can't register as one of our profiles or eavesdrop on our sessions.
+    log(`Rejected extension connection: peer uid ${peerUid} != daemon uid ${MY_UID} (port ${peerPort})`);
+    socket.close(1008, 'unauthorized');
+    return;
+  }
   socket.__csId = ++socketSeq;
-  log(`Chrome extension connected (ext#${socket.__csId}, ${connectedExtensions.size + 1} total)`);
+  log(`Chrome extension connected (ext#${socket.__csId}, uid ${peerUid}, ${connectedExtensions.size + 1} total)`);
   connectedExtensions.add(socket);
 
   socket.on('message', (data) => {
@@ -190,7 +246,44 @@ wss.on('connection', (socket) => {
   });
 });
 
-httpServer.listen(PORT, () => {
-  log(`Listening on port ${PORT}`);
-  log('Waiting for Chrome extension...');
-});
+// --- Startup: bind the command socket (handling a stale one), then the WS port ---
+function startCommandServer() {
+  commandServer.once('error', (e) => {
+    if (e.code !== 'EADDRINUSE') {
+      log('Command socket error:', e.message);
+      process.exit(1);
+    }
+    // The socket file exists. Either a live daemon owns it, or it's a leftover from a
+    // crash/unclean exit. Probe: if we can connect, someone's home — bail rather than
+    // steal it. If the connect is refused, it's stale — unlink and retry once.
+    const probe = net.connect(SOCK);
+    probe.once('connect', () => {
+      probe.destroy();
+      log(`Another daemon is already listening on ${SOCK}; exiting.`);
+      process.exit(1);
+    });
+    probe.once('error', () => {
+      try { fs.unlinkSync(SOCK); } catch {}
+      commandServer.listen(SOCK, onCommandListening);
+    });
+  });
+  commandServer.listen(SOCK, onCommandListening);
+}
+
+function onCommandListening() {
+  fs.chmodSync(SOCK, 0o600); // belt-and-suspenders on top of the 0700 runtime dir
+  log(`Command socket listening at ${SOCK} (0600, uid ${MY_UID})`);
+  wsHttpServer.listen(WS_PORT, '127.0.0.1', () => {
+    log(`Extension WebSocket listening on 127.0.0.1:${WS_PORT}`);
+    log('Waiting for Chrome extension...');
+  });
+}
+
+function cleanup() {
+  try { fs.unlinkSync(SOCK); } catch {}
+  process.exit(0);
+}
+process.on('SIGINT', cleanup);
+process.on('SIGTERM', cleanup);
+
+startCommandServer();

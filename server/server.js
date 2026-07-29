@@ -7,15 +7,25 @@
 const http = require('http');
 const readline = require('readline');
 const crypto = require('crypto');
+const { spawn } = require('child_process');
+const { daemonSocketPath } = require('./socket-path');
 
-const DAEMON_PORT = Number(process.env.CLAUDESURF_DAEMON_PORT) || 7865;
+// The daemon's command channel is a per-user Unix socket (0600), so only this OS user
+// can reach it — that's the isolation boundary from any other user on the box.
+const SOCK = daemonSocketPath();
 // The daemon runs as a systemd user service (Restart=always), so a crash is back in
-// ~3s. Retry connection-refused over that window so a restart is invisible to the agent
-// instead of surfacing a spurious failure. Only ECONNREFUSED is retried — it means the
-// request never reached the daemon, so re-sending can't double-execute a tool action.
+// ~3s. Retry over that window so a restart is invisible to the agent instead of
+// surfacing a spurious failure. Only "never reached the daemon" errors are retried
+// (ECONNREFUSED = socket present but nothing accepting; ENOENT = socket file gone during
+// a restart) — a retry then can't double-execute a tool action.
 const CONNECT_RETRIES = 6;
 const RETRY_DELAY_MS = 1000;
 const DAEMON_DOWN_MSG = 'Cannot reach ClaudeSurf daemon. Start it with: systemctl --user restart claudesurf';
+// Optional cold-start: if set, and no browser is connected to our daemon when a tool is
+// called, launch this command (e.g. "/usr/bin/google-chrome") and wait for its extension
+// to attach before proceeding. Lets a session spin up its own Chrome on demand instead of
+// keeping one warm. Unset (the default) = current behavior, browser must already be up.
+const BROWSER_CMD = process.env.CLAUDESURF_BROWSER_CMD;
 // Identity must stay stable for the life of the Claude Code session so the extension
 // reuses the *same* dedicated window across MCP reconnects/respawns. A per-process
 // `crypto.randomUUID()` changed whenever this process was respawned, which orphaned the
@@ -37,8 +47,7 @@ function sendOnce(action, params) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ sessionId: SESSION_ID, action, params });
     const req = http.request({
-      hostname: '127.0.0.1',
-      port: DAEMON_PORT,
+      socketPath: SOCK,
       path: '/api',
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
@@ -59,10 +68,10 @@ function sendOnce(action, params) {
       });
     });
     req.on('error', (e) => {
-      // Tag so the retry wrapper can tell a connection failure (and whether it's the
-      // safe-to-retry ECONNREFUSED) from a daemon-returned error.
+      // Tag so the retry wrapper can tell a connection failure (and whether it's
+      // safe-to-retry — daemon simply unreachable) from a daemon-returned error.
       e.isDaemonConnError = true;
-      e.canRetry = e.code === 'ECONNREFUSED';
+      e.canRetry = e.code === 'ECONNREFUSED' || e.code === 'ENOENT';
       reject(e);
     });
     req.setTimeout(35000, () => {
@@ -92,6 +101,54 @@ async function sendToDaemon(action, params = {}) {
       throw e;
     }
   }
+}
+
+// --- Cold-start: launch this user's browser on demand (opt-in via CLAUDESURF_BROWSER_CMD) ---
+
+// How many extensions are connected to our daemon right now. Since the daemon is
+// single-user (peer-uid filtered), a non-zero count means *our* Chrome is attached.
+function healthCount() {
+  return new Promise((resolve) => {
+    const req = http.request({ socketPath: SOCK, path: '/health', method: 'GET' }, (res) => {
+      let d = '';
+      res.on('data', (c) => { d += c; });
+      res.on('end', () => { try { resolve(JSON.parse(d).extensionsConnected || 0); } catch { resolve(0); } });
+    });
+    req.on('error', () => resolve(0));
+    req.setTimeout(2000, () => { req.destroy(); resolve(0); });
+    req.end();
+  });
+}
+
+const BROWSER_CONNECT_TIMEOUT_MS = 20000;
+let ensuring = null;
+
+async function doEnsureBrowser() {
+  if (await healthCount() >= 1) return; // our Chrome is already attached
+  const argv = BROWSER_CMD.split(/\s+/).filter(Boolean);
+  log('cold-start: no browser connected, launching: ' + BROWSER_CMD);
+  try {
+    // Launching Chrome when an instance for the profile is already up is harmless — it
+    // just signals the running instance — so we don't need to dedupe against a live browser.
+    spawn(argv[0], argv.slice(1), { detached: true, stdio: 'ignore' }).unref();
+  } catch (e) {
+    log('cold-start: launch failed (' + e.message + '); proceeding — the tool call will surface the real error');
+    return;
+  }
+  const deadline = Date.now() + BROWSER_CONNECT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 500));
+    if (await healthCount() >= 1) { log('cold-start: browser connected'); return; }
+  }
+  log('cold-start: browser did not connect within ' + BROWSER_CONNECT_TIMEOUT_MS + 'ms; proceeding anyway');
+}
+
+// Coalesce concurrent callers onto one in-flight launch so a burst of tool calls during
+// the connect window doesn't spawn multiple browsers.
+function ensureBrowser() {
+  if (!BROWSER_CMD) return Promise.resolve();
+  if (!ensuring) ensuring = doEnsureBrowser().finally(() => { ensuring = null; });
+  return ensuring;
 }
 
 // --- MCP protocol over stdio ---
@@ -193,6 +250,7 @@ async function handleMcpMessage(msg) {
     case 'tools/call': {
       const { name, arguments: args } = params;
       try {
+        await ensureBrowser();
         const result = await sendToDaemon(name, args || {});
 
         if (name === 'screenshot' && result.image) {
@@ -234,4 +292,4 @@ async function handleMcpMessage(msg) {
 // same ppid = same Claude Code CLI) from a genuinely new Claude session. If a fresh
 // line with the same ppid appears right after a compaction, the UUID changed = a new
 // window-lookup key = a new window.
-log('MCP server started (session ' + SESSION_ID.slice(0, 8) + ' [' + SESSION_ID + '] via ' + SESSION_ID_SOURCE + ', daemon port ' + DAEMON_PORT + ', pid ' + process.pid + ', ppid ' + process.ppid + ')');
+log('MCP server started (session ' + SESSION_ID.slice(0, 8) + ' [' + SESSION_ID + '] via ' + SESSION_ID_SOURCE + ', daemon socket ' + SOCK + ', pid ' + process.pid + ', ppid ' + process.ppid + ')');

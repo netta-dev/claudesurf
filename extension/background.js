@@ -1,4 +1,19 @@
-const WS_URL = 'ws://localhost:7865';
+const DEFAULT_WS_PORT = 7865;
+// Port is overridable per-profile via chrome.storage.local['claudesurf_ws_port'] so a
+// second OS user can run their own daemon on a different port (e.g. 7866) and their
+// Chrome connects to *their* daemon. The daemon also peer-uid-rejects foreign Chromes,
+// so a wrong port just fails to connect rather than crossing into another user's daemon.
+let wsPort = DEFAULT_WS_PORT;
+chrome.storage.local.get('claudesurf_ws_port').then((s) => {
+  const p = parseInt(s.claudesurf_ws_port, 10);
+  if (Number.isInteger(p) && p > 0) wsPort = p;
+});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.claudesurf_ws_port) {
+    const p = parseInt(changes.claudesurf_ws_port.newValue, 10);
+    wsPort = Number.isInteger(p) && p > 0 ? p : DEFAULT_WS_PORT;
+  }
+});
 const NAVIGATE_TIMEOUT_MS = 30_000;
 // Namespace storage keys so per-profile state and per-session state can coexist.
 const SESSION_KEY_PREFIX = 'session:';
@@ -14,7 +29,7 @@ function connect() {
   if (ws && ws.readyState === WebSocket.OPEN) {
     return;
   }
-  ws = new WebSocket(WS_URL);
+  ws = new WebSocket(`ws://127.0.0.1:${wsPort}`);
 
   ws.onopen = () => {
     console.log('[ClaudeSurf] Connected to server');

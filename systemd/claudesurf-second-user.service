@@ -1,0 +1,18 @@
+[Unit]
+Description=ClaudeSurf daemon (second OS user)
+StartLimitIntervalSec=0
+
+[Service]
+# Same as claudesurf.service, but on a DIFFERENT extension TCP port so it doesn't
+# collide with the first user's 7865 on the shared host. The command socket needs no
+# port (it's per-user under $XDG_RUNTIME_DIR). Set this user's Chrome to the matching
+# port once, in the ClaudeSurf service-worker console:
+#     chrome.storage.local.set({ claudesurf_ws_port: 7866 })
+# then reload the extension.
+Environment=CLAUDESURF_WS_PORT=7866
+ExecStart=/usr/bin/node %h/workspaces/claudesurf/server/daemon.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
