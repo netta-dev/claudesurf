@@ -103,7 +103,7 @@ If you close the dedicated window, the next tool call from that session creates 
 - **"Chrome extension not connected"**: Load the extension at `chrome://extensions/`. Check service worker console for `[ClaudeSurf] Connected to server`. Check health via the socket: `curl --unix-socket "$XDG_RUNTIME_DIR/claudesurf.sock" http://x/health` for `extensionsConnected > 0`.
 - **Session window went to the wrong profile**: bindings are decided at first-call time based on which profile had OS focus. Restart Claude Code (new session ID) while focused on the desired profile, or close and reopen the working window.
 - **Content script errors / "navigate to a URL first"**: `chrome://`, extension pages, `view-source:`, `file://`, and `about:blank` block content scripts. Use a regular http(s) page.
-- **Port conflict on 7865**: Set `CLAUDESURF_WS_PORT` for the daemon and, in each Chrome profile, set the matching port via `chrome.storage.local` (see [Multiple OS users](#multiple-os-users-isolation)). The command socket is per-user and needs no port; override its path with `CLAUDESURF_SOCKET` if needed (set it identically for the daemon and `server.js`).
+- **Port conflict on 7865**: Set `CLAUDESURF_WS_PORT` for the daemon and, in each Chrome profile, set the matching port via `extension/port.json` or `chrome.storage.local` (see [Multiple OS users](#multiple-os-users-isolation)). The command socket is per-user and needs no port; override its path with `CLAUDESURF_SOCKET` if needed (set it identically for the daemon and `server.js`).
 
 ## Multiple OS users (isolation)
 
@@ -120,11 +120,11 @@ claudesurf partitions users at the OS level, so a second user (say `c`) can use 
    Environment=CLAUDESURF_WS_PORT=7866
    ExecStart=/usr/bin/node /home/c/workspaces/claudesurf/server/daemon.js
    ```
-2. Point `c`'s Chrome at that port. In `c`'s Chrome, open the ClaudeSurf service-worker console (`chrome://extensions/` → **service worker**) and run once:
-   ```js
-   chrome.storage.local.set({ claudesurf_ws_port: 7866 })
+2. Point `c`'s Chrome at that port. Drop an untracked `port.json` next to the extension code and reload the extension (or restart Chrome):
+   ```bash
+   echo '{ "port": 7866 }' > ~/workspaces/claudesurf/extension/port.json
    ```
-   (Reload the extension afterward. The default is 7865, so `z`'s profiles need no change.)
+   Alternatively, set `chrome.storage.local.set({ claudesurf_ws_port: 7866 })` in the ClaudeSurf service-worker console (`chrome://extensions/` → **service worker**); the storage key wins over `port.json` if both are set. The default is 7865, so `z`'s profiles need no change.
 3. `c`'s `server.js` needs no port config — it derives `c`'s own socket from `c`'s runtime dir automatically.
 
 ## Optional: cold-start the browser on demand

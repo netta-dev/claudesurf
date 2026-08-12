@@ -1,17 +1,35 @@
 const DEFAULT_WS_PORT = 7865;
-// Port is overridable per-profile via chrome.storage.local['claudesurf_ws_port'] so a
-// second OS user can run their own daemon on a different port (e.g. 7866) and their
-// Chrome connects to *their* daemon. The daemon also peer-uid-rejects foreign Chromes,
-// so a wrong port just fails to connect rather than crossing into another user's daemon.
+// Port is overridable per-profile so a second OS user can run their own daemon on a
+// different port (e.g. 7866) and their Chrome connects to *their* daemon. Two sources,
+// highest wins: chrome.storage.local['claudesurf_ws_port'], then an optional untracked
+// port.json ({"port": 7866}) next to this file — settable without service-worker console
+// access. The daemon also peer-uid-rejects foreign Chromes, so a wrong port just fails
+// to connect rather than crossing into another user's daemon.
+let storagePort = null;
+let filePort = null;
 let wsPort = DEFAULT_WS_PORT;
+const asPort = (v) => {
+  const p = parseInt(v, 10);
+  return Number.isInteger(p) && p > 0 ? p : null;
+};
+const updateWsPort = () => {
+  wsPort = storagePort ?? filePort ?? DEFAULT_WS_PORT;
+};
 chrome.storage.local.get('claudesurf_ws_port').then((s) => {
-  const p = parseInt(s.claudesurf_ws_port, 10);
-  if (Number.isInteger(p) && p > 0) wsPort = p;
+  storagePort = asPort(s.claudesurf_ws_port);
+  updateWsPort();
 });
+fetch(chrome.runtime.getURL('port.json'))
+  .then((r) => r.json())
+  .then((j) => {
+    filePort = asPort(j.port);
+    updateWsPort();
+  })
+  .catch(() => {}); // no port.json — fine, it's optional
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.claudesurf_ws_port) {
-    const p = parseInt(changes.claudesurf_ws_port.newValue, 10);
-    wsPort = Number.isInteger(p) && p > 0 ? p : DEFAULT_WS_PORT;
+    storagePort = asPort(changes.claudesurf_ws_port.newValue);
+    updateWsPort();
   }
 });
 const NAVIGATE_TIMEOUT_MS = 30_000;

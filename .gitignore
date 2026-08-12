@@ -10,3 +10,6 @@ node_modules/
 # /engineer worktree isolation
 .claude/worktrees/
 .eng-provisioned
+
+# per-machine extension port override
+extension/port.json
