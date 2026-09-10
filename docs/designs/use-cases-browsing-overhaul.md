@@ -18,7 +18,7 @@ The daemon intercepts the navigation and cancels it before content loads, then r
 
 ### UC2a — A link opens a new tab
 
-The agent clicks a `target=_blank` link, or the page calls `window.open`. Chrome creates a new target; the daemon attaches to it paused, checks the destination host, and releases it only if the host is listed. The new target joins the session's window and shows up in `tabs list`, but the working tab is unchanged until the agent switches to it deliberately. An unlisted destination returns `needs_confirmation` and the target is closed rather than left blank.
+The agent clicks a `target=_blank` link, or the page calls `window.open`. Chrome creates a new target, as a tab in the session's window or as a popup window; the daemon attaches to it paused, attributes it to the session through its opener, checks the destination host, and releases it only if the host is listed. The new target shows up in `tabs list`, but the working tab is unchanged until the agent switches to it deliberately. An unlisted destination returns `needs_confirmation` and the target is closed rather than left blank.
 
 ### UC3 — Page-context fetch to an unlisted domain
 
@@ -50,6 +50,14 @@ The agent reads a page, the page navigates, and the agent then acts on a ref fro
 
 The action returns `stale_ref` naming the ref and saying the document changed. Nothing is clicked. The agent re-reads to obtain fresh refs.
 
+### UC7a — A ref from an earlier read of the same document
+
+The agent reads, scrolls, reads again, then clicks a ref that appeared only in the first read. The document has not navigated, so the ref resolves and the click proceeds. A pushState or hash change between the reads leaves refs valid too.
+
+### UC7b — A ref whose node has been removed
+
+The agent clicks a ref from a read of the current document, but the page has since removed that element. The action returns `error` saying the element is gone, since the document is the same one the ref came from; `stale_ref` is reserved for a navigated document.
+
 ### UC8 — A ref is used against a different tab
 
 The agent reads tab A, switches to tab B, and acts on a ref from A. Because refs are scoped to the target and document generation they were read from, the action returns the same `stale_ref` rather than resolving against whatever node in B shares the identifier.
@@ -58,7 +66,7 @@ The agent reads tab A, switches to tab B, and acts on a ref from A. Because refs
 
 ### UC9 — The human closes the working tab
 
-The agent's next action finds the session's recorded working target gone. The daemon creates a fresh working tab in the session's window, records it, and the action proceeds against it. The agent is told the tab was recreated, since the previous page's state is gone.
+The agent's next action finds the session's recorded working target gone. The daemon creates a fresh working tab in the session's window, records it, and the action runs against it: a `navigate` proceeds, while an action that needs a loaded page returns the outcome that page state gives it — `error` saying to navigate first for a read or scroll, `stale_ref` for a click. Either way the agent is told the tab was recreated, since the previous page's state is gone. The new tab is the window's active tab, so the window shows the agent's page rather than the identity page, and the window comes to the front once as it is created.
 
 ### UC10 — The human closes the whole session window
 
@@ -68,9 +76,13 @@ The next action from that session recreates the window with its identity tab and
 
 `tabs` with `close` targeting a session's identity tab returns `error` naming the refusal. The window keeps its identity.
 
+### UC11b — The human closes the identity tab
+
+The session's working tab stays, and actions continue against it. The identity tab is not recreated: `info` notes that the window has no identity tab, and one returns when the whole window is recreated (UC10).
+
 ### UC11a — A page opens a JavaScript dialog
 
-The page calls `alert`, `confirm`, or `prompt`. The renderer blocks until the dialog is answered, so the daemon dismisses it and the action returns with a note saying a dialog was dismissed and what it said. The agent learns a page asked something rather than seeing a command time out.
+The page calls `alert`, `confirm`, or `prompt`. The renderer blocks until the dialog is answered, so the daemon dismisses it and the action returns with a note naming the dialog type and, inside the wrapped payload, what it said. The agent learns a page asked something rather than seeing a command time out.
 
 A `beforeunload` dialog is accepted instead, so a navigation or a window close the human initiated proceeds.
 
@@ -92,7 +104,9 @@ systemd restarts the daemon. The browser, being its child, goes with it, closing
 
 ### UC15 — The browser exits while the daemon lives
 
-The human closes every session window, quits Chrome, or the browser crashes. The pipe reaches EOF. The daemon drops all window and target state, keeping session labels, and the next command from any session cold-starts a fresh browser with a fresh window carrying the session's name, as UC10's window-close path does.
+Chrome is quit, killed, or crashes. The pipe reaches EOF. The daemon drops all window and target state, keeping session labels, and the next command from any session cold-starts a fresh browser with a fresh window carrying the session's name, as UC10's window-close path does.
+
+Closing every session window is not this case: the pipe keeps Chrome alive with no windows, each closed window drops its own session's state as in UC10, and the next command creates a window in the idle browser.
 
 ### UC16 — A browser was orphaned by an unclean shutdown
 
@@ -114,7 +128,13 @@ A Cloudflare turnstile is a child target. Detection runs across attached targets
 
 ### UC19a — The agent clicks a download link
 
-A click produces a file download rather than a document. The daemon declines it and the action returns saying so, since a download would write to the profile owner's disk on the agent's action and the domain gate never sees it.
+A click produces a file download rather than a document. The daemon declines it and the action returns saying so, since a download would write to the profile owner's disk on the agent's action and the domain gate never sees it. The refusal is reported from phase 4, where network capture can see the response; before that the download is denied silently and the click returns as one that changed nothing.
+
+## Input
+
+### UC21 — A scripted click changes nothing
+
+The agent clicks a ref and the result reports the same URL and title and no change. The agent retries with `trusted: true`; the daemon dispatches real pointer events at the element's coordinates, which brings the session window to the front, and the page's handler receives a trusted event. The tool description tells the agent both facts, so a trusted click is a deliberate second attempt rather than the default.
 
 ## Untrusted content
 

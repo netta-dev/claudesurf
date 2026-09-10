@@ -1,7 +1,7 @@
 # browsing-overhaul
 
-**Last reviewed**: 2026-09-08
-**Status**: HLD complete
+**Last reviewed**: 2026-09-10
+**Status**: Phase 1 LLD committed
 **Companions**: [use cases](../use-cases-browsing-overhaul.md) · [future](../future-claudesurf.md)
 
 ## Overview
@@ -27,7 +27,7 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
 
 - **The daemon speaks CDP to the browser over `--remote-debugging-pipe`. The Chrome extension is deleted.**
   - Only the parent process holds the pipe's file descriptors, so only the parent can drive the browser. That is stronger than the peer-uid check it replaces, and a pipe stays off the network stack entirely.
-  - Tab pinning is the one capability given up — an extension API with no protocol equivalent — so the daemon identifies the working tab by target id recorded at creation. Window creation still takes focus, as it does today; Chrome does not honor a request to open a window unfocused on Linux and X11.
+  - Tab pinning is the one capability given up — an extension API with no protocol equivalent — so the daemon identifies the working tab by target id recorded at creation. Window creation still raises the window once, since adding the second tab is a page-initiated tab creation and Chrome raises the window for those, and recreating a working tab the human closed raises it the same way, as does any click that opens a tab or popup; nothing else raises it, because pointer input is the other thing that does and clicks are scripted by default.
 
 > [!example]- **Alternatives considered** — a third-party MCP engine, Playwright as a library, a `chrome.debugger` extension, `--remote-debugging-port` (the daemon speaks CDP over a pipe, with no extension)
 > Build on Chrome DevTools MCP or Playwright MCP and shrink claudesurf to a policy wrapper — would supply accessibility snapshots, trusted input, settle detection, and network capture ready-made, but chaining MCP servers to inject the nonce, domain policy, and action log is awkward, and the per-session window model would be grafted onto someone else's lifecycle rather than owned. Depend on Playwright as a library rather than as a server — dodges the chaining objection, and lost on keeping the daemon's browser lifecycle its own. Reach CDP through a `chrome.debugger` extension — raises a banner across every window of the browser it attaches to, and puts an MV3 service worker on the correctness path, since the keepalive would have had to hold the debugger session alive. `--remote-debugging-port` — an unauthenticated TCP port carrying full browser authority, reachable by any local process, breaching the per-user isolation the daemon exists to enforce.
@@ -71,7 +71,7 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
 | | `console` | `since` |
 | | `network` | `filter`, `since` |
 | `claudesurf_act` | `navigate` | `url`, `name`, `description` |
-| | `click` | `ref` |
+| | `click` | `ref`, `trusted` |
 | | `type` | `ref`, `text` |
 | | `press` | `keys` |
 | | `select` | `ref`, `option` |
@@ -88,7 +88,7 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
 
 - **Page-derived content is wrapped in a per-call nonce delimiter, generated after the payload arrives.**
   - Generating the nonce after the browser responds means the content predates it, so a page cannot contain the marker and no escaping is needed.
-  - Every action's payload is wrapped, not only the reads. An acting result echoes a page-controlled title, a tab list carries page-controlled titles and URLs, and a change summary is page-derived markdown of arbitrary length, so an act-side exemption would leave the largest untrusted payloads bare. `screenshot` is the one exception, since a delimiter is text and the payload is an image.
+  - Every action's payload is wrapped, not only the reads. An acting result echoes a page-controlled title, a tab list carries page-controlled titles and URLs, and a change summary is page-derived markdown of arbitrary length, so an act-side exemption would leave the largest untrusted payloads bare. A screenshot's image blocks are the one exception, since a delimiter is text; its URL and title lines are wrapped like any other payload.
   - The delimiter makes the boundary between the human's instructions and page content unforgeable. The domain allowlist and the profile's narrow login set do the enforcing.
 
 - **The domain allowlist is the only gate, it lives entirely in the daemon, and it gates document navigation to `http` and `https` hosts.**
@@ -140,17 +140,20 @@ flowchart TD
 Per Claude Code session:
 
 - **`server/server.js`** — MCP bridge: the two-tool surface, action dispatch, and the nonce wrapper. It reaches the daemon over the per-user Unix socket at `$XDG_RUNTIME_DIR/claudesurf.sock`, mode `0600` inside a `0700` runtime directory.
-- **`server/dispatch.js`** — action registry and argument validation.
 
 Loaded by both:
 
-- **`server/envelope.js`** — the outcome vocabulary, loaded by both processes: the bridge returns `schema_error`; the daemon returns `needs_confirmation`, `needs_human`, `stale_ref`, `unsettled`, and `setup_error`.
+- **`server/dispatch.js`** — action registry and argument validation; the bridge validates first, and the daemon validates again for any other caller.
+- **`server/envelope.js`** — the outcome vocabulary: `schema_error` from either process; `needs_confirmation`, `needs_human`, `stale_ref`, `unsettled`, and `setup_error` from the daemon.
 - **`server/diagnostics.js`** — leveled logging, to the journal from the daemon and to stderr from the bridge, where Claude Code captures it.
 
 One per OS user:
 
-- **`server/daemon.js`** — launches Chrome as a child with a pipe, owns the protocol connection and browser lifecycle, holds per-session window and target state, enforces the domain gate, and writes the policy file and the action log.
-- **`server/cdp.js`** — protocol client: pipe framing, request correlation, event dispatch, target auto-attach, browser lifecycle, orphan reaping.
+- **`server/daemon.js`** — the command server and action handlers; enforces the domain gate and writes the policy file and the action log.
+- **`server/cdp.js`** — protocol client: pipe framing, request correlation, event dispatch, target auto-attach.
+- **`server/browser.js`** — launches Chrome as a child with a pipe, owns the browser lifecycle, the browser record, and orphan reaping.
+- **`server/sessions.js`** — per-session window and target state, labels, and ref sets.
+- **`server/paths.js`** — the socket, profile, and browser-record paths and their overrides.
 - **`server/policy.js`** — allowlist matching, persisted grants, and session-scoped once-grants.
 - **`server/read.js`** — isolated-world evaluation and read assembly.
 - **`server/snapshot.js`** — accessibility tree pruning and frame assembly.
@@ -193,7 +196,7 @@ The `extension/` directory is deleted. Its session-identity page becomes `server
 
 ### Cross-cutting concerns
 
-**Page-initiated targets and dialogs.** Two things the page controls can reach the daemon outside any action it issued. A `target=_blank` link or `window.open` creates a target, which joins the session's window and appears in `tabs list` but never becomes the working tab on its own. A `javascript:` dialog — `alert`, `confirm`, `prompt`, or `beforeunload` — wedges the renderer until it is answered, so every later command on that target would time out against the request budget. The daemon dismisses dialogs and reports that it did, so the agent knows a page asked something rather than seeing an unexplained failure; `beforeunload` is accepted instead, so a close the human initiated goes through and closing a window stays the way she retires a session.
+**Page-initiated targets and dialogs.** Two things the page controls can reach the daemon outside any action it issued. A `target=_blank` link or `window.open` creates a target — a tab in the session's window, or a popup window — which is attributed to the session through its opener, appears in `tabs list`, and never becomes the working tab on its own. A `javascript:` dialog — `alert`, `confirm`, `prompt`, or `beforeunload` — wedges the renderer until it is answered, so every later command on that target would time out against the request budget. The daemon dismisses dialogs and reports that it did, so the agent knows a page asked something rather than seeing an unexplained failure; `beforeunload` is accepted instead, so a close the human initiated goes through and closing a window stays the way she retires a session.
 
 **Downloads.** A click on a file link produces no new document, so the gate does not see it, and Chrome would write to the profile owner's disk on the agent's action. Downloads are declined and the refusal is reported. Allowing them into a scoped directory is recorded as future work rather than built here.
 
@@ -214,13 +217,13 @@ An outcome reports a condition rather than locking the session: an agent holding
 
 The daemon runs `Restart=always` and `server.js` retries connection failures, so a restart is invisible to the agent and the human can lose a window without being told — sharpest during a `needs_human` handoff, where a restart mid-solve takes away the window she was working in. That is accepted, with one mitigation: a persisted browser record present at daemon startup is evidence the previous run had a browser, so the daemon announces the loss through the notification channel the `needs_human` handoff uses. The announcement says only that there was a browser, not how many windows it held.
 
-The reverse direction is the routine one. Chrome exits when its last window closes, so the human closing every session window — or quitting the browser, or a crash — reaches EOF on the pipe. No further target events arrive, and every session's recorded window and target ids point at a browser that is gone, so the daemon drops all session state on EOF and the next command cold-starts.
+The reverse direction is rarer than it looks. The pipe holds Chrome alive with zero windows, so the human closing every session window leaves an idle browser that the next command reuses without a cold start; only a quit, a crash, or a kill reaches EOF on the pipe. On EOF every session's recorded window and target ids point at a browser that is gone, so the daemon drops all session state and the next command cold-starts.
 
-**Graphical session environment.** The daemon launches a headful browser and fires desktop notifications, so it needs `DISPLAY` or `WAYLAND_DISPLAY`, `XAUTHORITY`, and `DBUS_SESSION_BUS_ADDRESS`. Today's unit sets none of them, and the launch happens in `server.js`, which inherits Claude Code's environment. Moving the launch into the daemon makes plumbing the graphical session into the user unit a setup requirement rather than an incidental, and a hard one: without it the daemon cannot launch a browser, and headless is not offered, since the `needs_human` handoff requires a window the human can reach.
+**Graphical session environment.** The daemon launches a headful browser and fires desktop notifications, so it needs `DISPLAY` or `WAYLAND_DISPLAY`, `XAUTHORITY`, and `DBUS_SESSION_BUS_ADDRESS`. Today's unit sets none of them, and the launch happens in `server.js`, which inherits Claude Code's environment. Moving the launch into the daemon would make plumbing the graphical session into the user unit a setup requirement, so the bridge keeps supplying it: each request carries an allowlist of those variables, and the daemon uses its own environment when it has a display and the bridge's otherwise. Without either the daemon cannot launch a browser, and headless is not offered, since the `needs_human` handoff requires a window the human can reach.
 
-The second OS user is the awkward case, and the identical-shape requirement holds for the browser but not for notifications. That user has no login session of its own to import an environment from — its `DISPLAY` arrives through Claude Code today, which is exactly what the daemon-side launch removes — so the unit needs the value supplied directly. Notifications are worse: `notify-send` from that user reaches that user's session bus, which no notification daemon watches, and it cannot reach the human's bus through a `0700` runtime directory. Sessions run by the second user therefore fall back to reporting a challenge in chat, which is where the handoff was always going to end up for a human who is not watching the desktop.
+The second OS user is the case this serves, and the identical-shape requirement holds for the browser but not for notifications. That user has no login session of its own to import an environment from — its `DISPLAY` arrives through Claude Code, and now reaches the daemon the same way. Notifications are worse: `notify-send` from that user reaches that user's session bus, which no notification daemon watches, and it cannot reach the human's bus through a `0700` runtime directory. Sessions run by the second user therefore fall back to reporting a challenge in chat, which is where the handoff was always going to end up for a human who is not watching the desktop.
 
-**Concurrency and the time budget.** Every Claude Code session for one OS user multiplexes over a single pipe into a single browser process, and the daemon runs one command at a time per target while interleaving across targets. A CDP response arrives as one message, so a large payload cannot be streamed — the accessibility pull is narrowed into several commands over partial subtrees instead. A screenshot cannot be narrowed that way, since it is one response of whatever size the page dictates. Full-page capture therefore carries its own dimension and scale cap; `max_chars` bounds text and does nothing for an image block. The budget is tightest at cold start, where a browser launch, handshake, and navigation all land inside a single tool call against `server.js`'s 35-second request timeout. Once settle detection exists it shares that window too, taking its timeout from what remains after the launch.
+**Concurrency and the time budget.** Every Claude Code session for one OS user multiplexes over a single pipe into a single browser process, and the daemon runs one command at a time per target while interleaving across targets. A CDP response arrives as one message, so a large payload cannot be streamed — the accessibility pull is narrowed into several commands over partial subtrees instead. A screenshot cannot be narrowed that way, since it is one response of whatever size the page dictates. Full-page capture is therefore split into a capped number of viewport-sized segments; `max_chars` bounds text and does nothing for an image block. The budget is tightest at cold start, where a browser launch, handshake, and navigation all land inside a single tool call against `server.js`'s 35-second request timeout. Once settle detection exists it shares that window too, taking its timeout from what remains after the launch.
 
 **Diagnostics.** This project deletes a substantial `[debug]` instrumentation layer — focus-probe logging, bind-reason logging, extension-side window logging — while moving onto a protocol whose failures are opaque. The action log is a product feature rather than a diagnostic, so the daemon carries its own leveled logging to the journal: protocol commands and errors at debug, browser lifecycle and gate decisions at info.
 
@@ -264,7 +267,7 @@ Beyond those, the CDP client, tree pruning, and settle detection need a recorded
 14. Reads combine the accessibility tree for controls and structure with a Readability and Turndown pass run in an isolated world.
 15. Reads follow attached out-of-process iframe targets, marking frame boundaries in the output.
 16. Read output is interleaved markdown with inline refs.
-17. A ref is a `backendDOMNodeId` scoped to its frame target and document generation; a ref used outside that scope returns `stale_ref`.
+17. A ref is a `backendDOMNodeId` scoped to its frame target and document generation; a ref used after that document changed returns `stale_ref`, and a ref that is wrong within the same document — never read, or since removed — returns `error`.
 18. Reads return visible elements only by default, report the skipped count, and take a `hidden` parameter to include them.
 19. Reads strip to the main content region by default, report what was dropped, and take a parameter to include it.
 20. Repeated links are deduplicated.
@@ -272,16 +275,16 @@ Beyond those, the CDP client, tree pruning, and settle detection need a recorded
 22. A `since` parameter returns what changed after an action.
 23. Nothing is truncated silently; every response states what was cut and how to retrieve more.
 24. `max_chars` and `offset` are introduced as a size backstop, replacing today's fixed character cut.
-25. Every action's returned payload is wrapped in `<<<claudesurf-untrusted:NONCE>>>` markers with a per-call random nonce. `screenshot` is exempt, since a delimiter is text and the payload is an image.
+25. Every action's returned text payload is wrapped in `<<<claudesurf-untrusted:NONCE>>>` markers with a per-call random nonce, `screenshot`'s URL and title lines included. Image blocks are exempt, since a delimiter is text.
 26. The nonce is generated after the payload arrives; no look-alike stripping is performed.
 27. Wrapping happens in `server/server.js`.
 28. The "data, not instructions" reminder lives in the tool description, plus a short tag on the closing delimiter if that proves to help.
 29. Typing, key presses, option select, and history navigation are supported. File upload is not.
 30. Tab control covers list, new, switch, and close, and refuses to close a session's identity tab.
-31. Screenshots capture the viewport, and the full page when asked, under a dimension and scale cap.
+31. Screenshots capture the viewport, and the full page when asked, as a capped number of viewport-sized segments.
 32. Actions return the resulting URL, title, and a summary of what changed, after waiting for the page to settle.
 33. A page-settled signal distinguishes a skeleton from a finished page.
-34. Input is dispatched through CDP so events are trusted.
+34. Keyboard input is dispatched through CDP so events are trusted. Clicks are scripted by default, since a dispatched pointer press raises the window, and trusted on request.
 35. Every action returns one of the fixed outcomes in the result envelope.
 36. Challenges, login walls, and two-factor prompts return `needs_human` with type, URL, title, and session name. No screenshot is taken and focus is left alone.
 37. No tool call blocks waiting on the human.
@@ -298,7 +301,7 @@ Beyond those, the CDP client, tree pruning, and settle detection need a recorded
 48. A target the page opens is attached paused, so its first navigation is gated like any other.
 49. JavaScript dialogs are dismissed and reported; `beforeunload` is accepted so a human-initiated close proceeds.
 50. Downloads are declined and the refusal is reported.
-51. The second OS user's unit is given the graphical session values directly, and its notifications fall back to chat.
+51. The graphical session values reach the daemon from its own environment or, failing that, from the bridge, which sends an allowlist of them with each request; a unit drop-in remains an option for either user. The second OS user's notifications fall back to chat.
 
 ## Phases
 
@@ -310,7 +313,7 @@ Two deliberate narrowings sit inside that. Phase 3's domain gate stops an unlist
 
 The daemon gains a CDP client, launches and owns a dedicated Chrome, takes over the window, tab, and session management the extension does today, and the extension is deleted. The MCP surface becomes the two tools with the result envelope and the nonce delimiter. Reads return text, title, URL, and a flat list of interactive elements carrying refs, link targets, and labels, so clicking is ref-addressed from the start. `navigate`, `scroll`, `screenshot`, and `info` come across with it, and `max_chars` and `offset` replace today's silent character cut. `navigate` waits for the load event as it does today and accepts `http` and `https` only, ahead of the allowlist; the schemes it now refuses are ones today's reads already fail on.
 
-Against today, this phase adds buttons and `[role]` controls where reads returned only anchors, refs in place of brittle `nth-child` paths, full-page screenshots, and a way to page through a large read. Three things are given up, each a consequence of a decision taken above rather than of this phase:
+Against today, this phase adds buttons and `[role]` controls where reads returned only anchors, refs in place of brittle `nth-child` paths, full-page screenshots, and a way to page through a large read. Four things are given up, each a consequence of a decision taken above rather than of this phase:
 
 1. The dedicated profile carries none of the everyday browser's logins, so each site has to be signed into once.
 2. The identity tab is no longer pinned, so it loses the property that makes it recognizable at a glance.
@@ -321,7 +324,7 @@ Against today, this phase adds buttons and `[role]` controls where reads returne
 - **The phase lands as a named sequence, not one commit.** Transport and browser lifecycle first, then session windows and targets, then the tool contract, then the read and click path — each verifiable before the next. The alternative, splitting transport from contract into two phases, would need a throwaway adapter serving six doomed tools over CDP.
 - **The extension is deleted in the same commit that completes the CDP path.** Deleting it earlier would leave the tree with no working transport, and the window model is proven before that commit lands, so the cutover has a fallback until it is known to work.
 - **This phase's reads come from a flat DOM walk in an isolated world, not the accessibility tree.** Phase 2 replaces the source. What stays fixed across that swap is the action signature and the ref semantics, not the output, which phase 2 changes materially.
-- **Clicks resolve a ref to coordinates and dispatch a real mouse event**, so handlers depending on a genuine event sequence behave.
+- **Clicks run as a scripted click in the isolated world by default, and `trusted: true` resolves the ref to coordinates and dispatches real pointer events.** A pointer press raises the session window to the front, so the trusted path is opt-in for the handlers that need a genuine event sequence.
 - **The profile directory persists across reboots.** Logins and cleared challenges are the point of a dedicated profile, so it lives in the user's home rather than the runtime directory.
 - **The working tab is identified by recorded target id**, since pinning is gone and the identity tab can no longer be excluded by a flag.
 
