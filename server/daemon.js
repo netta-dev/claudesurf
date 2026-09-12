@@ -18,7 +18,7 @@ const http = require('http');
 const net = require('net');
 const fs = require('fs');
 const { WebSocketServer } = require('ws');
-const { daemonSocketPath } = require('./socket-path');
+const { daemonSocketPath } = require('./paths');
 
 const WS_PORT = Number(process.env.CLAUDESURF_WS_PORT) || 7865;
 const SOCK = daemonSocketPath();

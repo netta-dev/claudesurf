@@ -3,6 +3,12 @@
   "version": "1.0.0",
   "description": "MCP server bridging Claude Code to Chrome via WebSocket",
   "main": "server.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test '../test/**/*.test.js'"
+  },
   "dependencies": {
     "ws": "^8.16.0"
   }

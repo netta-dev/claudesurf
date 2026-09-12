@@ -8,7 +8,7 @@ const http = require('http');
 const readline = require('readline');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
-const { daemonSocketPath } = require('./socket-path');
+const { daemonSocketPath } = require('./paths');
 
 // The daemon's command channel is a per-user Unix socket (0600), so only this OS user
 // can reach it — that's the isolation boundary from any other user on the box.
