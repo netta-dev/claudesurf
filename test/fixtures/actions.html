@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Actions fixture</title>
+<style>
+  #covered { position: relative; }
+  #overlay { position: absolute; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,.3); z-index: 10; }
+  .stage { position: relative; width: 200px; height: 40px; }
+</style>
+</head>
+<body>
+  <h1>Actions</h1>
+  <p id="log">nothing yet</p>
+  <button id="handler" onclick="document.getElementById('log').textContent = 'handled ' + (event.isTrusted ? 'trusted' : 'scripted')">Handler button</button>
+  <button id="trusted-only" onclick="if (event.isTrusted) document.getElementById('log').textContent = 'trusted only fired'">Trusted only</button>
+  <div class="stage"><button id="covered" onclick="document.getElementById('log').textContent = 'covered clicked'">Covered button</button><div id="overlay"></div></div>
+  <button disabled>Disabled button</button>
+  <a href="/other">Same tab link</a>
+  <a href="/other" target="_blank">New tab link</a>
+  <a href="/download">Download link</a>
+  <button onclick="history.pushState({}, '', '/actions.html?pushed=1'); document.getElementById('log').textContent = 'pushed'">Push state</button>
+  <button onclick="alert('Alert text from the page')">Alert button</button>
+  <button onclick="window.addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = ''; }); document.getElementById('log').textContent = 'armed'">Arm beforeunload</button>
+  <form method="post" action="/slow"><button type="submit">Slow submit</button></form>
+  <p>Trailing text so a small max_chars cuts before the elements.</p>
+</body>
+</html>

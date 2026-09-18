@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Labels fixture</title></head>
+<body>
+  <h1>Labels</h1>
+  <p>Body text of the labels fixture.</p>
+  <button aria-label="From aria-label">ignored text</button>
+  <span id="lbl">From aria-labelledby</span>
+  <button aria-labelledby="lbl"></button>
+  <label for="named">From label element</label><input id="named" type="text">
+  <a href="/other">From innerText</a>
+  <a href="/other"><img alt="From img alt" src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA="></a>
+  <button title="From title"></button>
+  <input type="search" placeholder="From placeholder">
+  <input type="submit" value="From value">
+  <input type="checkbox" checked aria-label="Checked box">
+  <select aria-label="Chooser"><option>one</option></select>
+  <textarea aria-label="Notes"></textarea>
+  <div role="button" tabindex="0">Role button</div>
+  <div role="presentation">not interactive</div>
+  <button disabled>Disabled control</button>
+  <button style="display:none">Display none</button>
+  <div aria-hidden="true"><button>Aria hidden</button></div>
+  <button style="opacity:0">Transparent</button>
+  <div id="host"></div>
+  <a href="/other" style="position:absolute; top: 5000px">Offscreen link</a>
+  <script>
+    const root = document.getElementById('host').attachShadow({ mode: 'open' });
+    root.innerHTML = '<button>Shadow button</button>';
+  </script>
+</body>
+</html>
