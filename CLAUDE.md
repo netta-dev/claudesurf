@@ -1,14 +1,14 @@
 # claudesurf
 
-Chrome extension + MCP server that lets Claude Code read and interact with web pages in your already-open Chrome browser. Uses your real browser session — cookies, logins, everything.
+MCP server that lets Claude Code read and interact with web pages in a dedicated Chrome it launches and owns. Each Claude Code session gets its own window in that browser; the browser's profile keeps its own logins.
 
 ## Stack
 
-node.js, ws, chrome extension (manifest v3), MCP stdio
+node.js 22 (no dependencies), Chrome DevTools Protocol over `--remote-debugging-pipe`, MCP stdio
 
-Two pieces in `server/`: `daemon.js` is one persistent process that owns WebSocket connections to all loaded Chrome extension instances (one per profile) and serves an HTTP API; `server.js` is a thin MCP stdio bridge, one per Claude Code session, that forwards to the daemon. `extension/` is a manifest v3 Chrome extension that connects to the daemon over WebSocket (port 7865). Each Claude Code session gets its own dedicated Chrome window; multiple loaded profiles let the daemon route different sessions to different profiles based on which had OS focus at bind time.
+Two processes in `server/`: `daemon.js` is one persistent process per OS user that launches Chrome as its child, speaks CDP to it over the pipe, and serves an HTTP API on a per-user Unix socket; `server.js` is a thin MCP stdio bridge, one per Claude Code session, that validates calls, forwards them to the daemon, and wraps page-derived text in a nonce delimiter. The MCP surface is two tools, `claudesurf_read` and `claudesurf_act`, each taking an `action`.
 
-See `README.md` for install, systemd setup, MCP tool list, and troubleshooting.
+See `README.md` for setup, systemd, the tool table, and troubleshooting.
 
 ---
 

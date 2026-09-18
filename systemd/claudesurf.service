@@ -1,12 +1,18 @@
 [Unit]
-Description=ClaudeSurf daemon
+Description=ClaudeSurf daemon (dedicated Chrome over the DevTools protocol)
 # Never give up restarting — otherwise systemd parks it in "failed" after 5 quick
 # restarts, defeating Restart=always for a long-lived daemon.
 StartLimitIntervalSec=0
 
 [Service]
 # %h = the running user's home, so this one unit works for any user's clone.
-# Listens on the default extension port 7865 + this user's command socket.
+# The daemon needs a graphical session to launch Chrome. It takes DISPLAY and friends
+# from its own environment when the user manager imported them (desktop logins), and
+# otherwise from the values the MCP bridge sends with each request. To pin them
+# instead, add a drop-in claudesurf.service.d/display.conf with
+#     [Service]
+#     Environment=DISPLAY=:0 XAUTHORITY=
+# (XAUTHORITY empty for a user reaching the X server through an xhost grant).
 ExecStart=/usr/bin/node %h/workspaces/claudesurf/server/daemon.js
 Restart=always
 RestartSec=3

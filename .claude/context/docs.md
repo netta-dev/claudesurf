@@ -1,4 +1,4 @@
 # Docs
 
-- `README.md` — install, systemd setup, MCP tool list, troubleshooting.
-- `.claude/context/architecture.md` — daemon/server/extension layering, per-session windows, multi-profile routing, storage layout, MV3 gotchas.
+- `README.md` — setup, systemd and the graphical environment, the two tools and their actions, the dedicated profile, troubleshooting, migration from the extension.
+- `.claude/context/architecture.md` — daemon/bridge modules, request flow, targets and attach, session windows and repair, refs and generations, isolated worlds, dialogs, protocol gotchas.

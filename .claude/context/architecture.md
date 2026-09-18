@@ -1,45 +1,51 @@
 # Architecture
 
-## Three layers
+## Modules
 
-- **`server/server.js`** — one process per Claude Code session, MCP stdio bridge. Tags every HTTP request to the daemon with a `SESSION_ID` that's stable for the Claude Code session (from `CLAUDE_CODE_SESSION_ID`), so a respawned MCP process reuses the same window.
-- **`server/daemon.js`** — one persistent process, owns all WebSocket connections to Chrome extension instances (one per Chrome profile). Routes each `sessionId` to a chosen extension and remembers the binding.
-- **`extension/`** — manifest v3 Chrome extension, one loaded per Chrome profile. Receives `sessionId` on every action; maintains a `sessionId → windowId` map in `chrome.storage.session`; targets ops at the active non-pinned tab inside that session's dedicated window.
+- **`server/server.js`** — MCP stdio bridge, one per Claude Code session. Validates calls with `dispatch.js`, POSTs `{sessionId, tool, action, args, env}` to the daemon over the `0600` Unix socket, renders the envelope with page text inside the nonce delimiter, and maps its own failures onto outcomes (unreachable daemon → `setup_error`, request timeout → `error`). `sessionId` comes from `CLAUDE_CODE_SESSION_ID` so a respawned bridge reuses its window.
+- **`server/daemon.js`** — one per OS user: the HTTP server on the socket, the action handlers, and `ensureBrowser` (coalesced launch; retains the last request's graphical environment).
+- **`server/dispatch.js`, `envelope.js`, `diagnostics.js`** — loaded by both: the action table with validation and tool definitions, the outcome vocabulary, and the leveled stderr logger (journald `<N>` prefixes under `JOURNAL_STREAM`).
+- **`server/cdp.js`** — the protocol client: NUL-delimited JSON over the pipe's fds 3 and 4, id correlation, `sessionId` routing, event fan-out, timeouts and deadlines, EOF and pipe error both as close.
+- **`server/browser.js`** — binary lookup, graphical environment, launch and handshake, the browser record, orphan reap, `enableTargets` (auto-attach and download denial).
+- **`server/sessions.js`** — `Session` records (window, identity and working targets, label, queue, notes, ref sets, page-opened targets) and the target registry (window, generation, isolated world, load and navigation counters, dialogs). Window creation and repair live here.
+- **`server/read.js`** — `page` (walk, refs, payload assembly), `info`, `screenshot`. **`server/input.js`** — `navigate`, `click`, `scroll`.
+- **`server/page/*.js`** — page-side scripts (walk, click, scroll) run in the browser and sent as source; never `require`d.
+- **`server/static/session.html`** — the session page both tabs start on, addressed by `file://`; role, session id, and start time in the URL fragment; `render(name, description)` for the label; two `target=_blank` links to itself that the daemon clicks to open the other role's tab.
+- **`server/paths.js`** — socket, profile, and record paths with their overrides.
 
-## Per-session windows
+## Request flow
 
-Each `sessionId` gets its own Chrome window. First action from a sessionId creates a window:
+`validate` → `ensureBrowser` (one launch for a burst of first calls) → `sessions.ensure(sessionId)` (serialized per session, creates or repairs the window) → the handler under the session's queue → notes and dismissed-dialog lines added → envelope. The bridge times out at 35 s; the daemon runs every request under a 33 s deadline (launch 15 s, window creation 5 s, `navigate` load ≤ 25 s or what remains minus 2 s).
 
-- Tab 1: `chrome-extension://…/session.html` — **pinned** as the window's persistent visual identity. Shows the session name + start time. Reads + re-renders live via `chrome.storage.onChanged`.
-- Tab 2: `about:blank` — the **working tab** Claude navigates and operates on.
+## Targets and attach
 
-All tab ops (`read_page`, `click`, `scroll`, `navigate`, `screenshot`, `get_page_info`) target the **active non-pinned tab**. If the user clicks the pinned session tab, ops fall back to the most-recently-accessed non-pinned tab. If all non-pinned tabs are closed, a fresh `about:blank` is created on demand.
+`Target.setAutoAttach` runs with `flatten` and `waitForDebuggerOnStart` for `page` and `iframe` targets. The attach handler records the target, queues `Browser.getWindowForTarget`, `Page.enable`, and `Emulation.setFocusEmulationEnabled`, sends `Runtime.runIfWaitingForDebugger`, and only then awaits the queued commands: awaiting first deadlocks on a noopener-opened tab, whose `Page.enable` answers only after the commit the pause holds back. A target whose URL is the session page with `#role=<identity|working>&session=<id>` is claimed for that role, at attach or on its first main-frame `Page.frameNavigated` (or from `Page.getFrameTree` when the attach carried no URL); otherwise a target with an `openerId` owned by a session is recorded as page-opened under that session; anything else stays unowned.
 
-## Multi-profile routing
+## Session windows
 
-The daemon tracks all connected extensions in `connectedExtensions: Set<WebSocket>` and binds each session to one via `sessionBindings: Map<sessionId, WebSocket>`. On the first request for a new sessionId, it probes all connected extensions in parallel with the reserved internal action `__claudesurf_get_focus` (500 ms timeout) and binds to the profile whose `lastFocusedAt` is highest. After binding, the session sticks to that profile even if the user alt-tabs.
+`Target.createTarget({newWindow: true, background: true})` opens the session page as the working tab. The identity tab is opened from it by Ctrl-clicking the page's identity link with real mouse events (`modifiers: 2`), which yields a background tab, so the working tab stays active. Repairs on the next `ensure`: working tab gone and identity page intact → a scripted `userGesture` click on the identity page's working link (a foreground tab, in whatever window the identity tab now sits); working tab gone and identity tab gone or navigated away → the whole window recreated under the retained label; identity tab gone alone → left absent. Pipe EOF drops every window and target; labels survive.
 
-Each extension tracks profile focus via `chrome.windows.onFocusChanged` (writes to `chrome.storage.session` key `lastFocusedAt`, debounced to 1 s) and a one-shot `getLastFocused` seed at extension load.
+## Refs and worlds
 
-On socket disconnect, sessions bound to that socket are dropped — the next request re-picks based on current focus.
+A ref is `e<backendDOMNodeId>`. Each session keeps a `{generation, ids}` set per target: the union of every id a read found at that generation. The generation increments on a main-frame `Page.frameNavigated` only (pushState leaves it). A click against a set of another generation returns `stale_ref`; an id not in the set, or one that no longer resolves, returns `error`. Every page-side script runs in one isolated world per target and generation (`Page.createIsolatedWorld`, world name `claudesurf`), recreated once when a command reports the context missing; the one main-world call is `render` on the session page.
 
-## Reserved action namespace
+## Dialogs, clicks, downloads
 
-Action names starting with `__claudesurf_` are daemon-initiated internal RPC and rejected at the `/api` boundary, so MCP clients can't address them. Currently only `__claudesurf_get_focus` exists.
+`Page.javascriptDialogOpening` is answered at once (`accept: false`, `beforeunload` accepted) and queued on the target; the daemon appends `Dialog (<type>): <message>` to the next payload. After a click the daemon waits up to 300 ms for `Page.frameStartedNavigating` with a cross-document `navigationType`, then up to 10 s for the load event; `Page.downloadWillBegin` ends the wait, since a denied download never commits. A target attributed to the session during the wait is reported as a tab (same `windowId`) or a popup.
 
 ## Storage
 
-`chrome.storage.session` — in-memory only, survives MV3 service worker restarts within a Chrome run, cleared on extension reload and Chrome restart. Keys:
-
-- `session:<sessionId>` → `windowId` (per-session)
-- `sessionName:<sessionId>` → `{ name, description }` (per-session)
-- `lastFocusedAt` → millisecond timestamp (per-profile, not per-session)
-
-No `chrome.storage.local`. No persistence across browser restarts by design — `chrome.storage.session` is cleared on restart, so windows aren't reattached even though the `SESSION_ID` is now stable.
+Nothing persists beyond the Chrome profile directory and the browser record beside the socket (`<socket basename>.browser.json`, `{pid, startTime}`), written at launch, cleared on pipe close, left in place on daemon exit so the next daemon can reap an orphan.
 
 ## Non-obvious gotchas
 
-- **`session.html` inline scripts are blocked by MV3 CSP.** All page logic must live in `extension/session.js` and be referenced via `<script src>`.
-- **`chrome.windows.create({ focused: false })` is not honored on Linux/X11** — the dedicated window pops to foreground on creation. Subsequent ops (navigate, scroll, etc.) don't steal focus.
-- **`chrome.tabs.captureVisibleTab(windowId)` captures whichever tab is active in that window.** If the user is viewing the pinned session tab, screenshot captures that, not the working tab.
-- **`isSessionLandingPage(url)` short-circuits ops on any content-script-incapable URL** (`about:blank`, `chrome://*`, `chrome-extension://*`, `chrome-untrusted://*`, `devtools://*`, `view-source:*`, `file://*`) with a friendly "navigate first" message.
+- `Input.dispatchMouseEvent` raises the session window; so does any page-initiated target creation. Scripted clicks, keys, navigation, and screenshots don't.
+- Input into a tab that is not its window's active tab stalls about 5 s per event without `Emulation.setFocusEmulationEnabled`; every attached page target gets it.
+- `Runtime.enable` and `DOM.enable` are never sent: everything used works without them, and `Runtime.enable` is detectable by page script.
+- `document.visibilityState` reports `visible` on both tabs in headful, so it can't tell the active tab; the X window title can.
+- Chrome exits when the pipe closes, so a daemon exit takes the browser with it; the record and reap path covers the case where it doesn't.
+- `Page.enable` on a paused noopener-opened tab answers only after the release.
+- `Target.targetInfoChanged` needs `Target.setDiscoverTargets`, which is not enabled; URL changes come from `Page.frameNavigated`, whose `frame.url` omits the fragment (`frame.urlFragment` carries it).
+- `Page.frameStartedLoading` also fires for pushState; `Page.frameStartedNavigating` carries the `navigationType` that tells them apart.
+- `--no-startup-window` plus the pipe keep Chrome alive with zero windows.
+- Exit code 21 before the handshake means the profile is held by another instance.
