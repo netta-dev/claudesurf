@@ -1,9 +1,6 @@
 // Leveled logging to stderr. Level from CLAUDESURF_LOG_LEVEL (debug|info|warn|error,
 // default info), read when the logger is created. Under systemd (JOURNAL_STREAM set)
 // each line carries a <N> syslog priority prefix so journald files it by level.
-//
-// This module never sees action records; the action log is a separate module so a
-// credential-bearing record cannot reach the journal through an import mix-up.
 
 const LEVELS = { debug: 7, info: 6, warn: 4, error: 3 };
 
@@ -25,4 +22,4 @@ function createLogger(scope, { env = process.env, write = (s) => process.stderr.
   return { debug: emit('debug'), info: emit('info'), warn: emit('warn'), error: emit('error') };
 }
 
-module.exports = { createLogger, LEVELS };
+module.exports = { createLogger };

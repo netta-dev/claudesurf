@@ -8,6 +8,8 @@ const fs = require('fs');
 const path = require('path');
 const { spawnDaemon, request, waitFor } = require('./helpers');
 
+const script = (name) => path.join(__dirname, 'fakes', 'scripts', name);
+
 let daemon;
 before(async () => { daemon = await spawnDaemon(); });
 after(() => daemon.stop());
@@ -92,6 +94,52 @@ test('a second session gets its own window', async () => {
   assert.match(info.payload, /session=d2/);
   const health = await request({ socketPath: daemon.socketPath });
   assert.strictEqual(health.body.sessions, 2);
+});
+
+test('a dialog dismissed during an action lands in its payload and note, once', async () => {
+  const own = await spawnDaemon({ env: { CLAUDESURF_FAKE_SCRIPT: script('dialog-on-click.js') } });
+  try {
+    await own.call('d1', 'claudesurf_act', 'navigate', { url: 'http://fake.test/', name: 'dialogs' });
+    const page = await own.call('d1', 'claudesurf_read', 'page');
+    const ref = page.payload.match(/\[(e\d+)\] button "Go"/)[1];
+    const click = await own.call('d1', 'claudesurf_act', 'click', { ref });
+    assert.strictEqual(click.outcome, 'success', JSON.stringify(click));
+    assert.strictEqual(click.payload, 'URL: http://fake.test/\nTitle: Fake page\nNavigated: no\nDialog (confirm): Leave the page?');
+    assert.deepStrictEqual(click.notes, ['a confirm dialog was dismissed']);
+    const info = await own.call('d1', 'claudesurf_read', 'info');
+    assert.ok(!info.payload.includes('Dialog'), 'reported once');
+    assert.strictEqual(info.notes, undefined);
+  } finally {
+    own.stop();
+  }
+});
+
+test('a target destroyed mid-action is reported as the working tab being gone', async () => {
+  const own = await spawnDaemon({ env: { CLAUDESURF_FAKE_SCRIPT: script('destroy-on-walk.js') } });
+  try {
+    await own.call('d1', 'claudesurf_act', 'navigate', { url: 'http://fake.test/', name: 'gone' });
+    const page = await own.call('d1', 'claudesurf_read', 'page');
+    assert.strictEqual(page.outcome, 'error');
+    assert.strictEqual(page.message, 'The working tab is gone; retry the action.');
+  } finally {
+    own.stop();
+  }
+});
+
+test('a launch whose setup step fails is not kept as the live browser', async () => {
+  const own = await spawnDaemon({ env: { CLAUDESURF_FAKE_SCRIPT: script('refuse-auto-attach.js') } });
+  try {
+    const first = await own.call('d1', 'claudesurf_read', 'info');
+    assert.strictEqual(first.outcome, 'error');
+    assert.match(first.message, /Browser setup failed: .*auto-attach refused/);
+    const health = await request({ socketPath: own.socketPath });
+    assert.strictEqual(health.body.browser, 'none');
+    const second = await own.call('d1', 'claudesurf_read', 'info');
+    assert.strictEqual(second.outcome, 'error');
+    assert.strictEqual((own.log().match(/browser pid \d+: FakeChrome/g) || []).length, 2, 'the next call launched again');
+  } finally {
+    own.stop();
+  }
 });
 
 test('SIGTERM leaves the browser record for the next daemon and unlinks the socket', async () => {

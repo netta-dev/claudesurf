@@ -1,5 +1,5 @@
 // The bridge's behaviour when the daemon is unreachable. The daemon runs under
-// systemd with Restart=always, so a crash is back in ~3 s; the bridge retries a
+// systemd with Restart=always, so the daemon is back ~3 s after a crash; the bridge retries a
 // not-reached daemon over that window (ENOENT while the socket file is gone,
 // ECONNREFUSED while nothing accepts) and, if it stays down, returns setup_error
 // pointing at the service.

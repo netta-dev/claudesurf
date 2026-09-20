@@ -16,7 +16,8 @@ const { createLogger } = require('./diagnostics');
 const envelope = require('./envelope');
 const { validate, withDefaults } = require('./dispatch');
 const browser = require('./browser');
-const { Sessions } = require('./sessions');
+const { Sessions, TargetGoneError } = require('./sessions');
+const { OutcomeError, WORKING_TAB_GONE } = require('./action-support');
 const read = require('./read');
 const input = require('./input');
 
@@ -31,7 +32,7 @@ let live = null; // { conn, child } while the browser is up
 let launching = null;
 let lastRequestEnv = {};
 
-// Coalesced: a burst of first calls launches one browser. Retains the request's
+// A burst of first calls launches one browser. Retains the request's
 // graphical environment for child processes spawned later.
 function ensureBrowser(requestEnv) {
   if (requestEnv && Object.keys(requestEnv).length) lastRequestEnv = requestEnv;
@@ -41,13 +42,19 @@ function ensureBrowser(requestEnv) {
       const env = browser.graphicalEnv(process.env, lastRequestEnv);
       const binary = browser.locateBinary();
       const launched = await browser.launch({ binary, profileDir: PROFILE, env, log });
-      live = launched;
       launched.conn.onClose(() => {
         if (live === launched) live = null;
         log.info('browser connection closed');
       });
       sessions.attach(launched.conn);
-      await browser.enableTargets(launched.conn);
+      try {
+        await browser.enableTargets(launched.conn);
+      } catch (e) {
+        // Window creation needs auto-attach; closing the pipe exits Chrome.
+        launched.conn.close();
+        throw new browser.BrowserError(`Browser setup failed: ${e.message}`);
+      }
+      live = launched;
       return launched;
     })().finally(() => { launching = null; });
   }
@@ -64,7 +71,8 @@ const HANDLERS = {
 };
 
 function failureEnvelope(e) {
-  if (e instanceof read.OutcomeError) return e.envelope;
+  if (e instanceof OutcomeError) return e.envelope;
+  if (e instanceof TargetGoneError) return envelope.error(WORKING_TAB_GONE);
   if (e instanceof browser.SetupError) return envelope.setupError(e.message);
   log.warn(`action failed: ${e.stack || e.message}`);
   return envelope.error(e.message);
@@ -77,9 +85,8 @@ async function runAction({ sessionId, tool, action, args, env }) {
   const deadline = Date.now() + REQUEST_BUDGET_MS;
   try {
     await ensureBrowser(env);
-    const session = await sessions.ensure(sessionId, { deadline });
+    const { session, notes } = await sessions.ensureWithNotes(sessionId, { deadline });
     return await session.run(async () => {
-      const notes = session.takeNotes();
       let result;
       try {
         result = await HANDLERS[action](session, a, deadline);

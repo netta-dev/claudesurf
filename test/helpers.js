@@ -23,6 +23,35 @@ function tmpSocket() {
   return path.join(tmpDir(), 'cs.sock');
 }
 
+// Sets process.env entries (null unsets) and returns the function that restores them.
+function setEnv(overrides) {
+  const saved = {};
+  for (const [k, v] of Object.entries(overrides)) {
+    saved[k] = process.env[k];
+    if (v === null) delete process.env[k]; else process.env[k] = v;
+  }
+  return () => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  };
+}
+
+// Runs fn with the overrides in place and restores them after it settles.
+async function withEnv(overrides, fn) {
+  const restore = setEnv(overrides);
+  try { return await fn(); } finally { restore(); }
+}
+
+// A temp directory with its own socket path (hence record path) and profile, both
+// removed and the env restored when the test ends.
+function isolatedPaths(t, prefix = 'claudesurf-test') {
+  const dir = tmpDir(prefix);
+  const restore = setEnv({ CLAUDESURF_SOCKET: path.join(dir, 'cs.sock') });
+  t.after(() => { restore(); fs.rmSync(dir, { recursive: true, force: true }); });
+  return { dir, profileDir: path.join(dir, 'profile'), record: path.join(dir, 'cs.browser.json') };
+}
+
 // In-process fake browser behind a Connection, with Sessions attached and auto-attach
 // enabled, as the daemon does after a launch.
 function fakeSession() {
@@ -154,12 +183,13 @@ function liveBinary() {
 }
 
 // Launches the real browser against a temp profile with Sessions attached; headless
-// unless asked otherwise. Own socket path so the record lands in the temp directory.
+// unless asked otherwise. Own socket path, so the record lands in the temp
+// directory; the env is restored and the directory removed by close().
 async function liveBrowser({ headless = true } = {}) {
   const browser = require('../server/browser');
   const { Sessions } = require('../server/sessions');
   const dir = tmpDir('claudesurf-live');
-  process.env.CLAUDESURF_SOCKET = path.join(dir, 'cs.sock');
+  const restore = setEnv({ CLAUDESURF_SOCKET: path.join(dir, 'cs.sock') });
   const env = headless ? {} : browser.graphicalEnv(process.env, {});
   const { conn, child } = await browser.launch({ binary: liveBinary(), profileDir: path.join(dir, 'profile'), env, headless, log: silentLog });
   const sessions = new Sessions(silentLog);
@@ -171,9 +201,10 @@ async function liveBrowser({ headless = true } = {}) {
       await conn.send('Browser.close').catch(() => {});
       await waitFor(() => child.exitCode !== null || child.signalCode !== null, 5000);
       if (child.exitCode === null) child.kill('SIGKILL');
+      restore();
       fs.rmSync(dir, { recursive: true, force: true });
     },
   };
 }
 
-module.exports = { silentLog, tmpDir, tmpSocket, fakeSession, sleep, waitFor, request, spawnDaemon, mockDaemon, callBridge, liveBinary, liveBrowser, SERVER_DIR, FAKE_CHROME };
+module.exports = { silentLog, tmpDir, tmpSocket, setEnv, withEnv, isolatedPaths, fakeSession, sleep, waitFor, request, spawnDaemon, mockDaemon, callBridge, liveBinary, liveBrowser, FAKE_CHROME };

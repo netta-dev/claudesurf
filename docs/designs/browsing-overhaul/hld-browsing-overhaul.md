@@ -1,7 +1,7 @@
 # browsing-overhaul
 
 **Last reviewed**: 2026-09-10
-**Status**: Phase 1 LLD committed
+**Status**: Phase 1 complete
 **Companions**: [use cases](../use-cases-browsing-overhaul.md) · [future](../future-claudesurf.md)
 
 ## Overview

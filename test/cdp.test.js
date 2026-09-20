@@ -51,16 +51,14 @@ test('times out per command and by absolute deadline', async () => {
   assert.ok(Date.now() - started < 1000, 'deadline bounded the wait');
 });
 
-test('dispatches events with their sessionId and supports waitFor', async () => {
+test('dispatches events with their sessionId until the handler unsubscribes', async () => {
   const { conn, reply } = pair();
   const seen = [];
   const off = conn.on('Page.loadEventFired', (params, sessionId) => seen.push([params.timestamp, sessionId]));
-  const waited = conn.waitFor('Page.loadEventFired', (p, sid) => sid === 'S2');
   reply({ method: 'Page.loadEventFired', params: { timestamp: 1 }, sessionId: 'S1' });
   reply({ method: 'Page.loadEventFired', params: { timestamp: 2 }, sessionId: 'S2' });
   await tick();
   assert.deepStrictEqual(seen, [[1, 'S1'], [2, 'S2']]);
-  assert.deepStrictEqual(await waited, { timestamp: 2 });
   off();
   reply({ method: 'Page.loadEventFired', params: { timestamp: 3 }, sessionId: 'S1' });
   await tick();

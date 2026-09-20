@@ -79,30 +79,6 @@ class Connection {
     return () => this.handlers.get(method).delete(handler);
   }
 
-  // Resolves the next event of `method` whose (params, sessionId) satisfies `predicate`,
-  // or rejects with TimeoutError. Subscribe before issuing the command that causes it.
-  waitFor(method, predicate = () => true, { timeout = DEFAULT_TIMEOUT_MS, deadline } = {}) {
-    let ms = timeout;
-    if (deadline !== undefined) ms = Math.max(1, Math.min(ms, deadline - Date.now()));
-    return new Promise((resolve, reject) => {
-      const off = this.on(method, (params, sessionId) => {
-        if (!predicate(params, sessionId)) return;
-        off();
-        clearTimeout(timer);
-        resolve(params);
-      });
-      const timer = setTimeout(() => {
-        off();
-        reject(new TimeoutError(`waiting for ${method}`, ms));
-      }, ms);
-      this.closeHandlers.push(() => {
-        off();
-        clearTimeout(timer);
-        reject(new ConnectionClosedError(`waiting for ${method}`));
-      });
-    });
-  }
-
   onClose(handler) {
     this.closeHandlers.push(handler);
   }
@@ -173,4 +149,4 @@ class Connection {
   }
 }
 
-module.exports = { Connection, ProtocolError, TimeoutError, ConnectionClosedError, DEFAULT_TIMEOUT_MS };
+module.exports = { Connection, ProtocolError, TimeoutError, ConnectionClosedError };

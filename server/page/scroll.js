@@ -1,8 +1,9 @@
 // Runs in the browser, in the page's isolated world; sent as source by input.js and
 // read.js. Never require() this file.
 //
-// Some sites (LinkedIn, etc.) scroll a container instead of the window; the heuristic
-// below finds it. Called with no arguments it only reports the position.
+// Scrolls the window, or, when the window does not scroll, the page's scrollable
+// container (a main region, else the largest scrollable div). Called with no
+// arguments it only reports the position.
 function claudesurfScroll(direction, amount) {
   function findScrollableElement() {
     const candidates = document.querySelectorAll('main, [role="main"], .scaffold-layout__main, .scaffold-finite-scroll');
@@ -11,7 +12,6 @@ function claudesurfScroll(direction, amount) {
         return el;
       }
     }
-    // Generic: find the largest scrollable element
     const all = document.querySelectorAll('div');
     let best = null;
     let bestArea = 0;
@@ -28,9 +28,8 @@ function claudesurfScroll(direction, amount) {
   }
 
   function getScrollTarget() {
-    // If window is scrollable, use it
     if (document.documentElement.scrollHeight > window.innerHeight + 50) {
-      return null; // null = use window
+      return null;
     }
     return findScrollableElement();
   }
@@ -54,7 +53,6 @@ function claudesurfScroll(direction, amount) {
       scrollY: container.scrollTop,
       pageHeight: container.scrollHeight,
       viewportHeight: container.clientHeight,
-      usedContainer: true
     };
   }
 
@@ -73,6 +71,5 @@ function claudesurfScroll(direction, amount) {
     scrollY: window.scrollY,
     pageHeight: document.body ? document.body.scrollHeight : 0,
     viewportHeight: window.innerHeight,
-    usedContainer: false
   };
 }

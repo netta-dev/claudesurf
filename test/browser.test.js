@@ -7,21 +7,16 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const browser = require('../server/browser');
-const { silentLog, tmpDir, sleep, waitFor, FAKE_CHROME } = require('./helpers');
+const { silentLog, tmpDir, sleep, waitFor, isolatedPaths, fakeSession, setEnv, FAKE_CHROME } = require('./helpers');
 
-// Every test gets its own socket (hence record path) and profile.
-function isolate() {
-  const dir = tmpDir('claudesurf-browser');
-  process.env.CLAUDESURF_SOCKET = path.join(dir, 'cs.sock');
-  return { dir, profileDir: path.join(dir, 'profile'), record: path.join(dir, 'cs.browser.json') };
-}
+const isolate = (t) => isolatedPaths(t, 'claudesurf-browser');
 
 function fakeLaunch(profileDir, env = {}) {
   return browser.launch({ binary: FAKE_CHROME, profileDir, env, log: silentLog });
 }
 
-test('launch completes the handshake, writes the record, and enableTargets sends auto-attach and download denial', async () => {
-  const { profileDir, record } = isolate();
+test('launch completes the handshake and writes the record; the record is cleared when the pipe closes', async (t) => {
+  const { profileDir, record } = isolate(t);
   const log = { ...silentLog, info: (m) => log.lines.push(m), lines: [] };
   const { conn, child } = await browser.launch({ binary: FAKE_CHROME, profileDir, env: {}, log });
   try {
@@ -29,7 +24,6 @@ test('launch completes the handshake, writes the record, and enableTargets sends
     const written = JSON.parse(fs.readFileSync(record, 'utf8'));
     assert.strictEqual(written.pid, child.pid);
     assert.strictEqual(written.startTime, browser.processStartTime(child.pid));
-    await browser.enableTargets(conn);
     assert.ok(fs.existsSync(profileDir), 'profile directory created');
   } finally {
     conn.close();
@@ -38,8 +32,20 @@ test('launch completes the handshake, writes the record, and enableTargets sends
   assert.ok(!fs.existsSync(record), 'record cleared when the pipe closes');
 });
 
-test('exit 21 before the handshake is setup_error naming the profile and lock holder', async () => {
-  const { profileDir } = isolate();
+test('enableTargets sends a flattened, paused auto-attach for page and iframe targets, then download denial', async () => {
+  const { fake, conn } = fakeSession();
+  await browser.enableTargets(conn);
+  assert.deepStrictEqual(fake.calls.map((c) => c.method), ['Target.setAutoAttach', 'Browser.setDownloadBehavior']);
+  assert.deepStrictEqual(fake.calls[0].params, {
+    autoAttach: true, waitForDebuggerOnStart: true, flatten: true,
+    filter: [{ type: 'page' }, { type: 'iframe' }],
+  });
+  assert.deepStrictEqual(fake.calls[1].params, { behavior: 'deny' });
+  conn.close();
+});
+
+test('exit 21 before the handshake is setup_error naming the profile and lock holder', async (t) => {
+  const { profileDir } = isolate(t);
   fs.mkdirSync(profileDir, { recursive: true });
   fs.symlinkSync('host-4242', path.join(profileDir, 'SingletonLock'));
   await assert.rejects(fakeLaunch(profileDir, { CLAUDESURF_FAKE_EXIT: '21' }), (e) => {
@@ -50,8 +56,8 @@ test('exit 21 before the handshake is setup_error naming the profile and lock ho
   });
 });
 
-test('any other pre-handshake exit is a BrowserError carrying stderr', async () => {
-  const { profileDir } = isolate();
+test('any other pre-handshake exit is a BrowserError carrying stderr', async (t) => {
+  const { profileDir } = isolate(t);
   await assert.rejects(fakeLaunch(profileDir, { CLAUDESURF_FAKE_EXIT: '3', CLAUDESURF_FAKE_STDERR: 'libgbm: no device' }), (e) => {
     assert.ok(e instanceof browser.BrowserError);
     assert.match(e.message, /exited before the handshake \(code 3\)/);
@@ -60,32 +66,22 @@ test('any other pre-handshake exit is a BrowserError carrying stderr', async () 
   });
 });
 
-test('the record is left in place when the daemon side stops without the pipe closing', async () => {
-  const { profileDir, record } = isolate();
-  const { conn, child } = await fakeLaunch(profileDir);
-  assert.ok(fs.existsSync(record));
-  // Stopping the daemon leaves the record to the next daemon; only a close clears it.
-  assert.ok(fs.existsSync(record));
-  conn.close();
-  await waitFor(() => child.exitCode !== null);
-});
-
-test('reapOrphan clears a record whose process is gone', async () => {
-  const { record } = isolate();
+test('reapOrphan clears a record whose process is gone', async (t) => {
+  const { record } = isolate(t);
   browser.writeRecord({ pid: 2 ** 22 - 7, startTime: '1' });
   assert.strictEqual(await browser.reapOrphan(silentLog), false);
   assert.ok(!fs.existsSync(record));
 });
 
-test('reapOrphan ignores a live pid whose start time differs', async () => {
-  const { record } = isolate();
+test('reapOrphan ignores a live pid whose start time differs', async (t) => {
+  const { record } = isolate(t);
   browser.writeRecord({ pid: process.pid, startTime: 'not-this-process' });
   assert.strictEqual(await browser.reapOrphan(silentLog), false);
   assert.ok(!fs.existsSync(record), 'stale record cleared');
 });
 
-test('reapOrphan terminates a live fake matching the record', async () => {
-  const { record } = isolate();
+test('reapOrphan terminates a live fake matching the record', async (t) => {
+  const { record } = isolate(t);
   const child = spawn(process.execPath, [FAKE_CHROME], { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
   await sleep(200);
   browser.writeRecord({ pid: child.pid, startTime: browser.processStartTime(child.pid) });
@@ -103,8 +99,9 @@ test('graphicalEnv takes the process values when it has a display, else the requ
   assert.throws(() => browser.graphicalEnv({ XAUTHORITY: '/x' }, { DBUS_SESSION_BUS_ADDRESS: 'x' }), browser.SetupError);
 });
 
-test('graphicalEnv drops an XAUTHORITY it cannot read, from either source', () => {
+test('graphicalEnv drops an XAUTHORITY it cannot read, from either source', (t) => {
   const dir = tmpDir('xauth');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const readable = path.join(dir, 'ok');
   fs.writeFileSync(readable, '');
   assert.deepStrictEqual(browser.graphicalEnv({ DISPLAY: ':0', XAUTHORITY: readable }, {}), { DISPLAY: ':0', XAUTHORITY: readable });
@@ -112,9 +109,28 @@ test('graphicalEnv drops an XAUTHORITY it cannot read, from either source', () =
   assert.deepStrictEqual(browser.graphicalEnv({}, { DISPLAY: ':0', XAUTHORITY: '/root/.Xauthority' }), { DISPLAY: ':0' });
 });
 
-test('locateBinary honours CLAUDESURF_BROWSER, probes PATH, and fails as setup_error', () => {
+test('launch spawns with the graphical values it was given; a dropped XAUTHORITY is not restored from the daemon\'s own environment', async (t) => {
+  const { profileDir, dir } = isolate(t);
+  const dump = path.join(dir, 'env.json');
+  async function spawnedEnv(processEnv) {
+    t.after(setEnv(processEnv));
+    const env = browser.graphicalEnv(process.env, {});
+    const { conn } = await browser.launch({ binary: FAKE_CHROME, profileDir, env: { ...env, CLAUDESURF_FAKE_ENV_DUMP: dump }, log: silentLog });
+    conn.close();
+    return JSON.parse(fs.readFileSync(dump, 'utf8'));
+  }
+  const unreadable = await spawnedEnv({ DISPLAY: ':7', WAYLAND_DISPLAY: null, XAUTHORITY: path.join(dir, 'missing') });
+  assert.strictEqual(unreadable.DISPLAY, ':7');
+  assert.ok(!('XAUTHORITY' in unreadable), 'unreadable XAUTHORITY stays dropped');
+  assert.strictEqual(unreadable.PATH, process.env.PATH, 'the rest of the environment is inherited');
+  const empty = await spawnedEnv({ DISPLAY: ':7', WAYLAND_DISPLAY: null, XAUTHORITY: '' });
+  assert.ok(!('XAUTHORITY' in empty), 'the unit drop-in\'s empty XAUTHORITY stays dropped');
+});
+
+test('locateBinary honours CLAUDESURF_BROWSER, probes PATH, and fails as setup_error', (t) => {
   assert.strictEqual(browser.locateBinary({ CLAUDESURF_BROWSER: '/opt/chrome' }), '/opt/chrome');
   const dir = tmpDir('bin');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const chromium = path.join(dir, 'chromium');
   fs.writeFileSync(chromium, '#!/bin/sh\n', { mode: 0o755 });
   assert.strictEqual(browser.locateBinary({ PATH: `/nonexistent:${dir}` }), chromium);

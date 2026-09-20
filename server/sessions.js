@@ -1,7 +1,7 @@
 // Per-session state and the target registry. A Session owns one Chrome window with an
 // identity tab and a working tab; every handler reaches its targets through this
 // registry, which also tracks each target's window, document generation, isolated
-// world, load events, and dismissed dialogs.
+// world, navigation, load, and download counts, and dismissed dialogs.
 //
 // Lifecycle: `attach(conn)` after every launch; `ensure(sessionId)` before every
 // action, which creates or repairs the window; target destruction marks the session
@@ -15,6 +15,7 @@ const { ProtocolError, TimeoutError } = require('./cdp');
 const SESSION_PAGE = pathToFileURL(path.join(__dirname, 'static', 'session.html')).href;
 const WINDOW_TIMEOUT_MS = 5_000;
 const CTRL_MODIFIER = 2;
+const MAX_DIALOGS = 20;
 const CROSS_DOCUMENT = new Set(['differentDocument', 'historyDifferentDocument', 'reload', 'reloadBypassingCache', 'restore', 'restoreWithPost']);
 
 class TargetGoneError extends Error {
@@ -29,6 +30,9 @@ class Session {
     this.workingTargetId = null;
     this.label = null;
     this.startedAt = null;
+    // Set when window creation got the working tab up but not the identity tab;
+    // ensure retries the identity tab. An identity tab the human closes stays closed.
+    this.identityFailed = false;
     this.notes = [];
     // targetId → { generation, ids: Set<backendNodeId> }
     this.refs = new Map();
@@ -83,6 +87,7 @@ class Sessions {
     conn.on('Page.frameNavigated', (p, sid) => this.onFrameNavigated(p, sid));
     conn.on('Page.frameStartedNavigating', (p, sid) => this.onNavigationStarted(p, sid));
     conn.on('Page.loadEventFired', (p, sid) => this.onLoad(sid));
+    conn.on('Page.navigatedWithinDocument', (p, sid) => this.onSameDocument(sid));
     conn.on('Page.downloadWillBegin', (p, sid) => this.onDownload(sid));
     conn.on('Page.javascriptDialogOpening', (p, sid) => this.onDialog(p, sid));
     conn.onClose(() => this.dropAll());
@@ -103,19 +108,54 @@ class Sessions {
   ensure(sessionId, { deadline } = {}) {
     const session = this.get(sessionId);
     return session.run(async () => {
-      if (session.workingTargetId && this.targets.has(session.workingTargetId)) return session;
-      const identity = session.identityTargetId && this.targets.get(session.identityTargetId);
-      const page = identity && parseSessionPage(identity.url);
-      if (identity && page && page.role === 'identity' && page.session === session.id) {
-        await this.openWorkingTab(session, identity, deadline);
-        session.notes.push('working tab was recreated');
-      } else {
-        const had = session.startedAt !== null;
-        await this.createWindow(session, deadline);
-        if (had) session.notes.push(session.label ? 'session window was recreated under its retained name' : 'session window was recreated');
-      }
+      await this.repair(session, deadline);
       return session;
     });
+  }
+
+  // ensure, plus the notes taken in the same queue slot, so a repair note reaches
+  // only the request whose ensure made it.
+  ensureWithNotes(sessionId, { deadline } = {}) {
+    const session = this.get(sessionId);
+    return session.run(async () => {
+      await this.repair(session, deadline);
+      return { session, notes: session.takeNotes() };
+    });
+  }
+
+  async repair(session, deadline) {
+    const working = session.workingTargetId && this.targets.get(session.workingTargetId);
+    if (working) {
+      if (!session.identityFailed || session.identityTargetId !== null) {
+        session.identityFailed = false;
+        return;
+      }
+      // The identity tab gets one retry. The working tab is usable either way, so a
+      // second failure, or a working tab that has left the session page and taken the
+      // link with it, leaves the identity tab absent, as when the human closes it.
+      let reopened = false;
+      if (parseSessionPage(working.url)) {
+        try {
+          await this.openIdentityTab(session, working.targetId, deadline);
+          reopened = true;
+        } catch (e) {
+          this.log.warn(`session ${session.id.slice(0, 8)}: reopening the identity tab: ${e.message}`);
+        }
+      }
+      session.identityFailed = false;
+      session.notes.push(reopened ? 'identity tab was recreated' : 'identity tab could not be recreated; it returns with the next window');
+      return;
+    }
+    const identity = session.identityTargetId && this.targets.get(session.identityTargetId);
+    const page = identity && parseSessionPage(identity.url);
+    if (identity && page && page.role === 'identity' && page.session === session.id) {
+      await this.openWorkingTab(session, identity, deadline);
+      session.notes.push('working tab was recreated');
+    } else {
+      const had = session.startedAt !== null;
+      await this.createWindow(session, deadline);
+      if (had) session.notes.push(session.label ? 'session window was recreated under its retained name' : 'session window was recreated');
+    }
   }
 
   // Stores the label and re-renders the identity page if present.
@@ -146,11 +186,25 @@ class Sessions {
     if (!t) throw new TargetGoneError(targetId);
     if (t.world && t.world.generation === t.generation) return t.world.contextId;
     const generation = t.generation;
+    // A page target's main frame id equals its target id until its first
+    // frameNavigated records the frame.
     const { executionContextId } = await this.send(targetId, 'Page.createIsolatedWorld', {
       frameId: t.mainFrameId || targetId, worldName: 'claudesurf',
     }, opts);
     t.world = { generation, contextId: executionContextId };
     return executionContextId;
+  }
+
+  // The target's window id, read from the browser when the attach handler has not
+  // recorded it yet (a target claimed on its first navigation can get there first).
+  async windowOf(targetId, opts = {}) {
+    const t = this.targets.get(targetId);
+    if (!t) throw new TargetGoneError(targetId);
+    if (t.windowId === null) {
+      const { windowId } = await this.conn.send('Browser.getWindowForTarget', { targetId }, opts);
+      t.windowId = windowId;
+    }
+    return t.windowId;
   }
 
   invalidateWorld(targetId) {
@@ -188,20 +242,30 @@ class Sessions {
     return r.result ? r.result.value : undefined;
   }
 
-  // Resolves once the target has fired more load events than `since`.
-  waitForLoad(targetId, since, { timeout = 10_000, deadline } = {}) {
+  // Resolves true once `predicate(target)` holds, checked now and after every event
+  // the registry counts on the target (navigation start, load, download, a target
+  // attributed to its session), false after `timeout` ms or at `deadline`; rejects
+  // with TargetGoneError when the target is destroyed or the pipe closes.
+  waitUntil(targetId, predicate, { timeout = 10_000, deadline } = {}) {
     const t = this.targets.get(targetId);
     if (!t) return Promise.reject(new TargetGoneError(targetId));
-    if (t.loads > since) return Promise.resolve();
-    let ms = timeout;
-    if (deadline !== undefined) ms = Math.max(1, Math.min(ms, deadline - Date.now()));
+    if (predicate(t)) return Promise.resolve(true);
+    const ms = budget(timeout, deadline);
     return new Promise((resolve, reject) => {
-      const waiter = { since, resolve, reject, timer: setTimeout(() => {
-        t.loadWaiters.delete(waiter);
-        reject(new TimeoutError('waiting for the page to load', ms));
+      const waiter = { predicate, resolve, reject, timer: setTimeout(() => {
+        t.waiters.delete(waiter);
+        resolve(false);
       }, ms) };
-      t.loadWaiters.add(waiter);
+      t.waiters.add(waiter);
     });
+  }
+
+  // Resolves once the target has fired more load events than `since`; TimeoutError
+  // otherwise.
+  async waitForLoad(targetId, since, { timeout = 10_000, deadline } = {}) {
+    const ms = budget(timeout, deadline);
+    const loaded = await this.waitUntil(targetId, (t) => t.loads > since, { timeout: ms });
+    if (!loaded) throw new TimeoutError('waiting for the page to load', ms);
   }
 
   takeDialogs(targetId) {
@@ -224,46 +288,63 @@ class Sessions {
       session.opened.clear();
     }
     for (const [key, waiters] of this.roleWaiters) {
-      for (const w of waiters) w.reject(new Error('browser connection closed'));
+      for (const w of waiters) { clearTimeout(w.timer); w.reject(new Error('browser connection closed')); }
       this.roleWaiters.delete(key);
     }
   }
 
-  sessionPageUrl(session, role) {
-    const params = new URLSearchParams({ role, session: session.id, started: session.startedAt });
+  sessionPageUrl(session, role, startedAt) {
+    const params = new URLSearchParams({ role, session: session.id, started: startedAt });
     return `${SESSION_PAGE}#${params}`;
   }
 
-  async createWindow(session, deadline) {
+  windowBudget(deadline) {
     const limit = deadline === undefined ? Date.now() + WINDOW_TIMEOUT_MS : Math.min(deadline, Date.now() + WINDOW_TIMEOUT_MS);
-    const opts = { deadline: limit };
+    return { deadline: limit };
+  }
+
+  async createWindow(session, deadline) {
+    const opts = this.windowBudget(deadline);
     this.disown(session);
-    if (!session.startedAt) session.startedAt = new Date().toISOString();
+    session.identityFailed = false;
+    const startedAt = session.startedAt || new Date().toISOString();
     const working = this.waitForRole(session, 'working', opts);
     await this.conn.send('Target.createTarget', {
-      url: this.sessionPageUrl(session, 'working'), newWindow: true, background: true,
+      url: this.sessionPageUrl(session, 'working', startedAt), newWindow: true, background: true,
     }, opts);
     const workingId = await working;
     await this.waitForLoad(workingId, 0, opts);
-    session.windowId = this.targets.get(workingId).windowId;
-    // Only a real pointer event carries the Ctrl modifier that makes the new tab a
-    // background one, so the working tab stays the window's active tab.
+    session.windowId = await this.windowOf(workingId, opts);
+    // The window exists from here; a failure before this point leaves startedAt
+    // unset so the retry does not report a recreation.
+    session.startedAt = startedAt;
+    await this.openIdentityTab(session, workingId, opts.deadline);
+    if (session.label) await this.render(workingId, session.label, opts);
+    this.log.info(`session ${session.id.slice(0, 8)}: window ${session.windowId} created`);
+  }
+
+  // Opens the identity tab from the working tab's identity link. Only a real pointer
+  // event carries the Ctrl modifier that makes the new tab a background one, so the
+  // working tab stays the window's active tab.
+  async openIdentityTab(session, workingId, deadline) {
+    const opts = this.windowBudget(deadline);
+    session.identityFailed = true;
+    // The human can drag a tab into another window.
+    const { windowId } = await this.conn.send('Browser.getWindowForTarget', { targetId: workingId }, opts);
+    this.targets.get(workingId).windowId = windowId;
+    session.windowId = windowId;
     const identity = this.waitForRole(session, 'identity', opts);
     await this.ctrlClick(workingId, 'identity-link', opts);
     const identityId = await identity;
     await this.waitForLoad(identityId, 0, opts);
-    if (session.label) {
-      await this.render(identityId, session.label, opts);
-      await this.render(workingId, session.label, opts);
-    }
-    this.log.info(`session ${session.id.slice(0, 8)}: window ${session.windowId} created`);
+    session.identityFailed = false;
+    if (session.label) await this.render(identityId, session.label, opts);
   }
 
   // The human closed the working tab: a scripted click with a user gesture on the
   // identity page's working link opens a foreground tab in that window.
   async openWorkingTab(session, identity, deadline) {
-    const limit = deadline === undefined ? Date.now() + WINDOW_TIMEOUT_MS : Math.min(deadline, Date.now() + WINDOW_TIMEOUT_MS);
-    const opts = { deadline: limit };
+    const opts = this.windowBudget(deadline);
     // The human can drag a tab into another window.
     const { windowId } = await this.conn.send('Browser.getWindowForTarget', { targetId: identity.targetId }, opts);
     identity.windowId = windowId;
@@ -290,17 +371,24 @@ class Sessions {
     session.refs.clear();
   }
 
+  // Resolves with the target id claimed for the role; TimeoutError at the deadline.
+  // A caller that gave up before the timer fired has nothing to catch, so the
+  // rejection is marked handled here.
   waitForRole(session, role, { deadline }) {
     const key = `${session.id}:${role}`;
     const ms = Math.max(1, deadline - Date.now());
-    return new Promise((resolve, reject) => {
+    const promise = new Promise((resolve, reject) => {
       const waiter = { resolve, reject, timer: setTimeout(() => {
-        this.roleWaiters.get(key).delete(waiter);
+        const waiters = this.roleWaiters.get(key);
+        waiters.delete(waiter);
+        if (waiters.size === 0) this.roleWaiters.delete(key);
         reject(new TimeoutError(`waiting for the ${role} tab`, ms));
       }, ms) };
       if (!this.roleWaiters.has(key)) this.roleWaiters.set(key, new Set());
       this.roleWaiters.get(key).add(waiter);
     });
+    promise.catch(() => {});
+    return promise;
   }
 
   // Claims a target for a session role when its URL is that session's page, else
@@ -333,6 +421,7 @@ class Sessions {
       t.role = 'opened';
       t.sessionId = opener.sessionId;
       this.get(opener.sessionId).opened.add(t.targetId);
+      this.notify(opener);
     }
   }
 
@@ -345,7 +434,7 @@ class Sessions {
     const t = {
       targetId, cdpSessionId, url: targetInfo.url || '', openerId: targetInfo.openerId || null,
       windowId: null, generation: 0, role: null, sessionId: null, world: null, mainFrameId: null,
-      loads: 0, navigations: 0, downloads: 0, loadWaiters: new Set(), dialogs: [],
+      loads: 0, navigations: 0, downloads: 0, sameDocument: 0, waiters: new Set(), dialogs: [],
     };
     this.targets.set(targetId, t);
     const opts = { sessionId: cdpSessionId };
@@ -377,7 +466,7 @@ class Sessions {
     } catch (e) {
       this.log.warn(`preparing target ${targetId}: ${e.message}`);
     } finally {
-      // A target left paused wedges its page load.
+      // A target left paused stalls its page load.
       release();
     }
   }
@@ -408,6 +497,8 @@ class Sessions {
     t.url = frame.url + (frame.urlFragment || '');
     t.generation += 1;
     t.world = null;
+    // A tab opened from the session page attaches with an empty URL, so its role
+    // claim lands here, on its first document.
     if (t.role === null || t.role === 'opened') this.claim(t);
   }
 
@@ -415,27 +506,49 @@ class Sessions {
     const t = this.byCdpSession(cdpSessionId);
     if (!t) return;
     const main = frameId === t.mainFrameId || frameId === t.targetId;
-    if (main && CROSS_DOCUMENT.has(navigationType)) t.navigations += 1;
+    if (main && CROSS_DOCUMENT.has(navigationType)) {
+      t.navigations += 1;
+      this.notify(t);
+    }
   }
 
   onLoad(cdpSessionId) {
     const t = this.byCdpSession(cdpSessionId);
     if (!t) return;
     t.loads += 1;
-    for (const w of [...t.loadWaiters]) {
-      if (t.loads > w.since) { t.loadWaiters.delete(w); clearTimeout(w.timer); w.resolve(); }
-    }
+    this.notify(t);
   }
 
+  // A fragment change or pushState: the URL changes, the document and its refs stay.
+  onSameDocument(cdpSessionId) {
+    const t = this.byCdpSession(cdpSessionId);
+    if (!t) return;
+    t.sameDocument += 1;
+    this.notify(t);
+  }
+
+  // Under download denial Chrome still fires this for a click on a file link, after
+  // the navigation start that the click wait counts and instead of a load event.
   onDownload(cdpSessionId) {
     const t = this.byCdpSession(cdpSessionId);
-    if (t) t.downloads += 1;
+    if (!t) return;
+    t.downloads += 1;
+    this.notify(t);
+  }
+
+  notify(t) {
+    for (const w of [...t.waiters]) {
+      if (w.predicate(t)) { t.waiters.delete(w); clearTimeout(w.timer); w.resolve(true); }
+    }
   }
 
   onDialog({ type, message }, cdpSessionId) {
     const t = this.byCdpSession(cdpSessionId);
     if (!t) return;
+    // Only the working tab's queue is drained; other targets keep their dialogs
+    // until an action reads them.
     t.dialogs.push({ type, message });
+    if (t.dialogs.length > MAX_DIALOGS) t.dialogs.shift();
     // beforeunload is accepted so a close the human started goes through.
     this.conn.send('Page.handleJavaScriptDialog', { accept: type === 'beforeunload' }, { sessionId: cdpSessionId })
       .catch((e) => this.log.warn(`dismissing ${type} dialog: ${e.message}`));
@@ -447,8 +560,8 @@ class Sessions {
   }
 
   failWaiters(t) {
-    for (const w of t.loadWaiters) { clearTimeout(w.timer); w.reject(new TargetGoneError(t.targetId)); }
-    t.loadWaiters.clear();
+    for (const w of t.waiters) { clearTimeout(w.timer); w.reject(new TargetGoneError(t.targetId)); }
+    t.waiters.clear();
   }
 
   async pageElement(targetId, elementId, opts) {
@@ -485,8 +598,14 @@ class Sessions {
   }
 }
 
+// Milliseconds to wait: `timeout`, cut to what remains before `deadline` (ms epoch).
+function budget(timeout, deadline) {
+  if (deadline === undefined) return timeout;
+  return Math.max(1, Math.min(timeout, deadline - Date.now()));
+}
+
 function isMissingContext(e) {
   return e instanceof ProtocolError && /context/i.test(e.protocolMessage || '');
 }
 
-module.exports = { Sessions, Session, TargetGoneError, SESSION_PAGE, parseSessionPage };
+module.exports = { Sessions, TargetGoneError, SESSION_PAGE, parseSessionPage };

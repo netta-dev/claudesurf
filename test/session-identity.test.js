@@ -29,7 +29,7 @@ test('two respawns with the same CLAUDE_CODE_SESSION_ID share one SESSION_ID', (
   const a2 = sessionIdOf({ CLAUDE_CODE_SESSION_ID: FIXED });
   assert.strictEqual(a1.source, 'CLAUDE_CODE_SESSION_ID');
   assert.strictEqual(a1.id, FIXED, 'id should be the env var verbatim');
-  assert.strictEqual(a1.id, a2.id, 'respawn must reuse the id => extension reuses the window');
+  assert.strictEqual(a1.id, a2.id, 'respawn must reuse the id => the daemon reuses the window');
 });
 
 test('two respawns with neither env var get different ids', () => {

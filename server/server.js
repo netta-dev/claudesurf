@@ -7,11 +7,10 @@
 const http = require('http');
 const readline = require('readline');
 const crypto = require('crypto');
-const { daemonSocketPath } = require('./paths');
+const { daemonSocketPath, GRAPHICAL_VARS } = require('./paths');
 const { createLogger } = require('./diagnostics');
 const { validate, toolDefinitions } = require('./dispatch');
 const envelope = require('./envelope');
-const { GRAPHICAL_VARS } = require('./browser');
 
 const log = createLogger('claudesurf mcp');
 const SOCK = daemonSocketPath();
@@ -21,7 +20,9 @@ const SOCK = daemonSocketPath();
 // retry cannot double-execute an action.
 const CONNECT_RETRIES = 6;
 const RETRY_DELAY_MS = 1000;
-const REQUEST_TIMEOUT_MS = 35_000;
+// The daemon runs every request under a 33 s deadline inside this. The override is
+// for tests; a value below 33 s makes the bridge time out before the daemon answers.
+const REQUEST_TIMEOUT_MS = Number(process.env.CLAUDESURF_REQUEST_TIMEOUT_MS) || 35_000;
 const DAEMON_DOWN_MSG = 'Cannot reach ClaudeSurf daemon. Start it with: systemctl --user restart claudesurf';
 
 // Identity must stay stable for the life of the Claude Code session so the daemon
@@ -79,7 +80,7 @@ function sendOnce(tool, action, args) {
   });
 }
 
-// Rides out a daemon restart, then maps the bridge's own failures onto the envelope.
+// Retries across a daemon restart, then maps the bridge's own failures onto the envelope.
 async function callDaemon(tool, action, args) {
   for (let attempt = 1; ; attempt++) {
     try {

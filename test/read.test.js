@@ -1,6 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { assemblePage, OutcomeError } = require('../server/read');
+const { assemblePage } = require('../server/read');
+const { OutcomeError } = require('../server/action-support');
 
 // A walk summary as the page script returns it, with one ref per element.
 function fixture() {

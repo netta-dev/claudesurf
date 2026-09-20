@@ -4,8 +4,9 @@
 // command so tests can assert what was sent. Usable in-process (`inProcess()`) and as
 // a child (fake-chrome.js).
 //
-// Tests customise it through `handle(method, fn)` to override a command, `site[url]`
-// to describe the page a URL serves, and `emit()` to raise events.
+// Tests customise it through `handle(method, fn)` to override a command (a promise
+// returned from fn answers late), `site[url]` to describe the page a URL serves, and
+// `emit()` to raise events.
 
 const { PassThrough } = require('stream');
 const path = require('path');
@@ -88,11 +89,14 @@ class FakeBrowser {
   }
 
   // Creates a page target, attached paused; its first document commits on release.
-  createTarget({ url = '', windowId, openerId, session } = {}) {
+  // `lateUrl` models a tab whose URL arrives with its first navigation (the attach
+  // carries an empty one), and `windowDelayMs` a Browser.getWindowForTarget reply
+  // that lands after that navigation.
+  createTarget({ url = '', windowId, openerId, lateUrl, windowDelayMs = 0 } = {}) {
     const targetId = `T${this.nextTarget++}`;
     const target = {
       targetId, sessionId: `S${targetId}`, url, windowId: windowId || this.nextWindow++, openerId,
-      released: false, committed: false, loads: 0, enabled: false,
+      pendingUrl: lateUrl, windowDelayMs, released: false, committed: false, loads: 0, enabled: false,
     };
     this.targets.set(targetId, target);
     const targetInfo = { targetId, type: 'page', title: '', url: target.url, attached: true };
@@ -172,7 +176,9 @@ class FakeBrowser {
     this.handle('Browser.getWindowForTarget', ({ targetId }) => {
       const t = this.targets.get(targetId);
       if (!t) throw { code: -32000, message: 'No target with given id found' };
-      return { windowId: t.windowId, bounds: { left: 0, top: 0, width: 800, height: 600, windowState: 'normal' } };
+      const reply = { windowId: t.windowId, bounds: { left: 0, top: 0, width: 800, height: 600, windowState: 'normal' } };
+      if (t.windowDelayMs) return new Promise((r) => setTimeout(() => r(reply), t.windowDelayMs));
+      return reply;
     });
     this.handle('Page.enable', (p, sid) => { const t = this.bySession(sid); if (t) t.enabled = true; return {}; });
     this.handle('Emulation.setFocusEmulationEnabled', ok);
@@ -246,13 +252,27 @@ class FakeBrowser {
       const t = this.bySession(sid);
       const page = this.site[url];
       if (page && page.errorText) return { frameId: t.targetId, errorText: page.errorText };
-      setImmediate(() => this.navigateTarget(t, url));
+      if (page && page.download) {
+        // Under download denial: the navigation starts, the download event follows, no load.
+        setImmediate(() => {
+          this.emit('Page.frameStartedNavigating', { frameId: t.targetId, url, navigationType: 'differentDocument' }, t.sessionId);
+          this.emit('Page.downloadWillBegin', { frameId: t.targetId, url }, t.sessionId);
+        });
+      } else if (url.split('#')[0] === t.url.split('#')[0] && url.includes('#')) {
+        setImmediate(() => { t.url = url; this.emit('Page.navigatedWithinDocument', { frameId: t.targetId, url }, t.sessionId); });
+      } else {
+        setImmediate(() => this.navigateTarget(t, url));
+      }
       return { frameId: t.targetId, loaderId: 'L1' };
     });
     this.handle('Page.captureScreenshot', () => ({ data: PNG }));
     this.handle('Page.getLayoutMetrics', (p, sid) => {
       const page = this.page(this.bySession(sid));
-      return { cssContentSize: { x: 0, y: 0, width: 800, height: page.pageHeight }, cssVisualViewport: { clientWidth: 800, clientHeight: page.viewportHeight, scale: 1 } };
+      return {
+        cssContentSize: { x: 0, y: 0, width: 800, height: page.pageHeight },
+        cssLayoutViewport: { pageX: 0, pageY: page.scrollY, clientWidth: 800, clientHeight: page.viewportHeight },
+        cssVisualViewport: { pageX: 0, pageY: page.scrollY, clientWidth: 800, clientHeight: page.viewportHeight, scale: 1 },
+      };
     });
     this.handle('Page.handleJavaScriptDialog', ok);
     this.handle('Browser.close', () => { setImmediate(() => this.close()); return {}; });
@@ -298,7 +318,7 @@ class FakeBrowser {
       if (values[0] === 'scripted' && element.onClick) setImmediate(() => element.onClick(this, t));
       return value({ state: element.visible ? 'ok' : 'hidden' });
     }
-    if (/this\.contains\(hit\)/.test(functionDeclaration)) {
+    if (/hit\.contains\(this\)/.test(functionDeclaration)) {
       const { element } = this.objects.get(objectId);
       const hit = values[0];
       return value(hit && hit.element === element);
@@ -332,13 +352,14 @@ class FakeBrowser {
     let reply;
     try {
       const result = handler ? handler(params, sessionId, this) : {};
+      // A handler may answer late by returning a promise.
+      if (result && typeof result.then === 'function') {
+        result.then((r) => this.write({ id, result: r }), (e) => this.write({ id, error: { code: -32000, message: e.message } }));
+        return;
+      }
       reply = { id, result };
     } catch (e) {
       reply = { id, error: e.code !== undefined ? { code: e.code, message: e.message } : { code: -32000, message: e.message || String(e) } };
-    }
-    if (reply.result && reply.result.__defer) {
-      reply.result.__defer.then((result) => this.write({ id, result }), (e) => this.write({ id, error: { code: -32000, message: e.message } }));
-      return;
     }
     this.write(reply);
   }
@@ -349,4 +370,4 @@ class FakeBrowser {
   }
 }
 
-module.exports = { FakeBrowser, SESSION_PAGE, PNG, defaultPage };
+module.exports = { FakeBrowser };

@@ -4,7 +4,8 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const read = require('../../server/read');
 const input = require('../../server/input');
-const { liveBinary, liveBrowser, sleep } = require('../helpers');
+const { OutcomeError } = require('../../server/action-support');
+const { liveBinary, liveBrowser } = require('../helpers');
 const { serve } = require('../fixtures/serve');
 
 const skip = liveBinary() ? false : 'no Chrome binary found';
@@ -37,7 +38,7 @@ async function readAll({ hidden = true, maxChars = 40000 } = {}) {
 
 async function outcome(promise) {
   try { return { ok: await promise }; } catch (e) {
-    if (e instanceof read.OutcomeError) return { fail: e.envelope };
+    if (e instanceof OutcomeError) return { fail: e.envelope };
     throw e;
   }
 }
@@ -53,12 +54,25 @@ test('labels come from each source; hidden elements are counted, excluded, then 
   assert.match(visible.payload, /\[e\d+\] checkbox "Checked box" \(checked\)/);
   assert.match(visible.payload, /\[e\d+\] button "Disabled control" \(disabled\)/);
   assert.match(visible.payload, /\[e\d+\] link "From innerText" → http:\/\/127\.0\.0\.1:\d+\/other/);
-  assert.match(visible.payload, /## Interactive elements \(\d+ visible, 3 hidden\)/);
-  for (const label of ['Display none', 'Aria hidden', 'Transparent']) assert.ok(!visible.refs[label], `${label} excluded`);
+  assert.match(visible.payload, /## Interactive elements \(\d+ visible, 4 hidden\)/);
+  for (const label of ['Display none', 'Aria hidden', 'Transparent', 'Zero height']) assert.ok(!visible.refs[label], `${label} excluded`);
   assert.ok(!/\[e\d+\] [\w-]+ "not interactive"/.test(visible.payload), 'role=presentation is not an element');
   assert.match(visible.payload, /\nBody text of the labels fixture\.\n/);
   const all = await readAll({ hidden: true });
-  for (const label of ['Display none', 'Aria hidden', 'Transparent']) assert.match(all.payload, new RegExp(`\\[e\\d+\\] \\w+ "${label}" \\(hidden\\)`));
+  for (const label of ['Display none', 'Aria hidden', 'Transparent', 'Zero height']) assert.match(all.payload, new RegExp(`\\[e\\d+\\] \\w+ "${label}" \\(hidden\\)`));
+});
+
+test('a click judges hidden and disabled the way the read did, element for element', { skip }, async () => {
+  await open('labels.html');
+  const { refs } = await readAll({ hidden: true });
+  for (const label of ['Display none', 'Aria hidden', 'Transparent', 'Zero height']) {
+    const trusted = await outcome(input.click(sessions, session, refs[label], { trusted: true }));
+    assert.match(trusted.fail.message, /is hidden; a trusted click/, label);
+    const scripted = await outcome(input.click(sessions, session, refs[label], {}));
+    assert.ok(scripted.ok, `${label}: a scripted click is attempted`);
+  }
+  const disabled = await outcome(input.click(sessions, session, refs['Disabled control'], {}));
+  assert.match(disabled.fail.message, /is disabled/);
 });
 
 test('a scripted click delivers to a handler as a scripted event; trusted delivers a trusted one', { skip }, async () => {
@@ -71,6 +85,14 @@ test('a scripted click delivers to a handler as a scripted event; trusted delive
   assert.strictEqual(await logText(), 'handled scripted', 'a scripted click does not satisfy an isTrusted check');
   await input.click(sessions, session, refs['Trusted only'], { trusted: true });
   assert.strictEqual(await logText(), 'trusted only fired');
+});
+
+test('a trusted click reaches an element below the fold: the page scrolls and the hit test lands', { skip }, async () => {
+  await open('labels.html');
+  const { refs } = await readAll();
+  const r = await input.click(sessions, session, refs['Offscreen link'], { trusted: true });
+  assert.match(r.payload, /^URL: http:\/\/127\.0\.0\.1:\d+\/other\n/);
+  assert.match(r.payload, /Navigated: yes/);
 });
 
 test('a trusted click is refused when covered; a scripted one reaches through; a disabled ref is refused', { skip }, async () => {
@@ -103,10 +125,32 @@ test('a target=_blank click reports Opened: a new tab, attributed to the session
   for (const id of session.opened) await live.conn.send('Target.closeTarget', { targetId: id });
 });
 
-test('a download link is denied and reads as an unchanged click', { skip }, async () => {
+test('a trusted click reaches a shadow host whose painted content is in its shadow tree', { skip }, async () => {
   await open('actions.html');
   const { refs } = await readAll();
+  await input.click(sessions, session, refs['Shadow host button'], { trusted: true });
+  assert.strictEqual(await logText(), 'shadow host trusted');
+});
+
+test('navigate to a denied download is an error that leaves the page; a fragment navigate returns promptly with the new URL', { skip }, async () => {
+  await open('actions.html');
+  let started = Date.now();
+  const download = await outcome(input.navigate(sessions, session, { url: `${site.base}/download`, name: 'live read' }));
+  assert.match(download.fail.message, /was a download, which is denied; the page is unchanged/);
+  assert.ok(Date.now() - started < 2000, `the download event ended the wait (${Date.now() - started} ms)`);
+  started = Date.now();
+  const fragment = await input.navigate(sessions, session, { url: `${site.base}/actions.html#part`, name: 'live read' });
+  assert.strictEqual(fragment.payload, `URL: ${site.base}/actions.html#part\nTitle: Actions fixture`);
+  assert.ok(Date.now() - started < 2000, `the same-document event ended the wait (${Date.now() - started} ms)`);
+});
+
+test('a download link is denied and reads as an unchanged click, without waiting for a load', { skip }, async () => {
+  await open('actions.html');
+  const { refs } = await readAll();
+  const started = Date.now();
   const r = await input.click(sessions, session, refs['Download link'], {});
+  // Page.downloadWillBegin fires under deny (about 15 ms after the click) and ends the wait.
+  assert.ok(Date.now() - started < 300, `the download event ended the wait (${Date.now() - started} ms)`);
   assert.strictEqual(r.payload, `URL: ${site.base}/actions.html\nTitle: Actions fixture\nNavigated: no`);
 });
 
@@ -142,7 +186,7 @@ test('dialog text lands in the payload via takeDialogs; beforeunload is accepted
   assert.deepStrictEqual(sessions.takeDialogs(session.workingTargetId), [{ type: 'alert', message: 'Alert text from the page' }]);
   await input.click(sessions, session, refs['Arm beforeunload'], {});
   assert.strictEqual(await logText(), 'armed');
-  // A beforeunload prompt only fires after a user gesture; the trusted click above counts.
+  // A beforeunload prompt fires only after a user gesture, which this trusted click supplies.
   await input.click(sessions, session, refs['Arm beforeunload'], { trusted: true });
   const r = await input.navigate(sessions, session, { url: `${site.base}/other`, name: 'live read' });
   assert.strictEqual(r.payload, `URL: ${site.base}/other\nTitle: Other`);
@@ -163,5 +207,4 @@ test('scroll moves a scrollable container on a fixture whose window does not scr
   assert.match(r.payload, /\nScroll: 700 of \d+ \(viewport \d+\)$/);
   const info = await read.pageInfo(sessions, session, {});
   assert.match(info.payload, /\nScroll: 700 of /);
-  await sleep(10);
 });

@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const { Connection } = require('./cdp');
-const { browserRecordPath } = require('./paths');
+const { browserRecordPath, GRAPHICAL_VARS } = require('./paths');
 
 // A misconfigured environment the human has to fix; renders as setup_error.
 class SetupError extends Error {
@@ -18,7 +18,6 @@ class BrowserError extends Error {
 }
 
 const BINARIES = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'];
-const GRAPHICAL_VARS = ['DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'DBUS_SESSION_BUS_ADDRESS'];
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 // Chrome's RESULT_CODE_NORMAL_EXIT_PROCESS_NOTIFIED: the profile is held by another
 // instance, which was told to open the launch's URLs instead.
@@ -90,14 +89,22 @@ function lockHolderPid(profileDir) {
   } catch { return null; }
 }
 
+// The daemon's environment with every graphical variable replaced by `env`'s, so a variable
+// graphicalEnv dropped stays out of the child's environment.
+function childEnv(env) {
+  const result = { ...process.env };
+  for (const name of GRAPHICAL_VARS) delete result[name];
+  return Object.assign(result, env);
+}
+
 // Spawns the browser and completes the handshake. Resolves { conn, child } once
 // Browser.getVersion answers; a pre-handshake exit rejects with SetupError (exit 21,
 // the profile is held by another Chrome) or BrowserError (anything else, carrying
 // the child's last stderr lines).
-async function launch({ binary, profileDir, env, headless = false, log, args: extraArgs = [] }) {
+async function launch({ binary, profileDir, env, headless = false, log }) {
   fs.mkdirSync(profileDir, { recursive: true });
-  const child = spawn(binary, [...launchArgs(profileDir, headless), ...extraArgs], {
-    env: { ...process.env, ...env },
+  const child = spawn(binary, launchArgs(profileDir, headless), {
+    env: childEnv(env),
     stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'],
   });
   let stderr = '';
@@ -183,7 +190,7 @@ async function reapOrphan(log) {
 }
 
 module.exports = {
-  SetupError, BrowserError, GRAPHICAL_VARS,
+  SetupError, BrowserError,
   locateBinary, graphicalEnv, launch, enableTargets,
-  readRecord, writeRecord, clearRecord, reapOrphan, processStartTime,
+  readRecord, writeRecord, reapOrphan, processStartTime,
 };

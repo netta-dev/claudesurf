@@ -1,40 +1,15 @@
 // The claudesurf_read actions: page (the walk, refs, payload assembly), info, and
 // screenshot. Handlers take the registry and the caller's Session and return
 // { payload, images? }; anything that maps to a non-success outcome throws an
-// envelope-bearing error (see fail()).
+// OutcomeError (action-support.js).
 
-const fs = require('fs');
-const path = require('path');
 const envelope = require('./envelope');
+const { fail, stateLines, workingTarget, requireHttp, pageState, WALK_SOURCE } = require('./action-support');
 
-const WALK_SOURCE = fs.readFileSync(path.join(__dirname, 'page', 'walk.js'), 'utf8');
-const SCROLL_SOURCE = fs.readFileSync(path.join(__dirname, 'page', 'scroll.js'), 'utf8');
 const MAX_SEGMENTS = 4;
-const NAVIGATE_FIRST = 'The working tab is not on an http(s) page; navigate first.';
-
-// Handlers throw this to return a specific envelope.
-class OutcomeError extends Error {
-  constructor(env) { super(env.message || env.outcome); this.name = 'OutcomeError'; this.envelope = env; }
-}
-function fail(env) { throw new OutcomeError(env); }
-
-function stateLines(url, title) {
-  return `URL: ${url}\nTitle: ${title}`;
-}
-
-function isHttp(url) {
-  return /^https?:/i.test(url || '');
-}
-
-function workingTarget(sessions, session) {
-  const t = session.workingTargetId && sessions.target(session.workingTargetId);
-  if (!t) fail(envelope.error('The working tab is gone; retry the action.'));
-  return t;
-}
-
-function requireHttp(t) {
-  if (!isHttp(t.url)) fail(envelope.error(NAVIGATE_FIRST));
-}
+// A read releases the remote object handles it takes under this group when it ends.
+const OBJECT_GROUP = 'claudesurf-read';
+const DOCUMENT_CHANGED = 'The document changed while it was being read; read the page again.';
 
 function elementLine(el, ref) {
   let line = `[e${ref}] ${el.kind} ${JSON.stringify(el.label)}`;
@@ -105,11 +80,13 @@ function assemblePage(summary, refs, { maxChars, offset, hidden }) {
 }
 
 // Reads the walk's element handles: one Runtime.getProperties on the stashed array,
-// then one DOM.describeNode per element, pipelined.
+// then one DOM.describeNode per element, pipelined. The array is missing when the
+// document changed since the walk (a new document gets a new world).
 async function elementRefs(sessions, t, count, opts) {
   if (count === 0) return [];
   const contextId = await sessions.world(t.targetId, opts);
-  const { result } = await sessions.send(t.targetId, 'Runtime.evaluate', { expression: 'globalThis.__claudesurfElements', contextId }, opts);
+  const { result } = await sessions.send(t.targetId, 'Runtime.evaluate', { expression: 'globalThis.__claudesurfElements', contextId, objectGroup: OBJECT_GROUP }, opts);
+  if (!result.objectId) fail(envelope.error(DOCUMENT_CHANGED));
   const props = await sessions.send(t.targetId, 'Runtime.getProperties', { objectId: result.objectId, ownProperties: true }, opts);
   const handles = props.result.filter((p) => /^\d+$/.test(p.name)).sort((a, b) => Number(a.name) - Number(b.name));
   const described = await Promise.all(handles.map((p) => sessions.send(t.targetId, 'DOM.describeNode', { objectId: p.value.objectId }, opts)));
@@ -122,7 +99,13 @@ async function readPage(sessions, session, { maxChars, offset, hidden, deadline 
   const opts = { deadline };
   const generation = t.generation;
   const summary = await sessions.callInWorld(t.targetId, WALK_SOURCE, [], opts);
-  const refs = await elementRefs(sessions, t, summary.elements.length, opts);
+  if (t.generation !== generation) fail(envelope.error(DOCUMENT_CHANGED));
+  let refs;
+  try {
+    refs = await elementRefs(sessions, t, summary.elements.length, opts);
+  } finally {
+    await sessions.send(t.targetId, 'Runtime.releaseObjectGroup', { objectGroup: OBJECT_GROUP }, opts).catch(() => {});
+  }
   const set = session.refs.get(t.targetId);
   if (set && set.generation === generation) {
     for (const id of refs) set.ids.add(id);
@@ -134,7 +117,7 @@ async function readPage(sessions, session, { maxChars, offset, hidden, deadline 
 
 async function pageInfo(sessions, session, { deadline }) {
   const t = workingTarget(sessions, session);
-  const info = await sessions.callInWorld(t.targetId, SCROLL_SOURCE, [], { deadline });
+  const info = await pageState(sessions, t, { deadline });
   const lines = [
     stateLines(info.url, info.title),
     `Scroll: ${info.scrollY} of ${info.pageHeight} (viewport ${info.viewportHeight})`,
@@ -147,7 +130,7 @@ async function pageInfo(sessions, session, { deadline }) {
 async function screenshot(sessions, session, { fullPage, deadline }) {
   const t = workingTarget(sessions, session);
   const opts = { deadline };
-  const info = await sessions.callInWorld(t.targetId, SCROLL_SOURCE, [], opts);
+  const info = await pageState(sessions, t, opts);
   const header = stateLines(info.url, info.title);
   if (!fullPage) {
     const { data } = await sessions.send(t.targetId, 'Page.captureScreenshot', { format: 'png' }, opts);
@@ -176,4 +159,4 @@ async function screenshot(sessions, session, { fullPage, deadline }) {
   };
 }
 
-module.exports = { readPage, pageInfo, screenshot, assemblePage, OutcomeError, fail, stateLines, workingTarget, requireHttp, isHttp, SCROLL_SOURCE };
+module.exports = { readPage, pageInfo, screenshot, assemblePage };

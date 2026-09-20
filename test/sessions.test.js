@@ -4,10 +4,11 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const path = require('path');
 const browser = require('../server/browser');
 const { Sessions, SESSION_PAGE, parseSessionPage } = require('../server/sessions');
-const { fakeSession, sleep, waitFor, tmpDir, silentLog, FAKE_CHROME } = require('./helpers');
+const { fakeSession, sleep, waitFor, isolatedPaths, silentLog, FAKE_CHROME } = require('./helpers');
+const { Connection } = require('../server/cdp');
+const { FakeBrowser } = require('./fakes/fake-browser');
 
 const { enableTargets } = browser;
 
@@ -86,6 +87,17 @@ test('a page-opened target is attributed by opener in the session window and in 
   assert.strictEqual(session.workingTargetId, sessions.target(session.workingTargetId).targetId, 'the working tab is unchanged');
 });
 
+test('a page-opened target attached without a URL is attributed by opener on its first navigation, and its window is recorded when the reply lands', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const popup = fake.createTarget({ url: '', lateUrl: 'http://a.test/pop', windowId: 999, openerId: session.workingTargetId, windowDelayMs: 60 });
+  await waitFor(() => session.opened.has(popup.targetId));
+  assert.strictEqual(sessions.target(popup.targetId).role, 'opened');
+  assert.strictEqual(sessions.target(popup.targetId).sessionId, 's1');
+  assert.strictEqual(await sessions.windowOf(popup.targetId), 999);
+  await waitFor(() => sessions.target(popup.targetId).windowId === 999);
+});
+
 test('working target destroyed → recreated from the identity page with a note; window re-resolved first', async () => {
   const { fake, sessions } = await setup();
   const session = await sessions.ensure('s1');
@@ -149,6 +161,90 @@ test('identity destroyed alone → left absent; ensure does nothing', async () =
   assert.strictEqual(session.identityTargetId, null);
   assert.strictEqual(fake.calls.length, calls, 'no protocol traffic');
   assert.ok(session.windowId !== null);
+});
+
+test('identity tab creation fails after the working tab is up → the next ensure opens it, with a note', async () => {
+  const { fake, sessions } = await setup();
+  let failOnce = true;
+  const mouse = fake.handlers.get('Input.dispatchMouseEvent');
+  fake.handle('Input.dispatchMouseEvent', (p, sid) => {
+    if (failOnce && p.type === 'mousePressed' && p.modifiers === 2) { failOnce = false; throw { code: -32000, message: 'nope' }; }
+    return mouse(p, sid);
+  });
+  await assert.rejects(sessions.ensure('s1'), /nope/);
+  const session = sessions.get('s1');
+  assert.ok(session.workingTargetId, 'the working tab exists');
+  assert.strictEqual(session.identityTargetId, null);
+  fake.targets.get(session.workingTargetId).windowId = 777; // the human dragged the working tab elsewhere
+  await sessions.ensure('s1');
+  assert.ok(session.identityTargetId, 'identity tab opened');
+  assert.strictEqual(session.windowId, 777, 're-resolved the working tab\'s window before the repair');
+  assert.strictEqual(sessions.target(session.identityTargetId).windowId, 777);
+  assert.strictEqual(fake.callsTo('Target.createTarget').length, 1, 'same window');
+  assert.deepStrictEqual(session.takeNotes(), ['identity tab was recreated']);
+  const calls = fake.calls.length;
+  await sessions.ensure('s1');
+  assert.strictEqual(fake.calls.length, calls, 'repaired once');
+});
+
+test('identity tab creation fails twice → the second ensure keeps the working tab with a note, and a third sends nothing', async () => {
+  const { fake, sessions } = await setup();
+  let failures = 0;
+  fake.handle('Input.dispatchMouseEvent', (p) => { if (p.type === 'mousePressed' && p.modifiers === 2) { failures++; throw { code: -32000, message: 'nope' }; } return {}; });
+  await assert.rejects(sessions.ensure('s1'), /nope/);
+  const session = sessions.get('s1');
+  const working = session.workingTargetId;
+  const returned = await sessions.ensure('s1');
+  assert.strictEqual(returned, session);
+  assert.strictEqual(failures, 2, 'retried once');
+  assert.strictEqual(session.workingTargetId, working, 'the live working tab is kept');
+  assert.strictEqual(session.identityTargetId, null);
+  assert.deepStrictEqual(session.takeNotes(), ['identity tab could not be recreated; it returns with the next window']);
+  const calls = fake.calls.length;
+  await sessions.ensure('s1');
+  assert.strictEqual(fake.calls.length, calls, 'no further repair attempts');
+});
+
+test('identity tab creation fails and the working tab has left the session page → the working tab is kept and the identity tab stays absent', async () => {
+  const { fake, sessions } = await setup();
+  fake.handle('Input.dispatchMouseEvent', (p) => { if (p.type === 'mousePressed' && p.modifiers === 2) throw { code: -32000, message: 'nope' }; return {}; });
+  await assert.rejects(sessions.ensure('s1'), /nope/);
+  const session = sessions.get('s1');
+  const working = session.workingTargetId;
+  fake.navigateTarget(fake.targets.get(working), 'http://a.test/');
+  await waitFor(() => sessions.target(working).url === 'http://a.test/');
+  await sessions.ensure('s1');
+  assert.strictEqual(session.workingTargetId, working, 'the live working tab is kept');
+  assert.strictEqual(session.identityTargetId, null);
+  assert.strictEqual(fake.callsTo('Target.createTarget').length, 1, 'no new window');
+  assert.deepStrictEqual(session.takeNotes(), ['identity tab could not be recreated; it returns with the next window']);
+  const calls = fake.calls.length;
+  await sessions.ensure('s1');
+  assert.strictEqual(fake.calls.length, calls, 'no further repair attempts');
+});
+
+test('dialogs on a target are capped at the last 20', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const cdp = fake.targets.get(session.workingTargetId).sessionId;
+  for (let i = 0; i < 25; i++) fake.emit('Page.javascriptDialogOpening', { type: 'alert', message: `m${i}` }, cdp);
+  await waitFor(() => fake.callsTo('Page.handleJavaScriptDialog').length === 25);
+  const dialogs = sessions.takeDialogs(session.workingTargetId);
+  assert.strictEqual(dialogs.length, 20);
+  assert.strictEqual(dialogs[0].message, 'm5', 'the oldest are gone');
+  assert.strictEqual(dialogs[19].message, 'm24');
+  assert.deepStrictEqual(sessions.takeDialogs(session.workingTargetId), []);
+});
+
+test('ensureWithNotes hands a repair note to the request whose ensure made it, and none to an overlapping one', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  fake.destroyTarget(session.workingTargetId);
+  await waitFor(() => session.workingTargetId === null);
+  const [first, second] = await Promise.all([sessions.ensureWithNotes('s1'), sessions.ensureWithNotes('s1')]);
+  assert.strictEqual(first.session, session);
+  assert.deepStrictEqual(first.notes, ['working tab was recreated']);
+  assert.deepStrictEqual(second.notes, []);
 });
 
 test('generation increments on main-frame frameNavigated only, resetting the world', async () => {
@@ -224,6 +320,24 @@ test('dropAll on EOF clears windows, targets, and refs but keeps labels', async 
   assert.strictEqual(sessions.count, 1);
 });
 
+test('EOF while ensure waits for a role tab rejects it, and ensure on a fresh connection succeeds', async () => {
+  const { fake, sessions } = await setup();
+  fake.handle('Target.createTarget', () => ({ targetId: 'never-attached' }));
+  const pending = sessions.ensure('s1', { deadline: Date.now() + 100 });
+  await fake.waitForCall('Target.createTarget');
+  fake.close();
+  await assert.rejects(pending, /browser connection closed/);
+  // Past the abandoned wait's deadline: its timer must not fire on a deleted key.
+  await sleep(150);
+  const relaunched = FakeBrowser.inProcess();
+  const conn = new Connection(relaunched.readable, relaunched.writable, silentLog);
+  sessions.attach(conn);
+  await enableTargets(conn);
+  const session = await sessions.ensure('s1');
+  assert.ok(session.workingTargetId && session.identityTargetId);
+  conn.close();
+});
+
 test('the session page URL round-trips through parseSessionPage and rejects look-alikes', () => {
   assert.deepStrictEqual(parseSessionPage(pageUrl('abc', 'identity')), { role: 'identity', session: 'abc' });
   assert.strictEqual(parseSessionPage('http://evil.test/session.html#role=identity&session=abc'), null);
@@ -232,10 +346,8 @@ test('the session page URL round-trips through parseSessionPage and rejects look
   assert.strictEqual(parseSessionPage(''), null);
 });
 
-test('Sessions.attach rebinds to the new connection across a relaunch', async () => {
-  const dir = tmpDir('claudesurf-relaunch');
-  process.env.CLAUDESURF_SOCKET = path.join(dir, 'cs.sock');
-  const profileDir = path.join(dir, 'profile');
+test('Sessions.attach rebinds to the new connection across a relaunch', async (t) => {
+  const { profileDir } = isolatedPaths(t, 'claudesurf-relaunch');
   const sessions = new Sessions(silentLog);
   const first = await browser.launch({ binary: FAKE_CHROME, profileDir, env: {}, log: silentLog });
   sessions.attach(first.conn);

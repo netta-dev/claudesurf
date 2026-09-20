@@ -98,8 +98,8 @@ function actionSchema(action) {
   return { action, properties, required };
 }
 
-// null when the call is well-formed, else a schema_error envelope. Defaults are not
-// applied here; handlers read them from ACTIONS.
+// null when the call is well-formed, else a schema_error envelope. Handlers apply
+// the defaults from ACTIONS.
 function validate(tool, action, args = {}) {
   if (!TOOLS[tool]) return schemaError(String(action), `unknown tool ${tool}`, { tools: Object.keys(TOOLS) });
   const spec = ACTIONS[action];
@@ -168,4 +168,4 @@ function toolDefinitions() {
   });
 }
 
-module.exports = { ACTIONS, TOOLS, validate, withDefaults, toolDefinitions, actionSchema };
+module.exports = { ACTIONS, validate, withDefaults, toolDefinitions };

@@ -13,6 +13,7 @@
   <button id="handler" onclick="document.getElementById('log').textContent = 'handled ' + (event.isTrusted ? 'trusted' : 'scripted')">Handler button</button>
   <button id="trusted-only" onclick="if (event.isTrusted) document.getElementById('log').textContent = 'trusted only fired'">Trusted only</button>
   <div class="stage"><button id="covered" onclick="document.getElementById('log').textContent = 'covered clicked'">Covered button</button><div id="overlay"></div></div>
+  <shadow-host role="button" tabindex="0" aria-label="Shadow host button" onclick="document.getElementById('log').textContent = 'shadow host ' + (event.isTrusted ? 'trusted' : 'scripted')"></shadow-host>
   <button disabled>Disabled button</button>
   <a href="/other">Same tab link</a>
   <a href="/other" target="_blank">New tab link</a>
@@ -22,5 +23,8 @@
   <button onclick="window.addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = ''; }); document.getElementById('log').textContent = 'armed'">Arm beforeunload</button>
   <form method="post" action="/slow"><button type="submit">Slow submit</button></form>
   <p>Trailing text so a small max_chars cuts before the elements.</p>
+<script>
+  document.querySelector('shadow-host').attachShadow({ mode: 'open' }).innerHTML = '<div style="display:inline-block; padding: 8px; background: #ccc">painted in the shadow tree</div>';
+</script>
 </body>
 </html>

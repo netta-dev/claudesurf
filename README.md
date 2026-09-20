@@ -1,6 +1,6 @@
 # ClaudeSurf
 
-An MCP server that lets Claude Code read and act on web pages in a dedicated Chrome. The daemon launches and owns that Chrome over `--remote-debugging-pipe`: no extension to load, no debugging port open. The profile persists, so sites stay signed in across sessions.
+An MCP server that lets Claude Code read and act on web pages in a dedicated Chrome. The daemon launches and owns that Chrome over `--remote-debugging-pipe`, without an extension or a debugging port. The profile persists, so sites stay signed in across sessions.
 
 Each Claude Code session gets its **own Chrome window**, so Claude browses without taking over the window you are using.
 
@@ -9,8 +9,8 @@ Each Claude Code session gets its **own Chrome window**, so Claude browses witho
 ```
 Claude Code session 1 ── server.js ─┐
 Claude Code session 2 ── server.js ─┼─ (Unix socket) ─ daemon.js ─ (pipe) ─ Chrome ─┬─ Window: session 1
-Claude Code session N ── server.js ─┘                                                ├─ Window: session 2
-                                                                                     └─ …
+Claude Code session N ── server.js ─┘                                               ├─ Window: session 2
+                                                                                    └─ …
 ```
 
 - **`server/server.js`** — MCP stdio bridge, one per Claude Code session. Exposes the two tools, validates calls, forwards them to the daemon over the per-user Unix socket (`$XDG_RUNTIME_DIR/claudesurf.sock`, mode `0600`), and wraps page-derived text in the nonce delimiter. It keys the session by Claude Code's own session id (`CLAUDE_CODE_SESSION_ID`, falling back to a hash of `CLAUDE_PROJECT_DIR`, then a random id), so a respawned bridge reuses its window.
@@ -21,15 +21,17 @@ Claude Code session N ── server.js ─┘                                   
 The first call from a session creates a window with two tabs:
 
 - The **working tab** — where Claude navigates and acts. Until the first `navigate` it shows the session page.
-- The **identity tab** — the second tab, unpinned, with a distinctive favicon and the session name as its title, so you can tell windows apart.
+- The **identity tab** — the second tab, with a distinctive favicon and the session name as its title, so you can tell windows apart.
 
 If you close the working tab, the next action recreates it. If you close the whole window, the next action recreates it under the same name. If you close only the identity tab, it stays closed until the window is next recreated.
 
 ## Setup
 
-Requires Node 22 or newer and Chrome (tested with Chrome 153). The server has no npm dependencies; there is nothing to install.
+Requires Node 22 or newer and Chrome (tested with Chrome 153). The server needs only Node, so there is nothing to install.
 
-### 1. Run the daemon as a systemd user service
+### 1. Run the daemon
+
+As a systemd user service:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -39,6 +41,8 @@ systemctl --user enable --now claudesurf
 ```
 
 The unit uses `%h/workspaces/claudesurf`, so one unit works for any user's clone; adjust the path if your clone lives elsewhere.
+
+Without systemd, run `node ~/workspaces/claudesurf/server/daemon.js` from a terminal in your desktop session, or from your session's autostart, and leave it running; the bridge reaches it through the same socket. A daemon started this way inherits the display from its shell, so the graphical-environment note below doesn't apply to it.
 
 **Graphical environment.** The daemon launches a headful Chrome, so it needs `DISPLAY` (or `WAYLAND_DISPLAY`). The unit ships without display values, and one of three things supplies them:
 
@@ -51,7 +55,7 @@ The unit uses `%h/workspaces/claudesurf`, so one unit works for any user's clone
    ```
    A second OS user reaches the X server through an `xhost` local-user grant rather than a cookie, so its `XAUTHORITY` must be empty. The daemon drops any `XAUTHORITY` that names a file it cannot read.
 
-The same unit serves every OS user on the machine.
+The same unit serves every OS user on the machine. Each OS user is isolated: its own daemon, its own `0600` socket in its runtime directory, its own profile, and no TCP port, so one user's Claude Code can't reach another user's browser.
 
 ### 2. Add the MCP server to Claude Code
 
@@ -87,11 +91,11 @@ Two tools, each taking an `action` plus that action's arguments as flat properti
 | | `click` | **`ref`**, `trusted` (default false) | Clicks an element by ref. Reports `Navigated: yes/no` and any tab or popup the page opened. |
 | | `scroll` | **`direction`** (`up`/`down`/`top`/`bottom`), `amount` (default 500) | Scrolls the window, or the page's scrollable container when the window does not scroll. |
 
-Outcomes: `success`, `needs_confirmation`, `needs_human`, `stale_ref`, `unsettled`, `schema_error`, `setup_error`, `error`. The bridge marks `error`, `schema_error`, and `setup_error` as tool errors.
+Outcomes: `success`, `stale_ref`, `schema_error`, `setup_error`, `error`. The bridge marks `error`, `schema_error`, and `setup_error` as tool errors. `needs_confirmation`, `needs_human`, and `unsettled` are reserved for the domain gate, challenge handoff, and settle detection, which are not built yet.
 
 **Refs** are valid for the current document. After the page navigates, a click on an old ref returns `stale_ref`; a ref that was never returned by a read of the current document returns `error`. Refs from an earlier read of the same document stay valid, and refs cut by `max_chars` are clickable without paging to them.
 
-**Clicks** are scripted by default, which leaves your desktop focus alone and reaches elements under overlays. `trusted: true` resolves the element to coordinates, checks nothing covers it, and sends real mouse events; that brings the Chrome window to the front. Use it only when a scripted click changed nothing and the control plausibly checks for a real pointer. A click that opens a new tab or popup brings the window to the front either way.
+**Clicks** are scripted by default, which leaves your desktop focus alone and reaches elements under overlays. `trusted: true` resolves the element to coordinates, confirms it is the topmost element there, and sends real mouse events; that brings the Chrome window to the front. Use it only when a scripted click changed nothing and the control plausibly checks for a real pointer. A click that opens a new tab or popup brings the window to the front either way.
 
 **Dialogs** (`alert`, `confirm`, `prompt`) are dismissed and their text appears in the next result as `Dialog (<type>): <message>`; `beforeunload` is accepted. Downloads are denied.
 
@@ -133,12 +137,12 @@ Live tests run a headless Chrome against a temporary profile. The headful window
 
 ## Troubleshooting
 
-- **"Cannot reach ClaudeSurf daemon"** — `systemctl --user restart claudesurf`. The bridge retries for a few seconds, so a restart is usually invisible.
+- **"Cannot reach ClaudeSurf daemon"** — `systemctl --user restart claudesurf`, or start `node server/daemon.js` again if you run it by hand. The bridge retries for a few seconds, so a restart is usually invisible.
 - **`setup_error`: profile held by another Chrome** — another Chrome has the profile open. Close it, or point `CLAUDESURF_PROFILE_DIR` elsewhere.
 - **`setup_error`: no `DISPLAY`** — add the drop-in above, or run Claude Code from a desktop session so the bridge can supply the display.
 - **"navigate first"** — `page`, `click`, and `scroll` work on http(s) pages only; a fresh window is on the session page until the first `navigate`.
 - **The window came to the front** — a trusted click, a click that opened a tab or popup, and window creation raise the window; scripted clicks, `navigate`, `scroll`, and screenshots don't.
-- **Screenshots take about two seconds** — the working tab is not the active tab in its window, because you are viewing another tab there. Switch back to it.
+- **Screenshots take seconds or time out** — the working tab is not the active tab in its window, because you are viewing another tab there (the first capture takes about 3 s and later ones can hit the 10 s limit). Switch back to it.
 - **Logs** — `journalctl --user -u claudesurf`; set `CLAUDESURF_LOG_LEVEL=debug` in a drop-in to see protocol traffic.
 
 ## Migrating from the extension-based version
@@ -146,6 +150,7 @@ Live tests run a headless Chrome against a temporary profile. The headful window
 1. Unload the ClaudeSurf extension from every Chrome profile it was loaded into.
 2. Delete `extension/port.json` if you created one.
 3. Remove `CLAUDESURF_BROWSER_CMD` from the MCP server entry; the daemon owns the launch.
-4. Replace permission rules on the old tool names (`read_page`, `click_element`, `navigate`, `scroll`, `get_page_info`, `screenshot`) with rules on `claudesurf_read` and `claudesurf_act`. A rule on `claudesurf_act` approves clicks too, so `navigate` and `scroll` now prompt unless you approve the whole tool.
-5. Replace the two systemd units with the one `claudesurf.service`, plus the optional display drop-in.
-6. Sign in again on each site inside the fresh profile.
+4. Delete `server/node_modules`; the server has no dependencies now.
+5. Replace permission rules on the old tool names (`read_page`, `click_element`, `navigate`, `scroll`, `get_page_info`, `screenshot`) with rules on `claudesurf_read` and `claudesurf_act`. A rule on `claudesurf_act` approves clicks too, so `navigate` and `scroll` now prompt unless you approve the whole tool.
+6. Replace the two systemd units with the one `claudesurf.service`, plus the optional display drop-in.
+7. Sign in again on each site inside the fresh profile.

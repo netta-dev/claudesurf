@@ -2,7 +2,7 @@
 // Never require() this file.
 //
 // Collects the interactive elements of the document, descending open shadow roots,
-// and returns a summary by value. The element objects themselves are stashed on the
+// and returns a summary by value. The element objects are stashed on the
 // world's global so the daemon can read their handles with one Runtime.getProperties.
 function claudesurfWalk() {
   const SELECTOR = 'a[href], button, input:not([type=hidden]), select, textarea, summary, [contenteditable=true], [role]';
@@ -57,25 +57,7 @@ function claudesurfWalk() {
     return '';
   }
 
-  function hiddenByAria(el) {
-    for (let n = el; n; n = n.parentElement || (n.getRootNode() instanceof ShadowRoot ? n.getRootNode().host : null)) {
-      if (n.getAttribute && n.getAttribute('aria-hidden') === 'true') return true;
-    }
-    return false;
-  }
-
-  function visible(el) {
-    if (!el.checkVisibility({ opacityProperty: true, visibilityProperty: true, contentVisibilityAuto: true })) return false;
-    const r = el.getBoundingClientRect();
-    if (r.width === 0 && r.height === 0) return false;
-    return !hiddenByAria(el);
-  }
-
-  function disabledOf(el) {
-    if (el.disabled === true) return true;
-    if (el.getAttribute('aria-disabled') === 'true') return true;
-    return Boolean(el.closest && el.closest('fieldset:disabled'));
-  }
+  // @include state.js
 
   function checkedOf(el) {
     if (typeof el.checked === 'boolean') return el.checked;
@@ -86,14 +68,17 @@ function claudesurfWalk() {
   const elements = [];
   collect(document, elements);
   globalThis.__claudesurfElements = elements;
-  const summary = elements.map((el) => ({
-    kind: kindOf(el),
-    label: labelOf(el),
-    href: el.tagName === 'A' ? el.href : undefined,
-    disabled: disabledOf(el),
-    checked: checkedOf(el),
-    visible: visible(el),
-  }));
+  const summary = elements.map((el) => {
+    const state = claudesurfState(el);
+    return {
+      kind: kindOf(el),
+      label: labelOf(el),
+      href: el.tagName === 'A' ? el.href : undefined,
+      disabled: state.disabled,
+      checked: checkedOf(el),
+      visible: !state.hidden,
+    };
+  });
   return {
     url: location.href,
     title: document.title,

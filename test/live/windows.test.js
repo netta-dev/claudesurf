@@ -1,8 +1,8 @@
 // Headful window behaviour, gated by CLAUDESURF_LIVE_HEADFUL=1: which tab is active,
-// tab grouping, and which operations raise the session window. The active X window
-// and its title are read with xdotool; the focus assertions skip without it. The
-// window title names the active tab, which is the observable that tells the working
-// tab from the identity tab.
+// tab grouping, and which operations raise the session window (creation, a click that
+// opens a tab, a trusted click). The active X window and its title are read with
+// xdotool; the focus assertions skip without it. The window title names the active
+// tab, which tells the working tab from the identity tab.
 
 const { test } = require('node:test');
 const assert = require('node:assert');
@@ -23,7 +23,7 @@ const activeWindow = () => xdotool('getactivewindow');
 const windowName = (id) => xdotool('getwindowname', id);
 const activate = (id) => { xdotool('windowactivate', '--sync', id); };
 
-test('the working tab is the active tab, the identity tab joins its window, and only creation and tab-opening clicks raise', { skip }, async () => {
+test('the working tab is the active tab, the identity tab joins its window, and only creation, tab-opening clicks, and trusted clicks raise', { skip }, async () => {
   const live = await liveBrowser({ headless: false });
   const site = await serve();
   const before = activeWindow();
@@ -65,6 +65,14 @@ test('the working tab is the active tab, the identity tab joins its window, and 
     await sleep(500);
     assert.strictEqual(activeWindow(), chromeWindow, 'a click that opens a tab raises the session window');
     for (const id of session.opened) await live.conn.send('Target.closeTarget', { targetId: id });
+
+    activate(before);
+    await sleep(300);
+    assert.strictEqual(activeWindow(), before, 'parked the desktop focus again');
+    const handler = again.payload.match(/\[(e\d+)\] button "Handler button"/)[1];
+    await input.click(sessions, session, handler, { trusted: true });
+    await sleep(500);
+    assert.strictEqual(activeWindow(), chromeWindow, 'a trusted click brings the session window to the front');
   } finally {
     site.close();
     await live.close();

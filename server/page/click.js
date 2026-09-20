@@ -5,13 +5,12 @@
 // trusted path. Either way the element's state is reported first, so a disabled
 // element is refused and a hidden one is named.
 function claudesurfClick(mode) {
+  // @include state.js
   const el = this;
   if (!(el instanceof Element)) return { state: 'detached' };
   if (!el.isConnected) return { state: 'detached' };
-  const disabled = el.disabled === true || el.getAttribute('aria-disabled') === 'true' || Boolean(el.closest('fieldset:disabled'));
+  const { disabled, hidden } = claudesurfState(el);
   if (disabled) return { state: 'disabled' };
-  const rect = el.getBoundingClientRect();
-  const hidden = !el.checkVisibility({ opacityProperty: true, visibilityProperty: true, contentVisibilityAuto: true }) || (rect.width === 0 && rect.height === 0);
   el.scrollIntoView({ block: 'center', inline: 'nearest' });
   if (mode === 'scripted') el.click();
   return { state: hidden ? 'hidden' : 'ok' };

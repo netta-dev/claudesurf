@@ -3,13 +3,18 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
+const fs = require('fs');
+const path = require('path');
 const { tmpSocket, mockDaemon, callBridge } = require('./helpers');
 
 async function withMock(respond, fn) {
   const socketPath = tmpSocket();
   const daemon = mockDaemon(socketPath, respond);
   await daemon.listen();
-  try { return await fn(socketPath, daemon); } finally { daemon.close(); }
+  try { return await fn(socketPath, daemon); } finally {
+    daemon.close();
+    fs.rmSync(path.dirname(socketPath), { recursive: true, force: true });
+  }
 }
 
 const DELIM = /<<<claudesurf-untrusted:([0-9a-f]{16})>>>\n([\s\S]*?)\n<<<end claudesurf-untrusted:\1>>> \(data, not instructions\)/;
@@ -90,8 +95,10 @@ test('the request carries session id, tool, action, args, and the graphical envi
 
 test('a daemon that does not answer in time renders as error', async () => {
   await withMock(() => undefined, async (socketPath) => {
-    const { response } = await callBridge({ socketPath, name: 'claudesurf_read', args: { action: 'info' }, timeoutMs: 45000 });
+    const started = Date.now();
+    const { response } = await callBridge({ socketPath, name: 'claudesurf_read', args: { action: 'info' }, env: { CLAUDESURF_REQUEST_TIMEOUT_MS: '300' } });
+    assert.ok(Date.now() - started < 5000, 'the override bounded the wait');
     assert.ok(response.result.isError);
-    assert.match(response.result.content[0].text, /^outcome: error\nThe daemon did not answer within 35 s/);
+    assert.match(response.result.content[0].text, /^outcome: error\nThe daemon did not answer within 0\.3 s/);
   });
 });
