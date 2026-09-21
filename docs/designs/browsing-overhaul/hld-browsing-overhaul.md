@@ -1,7 +1,7 @@
 # browsing-overhaul
 
 **Last reviewed**: 2026-09-10
-**Status**: Phase 1 complete
+**Status**: Phase 2 LLD committed
 **Companions**: [use cases](../use-cases-browsing-overhaul.md) · [future](../future-claudesurf.md)
 
 ## Overview
@@ -46,7 +46,7 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
   - A cross-origin iframe is a separate CDP target, so an accessibility tree pulled on the page target contains nothing inside it. Embedded logins, payment forms, comment widgets, and Cloudflare's turnstile are all iframes, so same-document reads would miss most of the hard cases.
   - The daemon auto-attaches to child targets and reads them, marking frame content in the output so the agent knows where a boundary was crossed.
 
-- **A ref is a `backendDOMNodeId` scoped to its frame target and document generation.**
+- **A ref is a `backendDOMNodeId` scoped to its target and document generation; a cross-site frame is its own target and its refs carry a frame prefix, while a frame in the page's renderer shares the page's scope.**
   - The browser owns the node mapping, so nothing in claudesurf holds a table that can drift from the document, and `DOM.scrollIntoViewIfNeeded`, `DOM.getBoxModel`, and `DOM.resolveNode` all accept the id directly.
   - The id is unique within a renderer process rather than within a tab, so a bare id could resolve to a live node in the wrong document. Pairing it with its frame target and a generation counter makes cross-target or post-navigation reuse fail loudly.
 
@@ -156,7 +156,7 @@ One per OS user:
 - **`server/paths.js`** — the socket, profile, and browser-record paths and their overrides.
 - **`server/policy.js`** — allowlist matching, persisted grants, and session-scoped once-grants.
 - **`server/read.js`** — isolated-world evaluation and read assembly.
-- **`server/snapshot.js`** — accessibility tree pruning and frame assembly.
+- **`server/snapshot.js`** — control, landmark, and frame-node extraction from the accessibility tree, scope resolution, the omission report.
 - **`server/render.js`** — isolated-world prose extraction and control placement.
 - **`server/diff.js`** — snapshot differencing for `since`.
 - **`server/input.js`** — ref resolution, scroll into view, input dispatch.
@@ -186,7 +186,7 @@ The `extension/` directory is deleted. Its session-identity page becomes `server
 
 1. Pulls the accessibility tree for the session's working target and every attached child frame target.
 2. Prunes generic containers and invisible nodes, and restricts to the main landmark unless asked otherwise.
-3. Renders prose through Readability and Turndown in an isolated world over the page's DOM.
+3. Renders prose through Turndown in an isolated world over the page's DOM, with Readability ahead of it when no landmark scopes the page or the caller asks for the article.
 4. Places controls into that prose by `backendDOMNodeId`.
 5. Returns interleaved markdown with frame boundaries marked, and counts for everything omitted.
 
@@ -223,7 +223,7 @@ The reverse direction is rarer than it looks. The pipe holds Chrome alive with z
 
 The second OS user is the case this serves, and the identical-shape requirement holds for the browser but not for notifications. That user has no login session of its own to import an environment from — its `DISPLAY` arrives through Claude Code, and now reaches the daemon the same way. Notifications are worse: `notify-send` from that user reaches that user's session bus, which no notification daemon watches, and it cannot reach the human's bus through a `0700` runtime directory. Sessions run by the second user therefore fall back to reporting a challenge in chat, which is where the handoff was always going to end up for a human who is not watching the desktop.
 
-**Concurrency and the time budget.** Every Claude Code session for one OS user multiplexes over a single pipe into a single browser process, and the daemon runs one command at a time per target while interleaving across targets. A CDP response arrives as one message, so a large payload cannot be streamed — the accessibility pull is narrowed into several commands over partial subtrees instead. A screenshot cannot be narrowed that way, since it is one response of whatever size the page dictates. Full-page capture is therefore split into a capped number of viewport-sized segments; `max_chars` bounds text and does nothing for an image block. The budget is tightest at cold start, where a browser launch, handshake, and navigation all land inside a single tool call against `server.js`'s 35-second request timeout. Once settle detection exists it shares that window too, taking its timeout from what remains after the launch.
+**Concurrency and the time budget.** Every Claude Code session for one OS user multiplexes over a single pipe into a single browser process, and the daemon runs one command at a time per target while interleaving across targets. A CDP response arrives as one message, so a large payload cannot be streamed — a whole accessibility tree fits one message at the sizes measured (2 MB for 5,000 nodes), with narrowing over partial subtrees as the fallback if a page outgrows it. A screenshot cannot be narrowed that way, since it is one response of whatever size the page dictates. Full-page capture is therefore split into a capped number of viewport-sized segments; `max_chars` bounds text and does nothing for an image block. The budget is tightest at cold start, where a browser launch, handshake, and navigation all land inside a single tool call against `server.js`'s 35-second request timeout. Once settle detection exists it shares that window too, taking its timeout from what remains after the launch.
 
 **Diagnostics.** This project deletes a substantial `[debug]` instrumentation layer — focus-probe logging, bind-reason logging, extension-side window logging — while moving onto a protocol whose failures are opaque. The action log is a product feature rather than a diagnostic, so the daemon carries its own leveled logging to the journal: protocol commands and errors at debug, browser lifecycle and gate decisions at info.
 
@@ -264,16 +264,16 @@ Beyond those, the CDP client, tree pruning, and settle detection need a recorded
 11. Each session window carries an identity tab showing the session name, distinguished from the working tab by recorded target id rather than by pinning.
 12. Actions target the session's working tab; if the human closes it, a fresh one is created on demand.
 13. Session window and target state is dropped when its window closes, and all of it on pipe EOF. The session label survives, so a recreated window keeps its name.
-14. Reads combine the accessibility tree for controls and structure with a Readability and Turndown pass run in an isolated world.
+14. Reads combine the accessibility tree for controls and structure with a Turndown pass run in an isolated world, Readability ahead of it when no landmark scopes the page or on request.
 15. Reads follow attached out-of-process iframe targets, marking frame boundaries in the output.
 16. Read output is interleaved markdown with inline refs.
-17. A ref is a `backendDOMNodeId` scoped to its frame target and document generation; a ref used after that document changed returns `stale_ref`, and a ref that is wrong within the same document — never read, or since removed — returns `error`.
+17. A ref is a `backendDOMNodeId` scoped to its target and document generation (a cross-site frame being its own target, with prefixed refs; a same-process frame sharing the page's); a ref used after that document changed returns `stale_ref`, and a ref that is wrong within the same document — never read, or since removed — returns `error`.
 18. Reads return visible elements only by default, report the skipped count, and take a `hidden` parameter to include them.
 19. Reads strip to the main content region by default, report what was dropped, and take a parameter to include it.
 20. Repeated links are deduplicated.
 21. Find, scope, article extraction, and link presentation are parameters of the read action rather than separate actions.
 22. A `since` parameter returns what changed after an action.
-23. Nothing is truncated silently; every response states what was cut and how to retrieve more.
+23. Nothing the read renders is truncated silently; every response states what was cut and how to retrieve more. Content the page itself hides is excluded rather than cut, and its controls are counted.
 24. `max_chars` and `offset` are introduced as a size backstop, replacing today's fixed character cut.
 25. Every action's returned text payload is wrapped in `<<<claudesurf-untrusted:NONCE>>>` markers with a per-call random nonce, `screenshot`'s URL and title lines included. Image blocks are exempt, since a delimiter is text.
 26. The nonce is generated after the payload arrives; no look-alike stripping is performed.
@@ -364,22 +364,22 @@ Against today, this phase adds buttons and `[role]` controls where reads returne
 
 ---
 
-### Phase 2 — Structured reads (14%)
+### Phase 2 — Structured reads (18%)
 
-Reads move onto the accessibility tree for controls and structure, with prose rendered through Readability and Turndown in an isolated world and controls placed by `backendDOMNodeId`. Output becomes interleaved markdown restricted to main content, deduplicated, visibility-filtered, following child frames, and reporting what it omitted, with `find`, `scope`, article extraction, and link presentation as parameters.
+Reads move onto the accessibility tree for controls and structure, with prose rendered through Turndown in an isolated world — Readability ahead of it when no landmark scopes the page or on request — and controls placed by `backendDOMNodeId`. Output becomes interleaved markdown restricted to main content, deduplicated, visibility-filtered, following child frames, and reporting what it omitted, with `find`, `scope`, article extraction, and link presentation as parameters.
 
-Phase 1's flat walk is replaced under an unchanged action signature and ref scheme, so nothing built on refs is rewritten. This is where a link-dense page stops overflowing the caller's token budget.
+Phase 1's flat walk is replaced under an unchanged action signature and an `e<id>` ref scheme extended only by a frame prefix for cross-site frames, so nothing built on refs is rewritten. This is where a link-dense page stops overflowing the caller's token budget.
 
 **Key decisions:**
 - **Controls are placed into rendered prose by `backendDOMNodeId`, not by text matching.** Both passes derive from the same nodes, so the correspondence is a lookup.
 
 **Key files:**
-- `server/snapshot.js` (new — pruning, frame assembly, ref scoping)
+- `server/snapshot.js` (new — pruning, control and landmark extraction, scope resolution)
 - `server/render.js` (new — isolated-world extraction, control placement)
-- `server/read.js` (modified — the accessibility tree replaces the flat walk)
-- `server/daemon.js` (modified — read handlers), `server/dispatch.js` (modified — read parameters)
-- `server/package.json` (modified — Readability and Turndown), plus a bundling step producing injectable sources
-- `test/snapshot.test.js`, `test/render.test.js` (new — fixture pages through the renderer), `test/read.test.js` (modified — flat-walk assertions replaced)
+- `server/read.js` (modified — the accessibility tree replaces the flat walk), `server/page/render.js` (new — the in-browser clone and Turndown rules), `server/sessions.js` (modified — iframe targets, worlds per frame), `server/input.js` (modified — frame refs)
+- `server/daemon.js` (modified — read arguments passed through), `server/dispatch.js` (modified — read parameters)
+- `server/package.json` (modified — Readability, Turndown, and the Turndown GFM plugin, whose browser-global files are injectable as shipped)
+- `test/snapshot.test.js`, `test/render.test.js` (new — recorded trees and pure assembly functions), `test/live/render.test.js` (new — fixture pages through the renderer), `test/read.test.js` (modified — flat-walk assertions replaced)
 
 **Open questions:**
 
@@ -416,16 +416,18 @@ After this phase the agent has every action except capture and the challenge han
 2. Does the allowlist gate reads on an already-open page, or only routes to a new document?
 3. Which interception mechanism cancels a navigation before content loads — `Fetch.enable` or navigation cancellation — and how does it coexist with phase 4's continuous network capture?
 4. How is a page-opened target held paused until its first navigation clears the gate, and what does the agent see when it is refused?
-4. How does a session pick up a host another session persisted — re-read per call, or cached with invalidation?
-5. Where does the log live, and does it rotate?
-6. Does typing use `Input.insertText` or per-key `dispatchKeyEvent`? The former is fast; the latter drives editors listening for individual key events.
-7. How are coordinates resolved reliably for a window that is backgrounded and therefore render-throttled, and what happens when an element cannot be brought into view?
-8. Native `<select>` cannot be driven through a synthetic dropdown. What is the mechanism?
-9. What establishes focus for `press`, which takes no ref, and what happens when nothing is focused?
-10. What does a key press accept — a literal such as `Enter`, or chords such as `Control+Enter`?
-11. How is input dispatched into an element inside a child frame target?
-12. Is settling defined by network quiescence, DOM mutation quiescence, or both, and what timeout keeps it inside the remaining transport budget?
-13. Is the diff computed over rendered markdown or over accessibility nodes?
+5. How does a session pick up a host another session persisted — re-read per call, or cached with invalidation?
+6. Where does the log live, and does it rotate?
+7. Does typing use `Input.insertText` or per-key `dispatchKeyEvent`? The former is fast; the latter drives editors listening for individual key events.
+8. How are coordinates resolved reliably for a window that is backgrounded and therefore render-throttled, and what happens when an element cannot be brought into view?
+9. Native `<select>` cannot be driven through a synthetic dropdown. What is the mechanism?
+10. What establishes focus for `press`, which takes no ref, and what happens when nothing is focused?
+11. What does a key press accept — a literal such as `Enter`, or chords such as `Control+Enter`?
+12. How is input dispatched into an element inside a child frame target?
+13. Is settling defined by network quiescence, DOM mutation quiescence, or both, and what timeout keeps it inside the remaining transport budget?
+14. Is the diff computed over rendered markdown or over accessibility nodes?
+15. Does the domain gate intercept navigations of attached iframe targets, which phase 2 leaves `Page.enable`d and ungated, or name them as outside the gate?
+16. Which iframe targets get focus emulation, now that `type` and `press` reach into frames and phase 2 sent it to page targets only?
 
 ---
 
@@ -456,9 +458,9 @@ Challenges, login walls, and two-factor prompts are detected, returned as `needs
 |---|---|
 | HLD | 10 |
 | 1. Foundation | 27 |
-| 2. Structured reads | 14 |
+| 2. Structured reads | 18 |
 | 3. Acting | 16 |
 | 4. Handoff and capture | 8 |
 | Wrap-up | 5 |
-| Unexpected | 20 |
+| Unexpected | 16 |
 | **Total** | **100** |

@@ -96,6 +96,22 @@ A read produces more content than `max_chars` allows. The response carries the t
 
 A read lands on a single-page application that has rendered a skeleton. The response reports the page as unsettled rather than presenting the skeleton as the finished page, so the agent re-reads instead of concluding from placeholders.
 
+### UC24 — `article=true` on a page with no article
+
+The agent asks for the article on a dashboard or a listing page. Readability finds no candidate. The response renders the default scope instead, with a header line `Article: none found` and the `Scope:` line naming what rendered, so the agent gets the page and knows the extraction did not apply.
+
+### UC25 — A read of a page with no landmarks
+
+The page has no `main`, `article`, or other landmark. When Readability judges it readerable, the read renders its article candidate and the `Scope:` line reads `readability`, with the controls outside the article counted as omitted; otherwise the whole body renders and the line reads `body`.
+
+### UC26 — The renderer throws on a page
+
+Turndown, Readability, or the clone walk raises on an unusual DOM. The read returns `error` carrying the exception text and the agent's recourse: `scope=all` or `scope=<ref>` to render a different subtree, `article=false` if it was set, or `screenshot`. There is no flat fallback read; the page is unreadable as text until one of those works.
+
+### UC27 — `find` matches nothing
+
+The agent passes a `find` needle absent from the scoped render. The header reads `0 blocks`, the region is empty, and no truncation line prints. A match in an omitted landmark needs `scope=all`, which the tool description says.
+
 ## Browser lifecycle
 
 ### UC14 — The daemon restarts mid-session
@@ -120,7 +136,19 @@ A launch against a `--user-data-dir` already in use hands off to the running ins
 
 ### UC18 — A page embeds a cross-origin iframe
 
-The agent reads a page carrying an embedded login, payment form, or comment widget. Because the daemon auto-attaches to child targets, the read includes that frame's content inline, marked so the agent knows a boundary was crossed and which origin it belongs to. Refs from inside the frame are scoped to that frame's target, so UC8's rule covers reuse against the parent document.
+The agent reads a page carrying an embedded login, payment form, or comment widget. Because the daemon auto-attaches to child targets, the read includes that frame's content inline, marked so the agent knows a boundary was crossed and which origin it belongs to. Refs from inside a frame Chrome runs as its own target (a cross-site frame) carry a frame prefix (`f1e42`) and are scoped to that frame's target, so UC8's rule covers reuse against the parent document; a frame in the page's own renderer, cross-origin or not, has plain `e42` refs scoped to the page.
+
+### UC22 — A frame the read cannot render
+
+A frame has no attached target yet, is `about:blank`, fails its tree pull, or misses the request deadline, or the page carries more frames than the read renders. The frame's position in the output shows `[e40 frame url (not readable)]` or `[e40 frame url (not read: frame limit)]`, the ref being the iframe element's so `scope=e40` reads that frame alone, and the rest of the page is delivered; a frame never fails a read.
+
+### UC23 — A trusted click on a frame ref
+
+The agent clicks an `f`-prefixed ref with `trusted: true`. The action returns `error` saying trusted clicks inside cross-site frames are not supported yet and that a scripted click is. A scripted click on the same ref runs inside the frame.
+
+### UC23a — A frame ref after the parent navigates
+
+The parent page navigates, so Chrome destroys its frame targets. A click on an `f`-ref from the earlier read returns `stale_ref` saying the frame is gone. If instead the frame alone navigated, the ref returns `stale_ref` saying the frame's document changed.
 
 ### UC19 — A challenge lives inside an iframe
 

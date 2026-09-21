@@ -29,3 +29,8 @@
    - [ ] Resolution:
 
 ## C. Human-review findings
+
+## D. Design-review loop
+
+1. The phase-2 LLD took five design-review rounds; rounds 2–4 each found real gaps that a check of the draft against the shipped code's seams would have caught before dispatch — an error class the daemon maps by `instanceof` from one module (`SetupError`), a shared object-group name across units on one protocol session, an attach handler's early return for non-page targets, a per-read frame index against phase 1's "refs stay valid within a generation" promise. Candidate: before the first review dispatch, the LLD author walks each new mechanism against the module it plugs into (error mapping, handler early-returns, shared names, prior-phase promises) and records the check in the doc's Context block.
+   - [ ] Resolution:
