@@ -25,9 +25,15 @@
   <button style="display:block; height:0; padding:0; border:0; overflow:hidden">Zero height</button>
   <div id="host"></div>
   <a href="/other" style="position:absolute; top: 5000px">Offscreen link</a>
+  <!-- Last in the flow, so the controls above keep the positions a trusted click
+       through frames.html hit-tests. -->
+  <p id="log">nothing yet</p>
   <script>
     const root = document.getElementById('host').attachShadow({ mode: 'open' });
     root.innerHTML = '<button>Shadow button</button>';
+    document.querySelector('[aria-label="From aria-label"]').addEventListener('click', (event) => {
+      document.getElementById('log').textContent = event.isTrusted ? 'trusted click' : 'scripted click';
+    });
   </script>
 </body>
 </html>

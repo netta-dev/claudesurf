@@ -1,0 +1,20 @@
+[
+{"nodeId":"445","role":{"type":"internalRole","value":"RootWebArea"},"name":{"type":"computedString","value":"Frames fixture"},"properties":[{"name":"focusable","value":{"type":"booleanOrUndefined","value":true}},{"name":"focused","value":{"type":"booleanOrUndefined","value":true}},{"name":"url","value":{"type":"string","value":"http://fixture.test/frames.html"}}],"childIds":["455"],"backendDOMNodeId":445},
+{"nodeId":"455","ignored":true,"role":{"type":"role","value":"none"},"childIds":["459"],"backendDOMNodeId":455},
+{"nodeId":"459","ignored":true,"role":{"type":"role","value":"none"},"childIds":["460","461","462","463","464","465","466"],"backendDOMNodeId":459},
+{"nodeId":"460","role":{"type":"role","value":"heading"},"name":{"type":"computedString","value":"Frames"},"properties":[{"name":"level","value":{"type":"integer","value":1}}],"childIds":["467"],"backendDOMNodeId":460},
+{"nodeId":"461","role":{"type":"role","value":"paragraph"},"name":{"type":"computedString","value":""},"childIds":["468"],"backendDOMNodeId":461},
+{"nodeId":"462","role":{"type":"role","value":"link"},"name":{"type":"computedString","value":"Page link"},"properties":[{"name":"focusable","value":{"type":"booleanOrUndefined","value":true}},{"name":"url","value":{"type":"string","value":"http://fixture.test/other"}}],"childIds":["469"],"backendDOMNodeId":462},
+{"nodeId":"463","role":{"type":"internalRole","value":"Iframe"},"name":{"type":"computedString","value":"Cross-site child"},"backendDOMNodeId":463},
+{"nodeId":"464","role":{"type":"internalRole","value":"Iframe"},"name":{"type":"computedString","value":"Same-site child"},"backendDOMNodeId":464},
+{"nodeId":"465","role":{"type":"internalRole","value":"Iframe"},"name":{"type":"computedString","value":"Hidden child"},"backendDOMNodeId":465},
+{"nodeId":"466","role":{"type":"role","value":"paragraph"},"name":{"type":"computedString","value":""},"childIds":["470"],"backendDOMNodeId":466},
+{"nodeId":"467","role":{"type":"internalRole","value":"StaticText"},"name":{"type":"computedString","value":"Frames"},"childIds":["-1000000169"],"backendDOMNodeId":467},
+{"nodeId":"468","role":{"type":"internalRole","value":"StaticText"},"name":{"type":"computedString","value":"The page's own prose, before the frames."},"childIds":["-1000000170"],"backendDOMNodeId":468},
+{"nodeId":"469","role":{"type":"internalRole","value":"StaticText"},"name":{"type":"computedString","value":"Page link"},"childIds":["-1000000171"],"backendDOMNodeId":469},
+{"nodeId":"470","role":{"type":"internalRole","value":"StaticText"},"name":{"type":"computedString","value":"The page's own prose, after the frames."},"childIds":["-1000000172"],"backendDOMNodeId":470},
+{"nodeId":"-1000000169","role":{"type":"internalRole","value":"InlineTextBox"},"name":{"type":"computedString","value":"Frames"}},
+{"nodeId":"-1000000170","role":{"type":"internalRole","value":"InlineTextBox"},"name":{"type":"computedString","value":"The page's own prose, before the frames."}},
+{"nodeId":"-1000000171","role":{"type":"internalRole","value":"InlineTextBox"},"name":{"type":"computedString","value":"Page link"}},
+{"nodeId":"-1000000172","role":{"type":"internalRole","value":"InlineTextBox"},"name":{"type":"computedString","value":"The page's own prose, after the frames."}}
+]

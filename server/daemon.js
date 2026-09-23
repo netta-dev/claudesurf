@@ -17,7 +17,7 @@ const envelope = require('./envelope');
 const { validate, withDefaults } = require('./dispatch');
 const browser = require('./browser');
 const { Sessions, TargetGoneError } = require('./sessions');
-const { OutcomeError, WORKING_TAB_GONE } = require('./action-support');
+const { OutcomeError, WORKING_TAB_GONE, safeText, LABEL_MAX, codePointBoundary } = require('./action-support');
 const read = require('./read');
 const input = require('./input');
 
@@ -62,13 +62,24 @@ function ensureBrowser(requestEnv) {
 }
 
 const HANDLERS = {
-  page: (session, a, deadline) => read.readPage(sessions, session, { maxChars: a.max_chars, offset: a.offset, hidden: a.hidden, deadline }),
+  page: (session, a, deadline) => read.readPage(sessions, session, { scope: a.scope, find: a.find, article: a.article, links: a.links, hidden: a.hidden, maxChars: a.max_chars, offset: a.offset, deadline }),
   info: (session, a, deadline) => read.pageInfo(sessions, session, { deadline }),
   screenshot: (session, a, deadline) => read.screenshot(sessions, session, { fullPage: a.full_page, deadline }),
   navigate: (session, a, deadline) => input.navigate(sessions, session, { url: a.url, name: a.name, description: a.description, deadline }),
   click: (session, a, deadline) => input.click(sessions, session, a.ref, { trusted: a.trusted, deadline }),
   scroll: (session, a, deadline) => input.scroll(sessions, session, a.direction, a.amount, { deadline }),
 };
+
+// A dialog's message is the page's to set, and it lands in the payload outside the
+// nonce delimiter's own escaping, so it is made safe the way a marker field is: NUL
+// stripped, whitespace collapsed to one line, brackets and backslashes escaped, and
+// capped, so a message built to open its own `## Hidden elements` section or a live ref
+// marker cannot.
+function safeDialogMessage(message) {
+  const text = safeText(message);
+  if (text.length <= LABEL_MAX) return text;
+  return `${text.slice(0, codePointBoundary(text, LABEL_MAX - 1))}…`;
+}
 
 function failureEnvelope(e) {
   if (e instanceof OutcomeError) return e.envelope;
@@ -96,9 +107,15 @@ async function runAction({ sessionId, tool, action, args, env }) {
         return failed;
       }
       let payload = result.payload;
-      for (const { type, message } of sessions.takeDialogs(session.workingTargetId)) {
-        notes.push(`a ${type} dialog was dismissed`);
-        payload += `\nDialog (${type}): ${message}`;
+      // Chrome delivers a frame's dialog on the page target's session, so the working
+      // target's queue holds it; the frame targets are drained with it because each is
+      // Page.enabled and a future Chrome may route it there.
+      const dialogTargets = [session.workingTargetId, ...sessions.frameTargets(session.workingTargetId).map((f) => f.targetId)];
+      for (const targetId of dialogTargets) {
+        for (const { type, message } of sessions.takeDialogs(targetId)) {
+          notes.push(`a ${type} dialog was dismissed`);
+          payload += `\nDialog (${type}): ${safeDialogMessage(message)}`;
+        }
       }
       return envelope.success(payload, { notes, images: result.images || [] });
     });

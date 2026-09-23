@@ -14,6 +14,13 @@ const FAKE_CHROME = path.join(__dirname, 'fakes', 'fake-chrome.js');
 
 const silentLog = { debug() {}, info() {}, warn() {}, error() {} };
 
+// A logger that keeps its lines per level, for tests that assert on diagnostics.
+function recordingLog() {
+  const lines = { debug: [], info: [], warn: [], error: [] };
+  const keep = (level) => (...args) => lines[level].push(args.map(String).join(' '));
+  return { lines, debug: keep('debug'), info: keep('info'), warn: keep('warn'), error: keep('error') };
+}
+
 let seq = 0;
 function tmpDir(prefix = 'claudesurf-test') {
   return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-${process.pid}-${++seq}-`));
@@ -53,25 +60,53 @@ function isolatedPaths(t, prefix = 'claudesurf-test') {
 }
 
 // In-process fake browser behind a Connection, with Sessions attached and auto-attach
-// enabled, as the daemon does after a launch.
-function fakeSession() {
+// enabled, as the daemon does after a launch. `log` is the daemon's one logger, which
+// a test replaces with recordingLog() to read the diagnostics back.
+function fakeSession({ log = silentLog } = {}) {
   const { Sessions } = require('../server/sessions');
   const { fake, readable, writable } = FakeBrowser.inProcess();
-  const conn = new Connection(readable, writable, silentLog);
-  const sessions = new Sessions(silentLog);
+  const conn = new Connection(readable, writable, log);
+  const sessions = new Sessions(log);
   sessions.attach(conn);
-  return { fake, conn, sessions };
+  return { fake, conn, sessions, log };
+}
+
+// The refs a page payload carries, keyed by the name beside them: control, landmark,
+// and group markers, both link forms, and the hidden section's lines.
+function refsIn(payload) {
+  const refs = {};
+  const collect = (pattern, nameFirst) => {
+    for (const match of payload.matchAll(pattern)) {
+      const [, first, second] = match;
+      refs[nameFirst ? first : second] = nameFirst ? second : first;
+    }
+  };
+  collect(/\[((?:f\d+)?e\d+) [\w-]+ "([^"]*)"/g, false);
+  collect(/\[((?:f\d+)?e\d+)\] [\w-]+ "([^"]*)"/g, false);
+  collect(/\[([^[\]\n]*)\]\([^)\n]*\)\[((?:f\d+)?e\d+)\]/g, true);
+  collect(/\[([^[\]\n]*)\]\[((?:f\d+)?e\d+)\]/g, true);
+  return refs;
+}
+
+// Every ref the markers of a payload carry, read by the rule read.js finds them with:
+// an unescaped bracket, which page text Turndown escaped never opens. A reader that
+// stripped the escapes and the quoted fields instead would drop a name that forged a
+// marker along with them.
+function markedRefs(text) {
+  return [...text.matchAll(/(?<!\\)\[((?:f\d+)?e\d+)[ \]]/g)].map((match) => match[1]);
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+// Polls until `pred` holds; throws at the timeout, so a test that waited for something
+// that never happened fails there rather than on the assertion after it.
 async function waitFor(pred, timeoutMs = 3000, stepMs = 20) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await pred()) return true;
     await sleep(stepMs);
   }
-  return false;
+  throw new Error(`condition did not hold within ${timeoutMs} ms: ${pred}`);
 }
 
 function request({ socketPath, method = 'GET', path: p = '/health', body, timeout = 5000 }) {
@@ -112,8 +147,12 @@ async function spawnDaemon({ env = {} } = {}) {
   let log = '';
   child.stdout.on('data', (d) => { log += d; });
   child.stderr.on('data', (d) => { log += d; });
-  const up = await waitFor(() => request({ socketPath }).then(() => true, () => false), 5000);
-  if (!up) { child.kill(); throw new Error(`daemon did not come up\n${log}`); }
+  try {
+    await waitFor(() => request({ socketPath }).then(() => true, () => false), 5000);
+  } catch {
+    child.kill();
+    throw new Error(`daemon did not come up\n${log}`);
+  }
   return {
     socketPath, dir, child,
     log: () => log,
@@ -207,4 +246,4 @@ async function liveBrowser({ headless = true } = {}) {
   };
 }
 
-module.exports = { silentLog, tmpDir, tmpSocket, setEnv, withEnv, isolatedPaths, fakeSession, sleep, waitFor, request, spawnDaemon, mockDaemon, callBridge, liveBinary, liveBrowser, FAKE_CHROME };
+module.exports = { silentLog, recordingLog, tmpDir, tmpSocket, setEnv, withEnv, isolatedPaths, fakeSession, refsIn, markedRefs, sleep, waitFor, request, spawnDaemon, mockDaemon, callBridge, liveBinary, liveBrowser, FAKE_CHROME };

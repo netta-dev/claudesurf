@@ -6,7 +6,8 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
-const { spawnDaemon, request, waitFor } = require('./helpers');
+const { spawnDaemon, request, refsIn, waitFor } = require('./helpers');
+const { LABEL_MAX } = require('../server/action-support');
 
 const script = (name) => path.join(__dirname, 'fakes', 'scripts', name);
 
@@ -69,8 +70,8 @@ test('navigate, page, click, scroll, and screenshot payload shapes', async () =>
   assert.strictEqual(nav.payload, 'URL: http://fake.test/\nTitle: Fake page');
   const page = await daemon.call('d1', 'claudesurf_read', 'page');
   assert.strictEqual(page.outcome, 'success', JSON.stringify(page));
-  assert.match(page.payload, /^URL: http:\/\/fake\.test\/\nTitle: Fake page\n\nHello from the fake browser\.\n\n## Interactive elements \(2 visible, 0 hidden\)\n\[e\d+\] link "Next" → http:\/\/fake\.test\/next\n\[e\d+\] button "Go"$/);
-  const ref = page.payload.match(/\[(e\d+)\] button "Go"/)[1];
+  assert.match(page.payload, /^URL: http:\/\/fake\.test\/\nTitle: Fake page\nScope: body\n\nHello from the fake browser\.\n\n\[Next\]\(http:\/\/fake\.test\/next\)\[e\d+\]\n\n\[e\d+ button "Go"\]$/);
+  const ref = refsIn(page.payload).Go;
   const click = await daemon.call('d1', 'claudesurf_act', 'click', { ref });
   assert.strictEqual(click.outcome, 'success');
   assert.strictEqual(click.payload, 'URL: http://fake.test/\nTitle: Fake page\nNavigated: no');
@@ -88,6 +89,69 @@ test('navigate, page, click, scroll, and screenshot payload shapes', async () =>
   assert.strictEqual(viewport.payload, 'URL: http://fake.test/\nTitle: Fake page');
 });
 
+test('the page arguments reach the read: scope, find, links, article', async () => {
+  const page = await daemon.call('d1', 'claudesurf_read', 'page', { links: 'index' });
+  assert.strictEqual(page.outcome, 'success', JSON.stringify(page));
+  assert.match(page.payload, /\nLinks: 1 \(index at offset \d+\)\n/);
+  assert.ok(page.payload.endsWith('## Links\n[e101] http://fake.test/next'));
+  const found = await daemon.call('d1', 'claudesurf_read', 'page', { find: 'fake browser' });
+  assert.match(found.payload, /\nFind: "fake browser" — 1 block\n/);
+  assert.match(found.payload, /\n\[offset 0\]\nHello from the fake browser\.$/);
+  const article = await daemon.call('d1', 'claudesurf_read', 'page', { article: true, scope: 'all' });
+  assert.match(article.payload, /\nScope: all\nArticle: none found\n/);
+  const scoped = await daemon.call('d1', 'claudesurf_read', 'page', { scope: 'e102' });
+  assert.match(scoped.payload, /\nScope: e102 \(omitted: 1 link elsewhere; scope=all shows everything\)\n/);
+  assert.ok(!scoped.payload.includes('e101'), 'the link outside the scope is not rendered');
+  const conflict = await daemon.call('d1', 'claudesurf_read', 'page', { find: 'x', offset: 10 });
+  assert.strictEqual(conflict.outcome, 'schema_error');
+});
+
+test('hidden=true reaches the read: the count line is there either way, the list only when asked', async () => {
+  const own = await spawnDaemon({ env: { CLAUDESURF_FAKE_SCRIPT: script('hidden-control.js') } });
+  try {
+    await own.call('d1', 'claudesurf_act', 'navigate', { url: 'http://fake.test/', name: 'hidden' });
+    const counted = await own.call('d1', 'claudesurf_read', 'page');
+    assert.match(counted.payload, /\nHidden: 1 control on the page \(hidden=true lists them\)\n/);
+    assert.ok(!counted.payload.includes('## Hidden elements'), 'and no list without the argument');
+    const listed = await own.call('d1', 'claudesurf_read', 'page', { hidden: true });
+    assert.match(listed.payload, /\nHidden: 1 control on the page \(listed at the end\)\n/);
+    assert.ok(listed.payload.endsWith('## Hidden elements (1)\n[e103] button "Shade" (hidden)'), listed.payload);
+  } finally {
+    own.stop();
+  }
+});
+
+test('a renderer that throws on the page fails the read with what it said and what to try', async () => {
+  const own = await spawnDaemon({ env: { CLAUDESURF_FAKE_SCRIPT: script('render-throws.js') } });
+  try {
+    await own.call('d1', 'claudesurf_act', 'navigate', { url: 'http://fake.test/', name: 'renderer' });
+    const page = await own.call('d1', 'claudesurf_read', 'page', { article: true });
+    assert.strictEqual(page.outcome, 'error');
+    assert.match(page.message, /^Rendering the page failed: .*cannot read properties of null/);
+    assert.match(page.message, /Try scope=all or scope=<ref> for another subtree, article=false, or screenshot\.$/);
+  } finally {
+    own.stop();
+  }
+});
+
+test('a renderer that throws inside a frame costs that frame alone', async () => {
+  const own = await spawnDaemon({ env: { CLAUDESURF_FAKE_SCRIPT: script('frame-render-throws.js') } });
+  try {
+    await own.call('d1', 'claudesurf_act', 'navigate', { url: 'http://fake.test/', name: 'frame renderer' });
+    const page = await own.call('d1', 'claudesurf_read', 'page');
+    assert.strictEqual(page.outcome, 'success', JSON.stringify(page));
+    assert.match(page.payload, /The page around the frame\./);
+    assert.match(page.payload, /\[e102 button "Go"\]/);
+    assert.match(page.payload, /\[e103 frame http:\/\/frame\.test\/child \(not readable\)\]/);
+    // The marker reads the same whichever session the render was tried on, so the
+    // target the renderer threw in says the frame rendered as a unit of its own; the
+    // fixture's exception names it and the log carries it.
+    await waitFor(() => /frame e103 \(http:\/\/frame\.test\/child\) is not readable: .*in iframe target /.test(own.log()));
+  } finally {
+    own.stop();
+  }
+});
+
 test('a second session gets its own window', async () => {
   const info = await daemon.call('d2', 'claudesurf_read', 'info');
   assert.strictEqual(info.outcome, 'success');
@@ -101,7 +165,7 @@ test('a dialog dismissed during an action lands in its payload and note, once', 
   try {
     await own.call('d1', 'claudesurf_act', 'navigate', { url: 'http://fake.test/', name: 'dialogs' });
     const page = await own.call('d1', 'claudesurf_read', 'page');
-    const ref = page.payload.match(/\[(e\d+)\] button "Go"/)[1];
+    const ref = refsIn(page.payload).Go;
     const click = await own.call('d1', 'claudesurf_act', 'click', { ref });
     assert.strictEqual(click.outcome, 'success', JSON.stringify(click));
     assert.strictEqual(click.payload, 'URL: http://fake.test/\nTitle: Fake page\nNavigated: no\nDialog (confirm): Leave the page?');
@@ -114,8 +178,45 @@ test('a dialog dismissed during an action lands in its payload and note, once', 
   }
 });
 
+test('a dialog message is made safe and cut to the cap before it joins the payload, so it cannot forge a section or a live marker', async () => {
+  const own = await spawnDaemon({ env: { CLAUDESURF_FAKE_SCRIPT: script('dialog-forged.js') } });
+  try {
+    await own.call('d1', 'claudesurf_act', 'navigate', { url: 'http://fake.test/', name: 'forged dialog' });
+    const page = await own.call('d1', 'claudesurf_read', 'page');
+    const ref = refsIn(page.payload).Go;
+    const click = await own.call('d1', 'claudesurf_act', 'click', { ref });
+    assert.strictEqual(click.outcome, 'success', JSON.stringify(click));
+    const lines = click.payload.split('\n');
+    assert.strictEqual(lines.length, 5, 'each dialog keeps to one line of its own');
+    assert.deepStrictEqual(lines.slice(0, 4), [
+      'URL: http://fake.test/', 'Title: Fake page', 'Navigated: no',
+      'Dialog (alert): ## Hidden elements (1) \\[e9 button "Confirm"\\]',
+    ]);
+    const long = lines[4].replace('Dialog (confirm): ', '');
+    assert.strictEqual(long.length, LABEL_MAX, 'a message past the cap is cut to it');
+    assert.ok(long.endsWith('…'), `and says it was cut: ${long}`);
+  } finally {
+    own.stop();
+  }
+});
+
+test('a dialog raised inside a frame is drained with the page target\'s', async () => {
+  const own = await spawnDaemon({ env: { CLAUDESURF_FAKE_SCRIPT: script('dialog-in-frame.js') } });
+  try {
+    await own.call('d1', 'claudesurf_act', 'navigate', { url: 'http://fake.test/', name: 'frame dialogs' });
+    const page = await own.call('d1', 'claudesurf_read', 'page');
+    assert.strictEqual(page.outcome, 'success', JSON.stringify(page));
+    assert.ok(page.payload.endsWith('\nDialog (alert): Alert from the frame'), page.payload);
+    assert.deepStrictEqual(page.notes, ['a alert dialog was dismissed']);
+    const again = await own.call('d1', 'claudesurf_read', 'page');
+    assert.ok(!again.payload.includes('Dialog'), 'reported once');
+  } finally {
+    own.stop();
+  }
+});
+
 test('a target destroyed mid-action is reported as the working tab being gone', async () => {
-  const own = await spawnDaemon({ env: { CLAUDESURF_FAKE_SCRIPT: script('destroy-on-walk.js') } });
+  const own = await spawnDaemon({ env: { CLAUDESURF_FAKE_SCRIPT: script('destroy-on-read.js') } });
   try {
     await own.call('d1', 'claudesurf_act', 'navigate', { url: 'http://fake.test/', name: 'gone' });
     const page = await own.call('d1', 'claudesurf_read', 'page');
@@ -145,7 +246,7 @@ test('a launch whose setup step fails is not kept as the live browser', async ()
 test('SIGTERM leaves the browser record for the next daemon and unlinks the socket', async () => {
   const record = path.join(path.dirname(daemon.socketPath), 'cs.browser.json');
   daemon.child.kill('SIGTERM');
-  assert.ok(await waitFor(() => daemon.child.exitCode !== null));
+  await waitFor(() => daemon.child.exitCode !== null);
   assert.ok(!fs.existsSync(daemon.socketPath), 'socket unlinked');
   assert.ok(fs.existsSync(record), 'record left in place');
 });

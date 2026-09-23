@@ -86,7 +86,7 @@ test('reapOrphan terminates a live fake matching the record', async (t) => {
   await sleep(200);
   browser.writeRecord({ pid: child.pid, startTime: browser.processStartTime(child.pid) });
   assert.strictEqual(await browser.reapOrphan(silentLog), true);
-  assert.ok(await waitFor(() => child.exitCode !== null || child.signalCode !== null));
+  await waitFor(() => child.exitCode !== null || child.signalCode !== null);
   assert.ok(!fs.existsSync(record));
 });
 

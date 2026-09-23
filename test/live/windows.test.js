@@ -9,7 +9,7 @@ const assert = require('node:assert');
 const { execFileSync } = require('child_process');
 const read = require('../../server/read');
 const input = require('../../server/input');
-const { liveBinary, liveBrowser, sleep } = require('../helpers');
+const { liveBinary, liveBrowser, refsIn, sleep } = require('../helpers');
 const { serve } = require('../fixtures/serve');
 
 const skip = !process.env.CLAUDESURF_LIVE_HEADFUL ? 'set CLAUDESURF_LIVE_HEADFUL=1 to run'
@@ -46,8 +46,7 @@ test('the working tab is the active tab, the identity tab joins its window, and 
     await sleep(300);
     assert.strictEqual(activeWindow(), before, 'parked the desktop focus on the previous window');
     const { payload } = await read.readPage(sessions, session, { maxChars: 40000, offset: 0, hidden: false });
-    const refs = {};
-    for (const m of payload.matchAll(/\[(e\d+)\] [\w-]+ "([^"]*)"/g)) refs[m[2]] = m[1];
+    const refs = refsIn(payload);
     const started = Date.now();
     await input.click(sessions, session, refs['Handler button'], {});
     assert.ok(Date.now() - started < 3000, 'a scripted click into a background window does not stall');
@@ -58,9 +57,8 @@ test('the working tab is the active tab, the identity tab joins its window, and 
     assert.strictEqual(activeWindow(), before, 'navigate, scripted click, scroll, and screenshot left the active window alone');
     assert.match(windowName(chromeWindow), /^Actions fixture/, 'the working tab stayed active');
 
-    const again = await read.readPage(sessions, session, { maxChars: 40000, offset: 0, hidden: false });
-    const newTab = again.payload.match(/\[(e\d+)\] link "New tab link"/)[1];
-    const r = await input.click(sessions, session, newTab, {});
+    const again = refsIn((await read.readPage(sessions, session, { maxChars: 40000, offset: 0, hidden: false })).payload);
+    const r = await input.click(sessions, session, again['New tab link'], {});
     assert.match(r.payload, /Opened: a new tab/);
     await sleep(500);
     assert.strictEqual(activeWindow(), chromeWindow, 'a click that opens a tab raises the session window');
@@ -69,8 +67,7 @@ test('the working tab is the active tab, the identity tab joins its window, and 
     activate(before);
     await sleep(300);
     assert.strictEqual(activeWindow(), before, 'parked the desktop focus again');
-    const handler = again.payload.match(/\[(e\d+)\] button "Handler button"/)[1];
-    await input.click(sessions, session, handler, { trusted: true });
+    await input.click(sessions, session, again['Handler button'], { trusted: true });
     await sleep(500);
     assert.strictEqual(activeWindow(), chromeWindow, 'a trusted click brings the session window to the front');
   } finally {

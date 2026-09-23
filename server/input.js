@@ -4,7 +4,9 @@
 
 const envelope = require('./envelope');
 const { ProtocolError } = require('./cdp');
-const { fail, stateLines, workingTarget, requireHttp, pageState, CLICK_SOURCE, SCROLL_SOURCE } = require('./action-support');
+const { isMissingContext } = require('./sessions');
+const { REF } = require('./dispatch');
+const { fail, stateLines, workingTarget, requireHttp, pageState, releaseObjects, CLICK_SOURCE, SCROLL_SOURCE } = require('./action-support');
 
 const NAVIGATE_LOAD_MS = 25_000;
 // How long after an aborted navigate the denied-download event may still arrive.
@@ -48,27 +50,73 @@ async function navigate(sessions, session, { url, name, description, deadline })
   return { payload: stateLines(info.url, info.title) };
 }
 
-// Resolves a ref against the session's ref set for the working tab, per the
-// generation rules: a set from another document is stale, an unread ref is an error.
-async function resolveRef(sessions, session, t, ref, opts) {
-  const id = Number(ref.slice(1));
-  const set = session.refs.get(t.targetId);
-  if (!set || set.generation !== t.generation) fail(envelope.staleRef(ref, 'the document changed since it was read; read the page again'));
-  if (!set.ids.has(id)) fail(envelope.error(`${ref} was not returned by a read of this document`));
-  const contextId = await sessions.world(t.targetId, opts);
-  try {
-    const { object } = await sessions.send(t.targetId, 'DOM.resolveNode', { backendNodeId: id, executionContextId: contextId, objectGroup: OBJECT_GROUP }, opts);
-    if (!object.objectId) fail(envelope.error(`${ref} no longer resolves to an element`));
-    return object.objectId;
-  } catch (e) {
-    if (e instanceof ProtocolError) fail(envelope.error(`${ref} no longer resolves to an element (it was removed from the page)`));
-    throw e;
+// The frame number and the backend id a ref names (dispatch.js's grammar), or null
+// when it is no ref at all.
+function parseRef(ref) {
+  const match = REF.exec(ref);
+  return match ? { frame: match[1] === undefined ? null : Number(match[1]), id: Number(match[2]) } : null;
+}
+
+// The target, frame, and id a ref names, under phase 1's generation rules widened to
+// frames: a frame target that is gone or has moved on is stale, a frame number never
+// assigned and a ref never read are errors. `frameId` is the frame of that target the
+// id was read in, null for its own main frame.
+function refUnit(sessions, session, t, ref) {
+  const parsed = parseRef(ref);
+  if (!parsed) fail(envelope.error(`${ref} is not a ref; refs look like e42, or f1e42 inside a frame`));
+  const { frame, id } = parsed;
+  const unread = () => fail(envelope.error(`${ref} was not returned by a read of this document`));
+  let target = t;
+  if (frame !== null) {
+    // The page's own generation answers first: Chrome destroys a page's frame targets
+    // after its frameNavigated, so between the two the frame target still stands, at
+    // the generation the read left it, for a document the page has moved off.
+    const page = session.refs.get(t.targetId);
+    if (page && page.generation !== t.generation) {
+      fail(envelope.staleRef(ref, 'the frame it was read in is gone; read the page again'));
+    }
+    target = sessions.frameTarget(t.targetId, frame);
+    if (!target) {
+      // Numbering starts at 1, so anything outside 1..the counter was never a frame of
+      // this page and reads as a ref no read returned.
+      if (frame > 0 && frame < t.nextFrameNumber) fail(envelope.staleRef(ref, 'the frame it was read in is gone; read the page again'));
+      unread();
+    }
   }
+  const set = session.refs.get(target.targetId);
+  if (!set) unread();
+  if (set.generation !== target.generation) {
+    const what = frame === null ? 'the document' : "the frame's document";
+    fail(envelope.staleRef(ref, `${what} changed since it was read; read the page again`));
+  }
+  if (!set.ids.has(id)) unread();
+  return { target, frame, frameId: set.ids.get(id), id };
+}
+
+// Resolves the node a ref names into the isolated world of the frame it was read in,
+// which is the only world it resolves in. A frame that navigated on its own leaves no
+// generation behind, so the world it discarded is found here and recreated once.
+function resolveNode(sessions, located, ref, opts) {
+  const { target, frameId, id } = located;
+  return sessions.withWorld(target.targetId, frameId, async (contextId) => {
+    try {
+      const { object } = await sessions.send(target.targetId, 'DOM.resolveNode', { backendNodeId: id, executionContextId: contextId, objectGroup: OBJECT_GROUP }, opts);
+      if (!object.objectId) fail(envelope.error(`${ref} no longer resolves to an element`));
+      return object.objectId;
+    } catch (e) {
+      // A missing context is withWorld's retry signal and is rethrown; a missing element fails the click here.
+      if (isMissingContext(e)) throw e;
+      if (e instanceof ProtocolError) fail(envelope.error(`${ref} no longer resolves to an element (it was removed from the page)`));
+      throw e;
+    }
+  }, opts);
 }
 
 // Content quads and mouse events are in viewport coordinates; the hit test takes
-// document coordinates, so the scroll offset is added for it.
-async function trustedClick(sessions, t, objectId, ref, opts) {
+// document coordinates, so the scroll offset is added for it. A same-process frame is
+// laid out in its parent's renderer, so its quads are the page's coordinates already;
+// `located` is only needed for the world its node lives in.
+async function trustedClick(sessions, t, located, objectId, ref, opts) {
   const { quads } = await sessions.send(t.targetId, 'DOM.getContentQuads', { objectId }, opts);
   if (!quads || quads.length === 0) fail(envelope.error(`${ref} is hidden and has no position to click; a trusted click needs a visible element`));
   const [x1, y1, , , x2, y2] = quads[0];
@@ -84,7 +132,10 @@ async function trustedClick(sessions, t, objectId, ref, opts) {
     if (e instanceof ProtocolError) fail(envelope.error(`${ref} has no hit-testable point at its centre (it is covered, or lies outside the document); a trusted click cannot reach it`));
     throw e;
   }
-  const contextId = await sessions.world(t.targetId, opts);
+  // The hit node goes into the element's own world: callFunctionOn refuses an argument
+  // from another one. A hit outside the element's frame resolves there too, and the
+  // comparison below reports it as the covering element it is.
+  const contextId = await sessions.world(t.targetId, located.frameId, opts);
   const { object } = await sessions.send(t.targetId, 'DOM.resolveNode', { backendNodeId: hit.backendNodeId, executionContextId: contextId, objectGroup: OBJECT_GROUP }, opts);
   // The hit node reaches the element when one is inside the other, shadow roots
   // included: a host's painted content lives in its shadow tree.
@@ -124,28 +175,36 @@ async function afterClick(sessions, session, t, before, opts) {
   return lines;
 }
 
+// The click runs on the session of the target the ref was read in — a frame's own for
+// an f-ref — while the navigation wait and the state lines stay the page target's, so
+// a navigation confined to a frame reads as Navigated: no.
 async function click(sessions, session, ref, { trusted, deadline }) {
   const t = workingTarget(sessions, session);
   requireHttp(t);
   const opts = { deadline };
+  const located = refUnit(sessions, session, t, ref);
+  if (trusted && located.frame !== null) {
+    fail(envelope.error(`${ref} is inside a cross-site frame, where trusted clicks are not supported yet; click it without trusted=true`));
+  }
+  const on = located.target.targetId;
   try {
-    const objectId = await resolveRef(sessions, session, t, ref, opts);
+    const objectId = await resolveNode(sessions, located, ref, opts);
     const before = { navigations: t.navigations, loads: t.loads, downloads: t.downloads, opened: session.opened.size, openedIds: new Set(session.opened) };
-    const { state } = await sessions.callFunction(t.targetId, {
+    const { state } = await sessions.callFunction(on, {
       objectId, functionDeclaration: CLICK_SOURCE, args: [trusted ? 'prepare' : 'scripted'], userGesture: true,
     }, opts);
     if (state === 'detached') fail(envelope.error(`${ref} no longer resolves to an element (it was removed from the page)`));
     if (state === 'disabled') fail(envelope.error(`${ref} is disabled; clicking it would change nothing`));
     if (trusted) {
       if (state === 'hidden') fail(envelope.error(`${ref} is hidden; a trusted click needs a visible element`));
-      await trustedClick(sessions, t, objectId, ref, opts);
+      await trustedClick(sessions, t, located, objectId, ref, opts);
     }
     const lines = await afterClick(sessions, session, t, before, opts);
     const info = await pageState(sessions, t, opts);
     return { payload: [stateLines(info.url, info.title), ...lines].join('\n') };
   } finally {
     // A navigation the click started has already discarded the handles.
-    await sessions.send(t.targetId, 'Runtime.releaseObjectGroup', { objectGroup: OBJECT_GROUP }, opts).catch(() => {});
+    await releaseObjects(sessions, on, OBJECT_GROUP);
   }
 }
 
@@ -156,4 +215,4 @@ async function scroll(sessions, session, direction, amount, { deadline }) {
   return { payload: `${stateLines(info.url, info.title)}\nScroll: ${info.scrollY} of ${info.pageHeight} (viewport ${info.viewportHeight})` };
 }
 
-module.exports = { navigate, click, scroll };
+module.exports = { navigate, click, scroll, refUnit };

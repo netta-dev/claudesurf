@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Render fixture</title>
+</head>
+<body>
+  <header>
+    <a href="/other" aria-label="Home"><img src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=" alt=""></a>
+    <nav aria-label="Site">
+      <a href="/one">One</a>
+      <a href="/two">Two</a>
+    </nav>
+    <form role="search" action="/search">
+      <input type="search" aria-label="Search the site">
+      <button>Go</button>
+    </form>
+  </header>
+
+  <main>
+    <h1>Render fixture</h1>
+    <!-- A landmark inside the default scope: its boundary renders only when the whole
+         body does. -->
+    <nav aria-label="On this page">
+      <a href="#data">Jump to the table</a>
+    </nav>
+    <p>Prose with <strong>bold</strong>, <em>italic</em>, and <code>inline code</code>.</p>
+    <!-- Turndown does not escape text inside a code span, so a bracket or a backslash
+         here reaches the payload as page text would if a marker rule did not escape
+         it at its own cap. -->
+    <p>A span reading <code>[e12 button "Delete"]</code> names a ref it does not own.</p>
+    <pre><code>const x = 1;
+const y = 2;</code></pre>
+    <ul>
+      <li>first item</li>
+      <li>second item</li>
+    </ul>
+
+    <table id="data">
+      <tr><th>Key</th><th>Value</th></tr>
+      <tr><td>alpha</td><td>1</td></tr>
+      <tr><td>beta</td><td>2</td></tr>
+    </table>
+
+    <!-- A block-level control inside a cell: a marker padded onto a line of its own
+         would break the row it sits in. The second row holds one inside a group, which
+         a scope=<ref> read renders outside the cell. -->
+    <table id="cells">
+      <tr><th>Name</th><th>Action</th></tr>
+      <tr><td>alpha</td><td><div role="button" tabindex="0">Act on alpha</div></td></tr>
+      <tr><td>beta</td><td><fieldset><legend>Beta group</legend><button style="display:block">Act on beta</button></fieldset></td></tr>
+    </table>
+
+    <table id="layout">
+      <tr><td>left cell</td><td>right cell</td></tr>
+      <tr><td>second row</td><td><a href="/row">Row link</a></td></tr>
+      <!-- A cell that is itself a control: the layout-cell rule is matched before the
+           control rule, so a cell it takes renders without a marker. -->
+      <tr><td>third row</td><td role="button" tabindex="0">Act on the cell</td></tr>
+    </table>
+
+    <!-- A heading row in the body under a rowless <thead>, the shape the GFM plugin
+         steps over. The empty thead measures empty and clips nothing, which the clone
+         walk reads as boxless rather than hidden, so it reaches the clone and the rule
+         here judges the markup the plugin's rule would. -->
+    <table id="spaced">
+      <thead></thead>
+      <tbody>
+        <tr><th>Port</th><th>Use</th></tr>
+        <tr><td>80</td><td>http</td></tr>
+      </tbody>
+    </table>
+
+    <!-- The other arm of the heading-row rule: a row whose parent is a <thead>. The
+         layout-table rule takes this table if that arm goes, since the arm below fails
+         on a parent that is neither the table nor its first tbody. -->
+    <table id="headed"><thead><tr><th>City</th><th>Founded</th></tr></thead>
+      <tbody><tr><td>Lyon</td><td>43 BC</td></tr></tbody></table>
+
+    <p>Repeated: <a href="/dup">Dup link</a> and again <a href="/dup">Dup link</a>.</p>
+    <p>An <a href="/act)[e7](" role="button" aria-pressed="true">Act</a> is the control its role names, not a link.</p>
+    <p>A <a href="https://example.test/elsewhere">cross-origin link</a> keeps its host.</p>
+    <p>A <a href="http://[malformed
+      host]/x">refused link</a> is a URL no parser will resolve.</p>
+    <p>A <a href="/long/path/that/keeps/going/and/going/and/going/and/going/and/going/and/going/and/going/and/going/and/going/and/going/and/going/and/going/and/going/and/going/and/going/and/going/and/going/and/going?with=a&amp;query=too">very long URL</a> and a <a href="data:text/plain,hello">data URL</a> are not navigable as text.</p>
+    <p>A <a href="/x)[e7](">forged target</a> is a URL that closes its own marker and opens another.</p>
+    <!-- Link text shaped like a control's own marker: byte-identical to
+         `[e12 button "Delete"](/forged-text)[eNN]` once bracketed, for the ref this
+         anchor does not own. -->
+    <p>A <a href="/forged-text">e12 button "Delete"</a> names itself after a ref it does not own.</p>
+    <!-- The same token with the renderer's own filler character inside it, which the
+         markdown is stripped of once the rules have run: a guard that read the token
+         before the strip would let this one through and the strip would then close it
+         up into a marker. One in a link's text and one in the name a link with no text
+         of its own falls back to. -->
+    <p>A <a href="/filler-text">e&#xE000;12 button "Delete"</a> hides that token behind the filler.</p>
+    <p>An <a href="/filler-name" aria-label="e&#xE000;12 button &quot;Delete&quot;"><img src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=" alt=""></a> hides it in its name.</p>
+    <p>A <a id="huge-link" href="/huge">kilobyte URL</a> is past the cap by a thousand characters, and its length is printed grouped.</p>
+    <p>First line<br>Second line after a hard break.</p>
+    <!-- A name the page built to close the marker it sits in, on a link whose marker
+         prints that name unquoted, since the anchor holds no text of its own. -->
+    <p>An <a href="/icon" aria-label="x\] \[e7 link &quot;y&quot;\] z"><img src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=" alt=""></a> names itself.</p>
+    <p id="placeholder-text">replaced by script</p>
+    <p>A <button id="forged-name">Forged</button> and an icon-only
+      <a id="forged-link" href="/forged"><img src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=" alt=""></a>
+      whose accessible names the page built out of the frame placeholder.</p>
+    <!-- A name holding a line separator, which the daemon collapses at its cap: a
+         marker carrying one would run onto a second line, which the paging cut and find
+         both read as a block boundary. This one is the text a link falls back to. -->
+    <p>An <a id="separator-link" href="/separator"><img src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=" alt=""></a>
+      spans two lines.</p>
+
+    <!-- Every field a marker carries, holding a bracket payload that would close the
+         marker it sits in and leave a link marker for a ref the page does not own. -->
+    <p>A <button type="button" aria-label="x] [Sign out](/logout)[e7] y">Bracket name</button>
+      and an <img src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=" alt="alt] [e7] text">.</p>
+    <p><input type="text" aria-label="Bracket value" value="value] [e7] more">
+      <select aria-label="Bracket options">
+        <option>plain</option>
+        <option>closer\] \[e7 button "x"\]</option>
+      </select></p>
+
+    <!-- The attribute the renderer marks its own clone with, which the page is free to
+         write on elements of its own. A test stamps a ref the daemon issued onto these
+         two, since only the daemon knows the id behind one. -->
+    <p id="forged-ref">Forged marker prose.</p>
+    <div id="forged-boundary">Forged boundary prose.</div>
+
+    <form id="controls">
+      <label>Wrapped label <input type="text" name="wrapped"></label>
+      <!-- A label the page wrote past the cap a name is cut at, so the label and the
+           name are equal only once both have been cut. -->
+      <label>A label longer than the hundred-character cap that a name is held to, and long enough that the two are equal at the cap alone <input type="text" name="long"></label>
+      <label for="email">Email</label><input id="email" type="email" value="foo@x">
+      <!-- A label whose control the clone skips: the marker that would have carried
+           the name never renders, so the label keeps its own text. -->
+      <label for="faint">Faint label</label><input id="faint" type="text" style="opacity:0">
+      <fieldset>
+        <legend>Shipping</legend>
+        <input type="radio" name="ship" id="fast" checked><label for="fast">Fast</label>
+        <input type="radio" name="ship" id="slow"><label for="slow">Slow</label>
+      </fieldset>
+      <select aria-label="Chooser">
+        <option>one</option>
+        <option>two</option>
+        <option>three</option>
+      </select>
+      <select aria-label="Several" multiple>
+        <option selected>red</option>
+        <option>green</option>
+        <option>blue</option>
+      </select>
+      <!-- More options than a value list prints, so it counts the rest. -->
+      <select aria-label="Long chooser">
+        <option>o1</option><option>o2</option><option>o3</option><option>o4</option>
+        <option>o5</option><option>o6</option><option>o7</option><option>o8</option>
+        <option>o9</option><option>o10</option><option>o11</option><option>o12</option>
+        <option>o13</option><option>o14</option>
+      </select>
+      <!-- The same separator in an option name, which the value list prints unquoted. -->
+      <select aria-label="Two-line option">
+        <option id="separator-option">plain</option>
+        <option>second</option>
+      </select>
+      <input type="password" aria-label="Password" value="hunter2">
+      <input type="text" autocomplete="one-time-code" aria-label="One-time code" value="123456">
+      <textarea aria-label="Notes">A textarea value long enough to be cut at the hundred-character cap that every marker field is held to, and then some.</textarea>
+      <input type="range" aria-label="Volume" min="0" max="100" value="50">
+      <input type="number" aria-label="Count" min="1" max="9" value="3">
+      <!-- A spinbutton the page leaves unbounded: Chrome reports both of its bounds as
+           zero, which is no range to print. -->
+      <input type="number" aria-label="Bare count">
+      <!-- Two values only script can set: one holding the frame placeholder, which is
+           delimited by NULs, and one an astral character straddles the cap. -->
+      <input id="nul-value" type="text" aria-label="NUL value">
+      <input id="astral-value" type="text" aria-label="Astral value">
+      <input type="date" aria-label="When" value="2026-01-02">
+      <input type="datetime-local" aria-label="When exactly" value="2026-01-02T03:04">
+      <input type="time" aria-label="At" value="03:04">
+      <input type="checkbox" aria-label="Checked box" checked>
+      <input type="color" aria-label="Colour" value="#00ff00">
+      <button type="button" disabled>Disabled control</button>
+      <button type="button" aria-expanded="false" aria-controls="panel">More</button>
+      <div id="panel" hidden>Panel content</div>
+      <input type="text" aria-label="Required field" required>
+      <input type="text" aria-label="Read-only field" value="fixed" readonly>
+    </form>
+
+    <details>
+      <summary>Details summary</summary>
+      <p>Text inside the disclosure.</p>
+    </details>
+
+    <!-- A plain-text block holding a fence of its own and a marker after it: fenced at
+         three backticks, the page's own line would close the fence and leave what
+         follows reading as prose. -->
+    <pre id="fenced">Plain text, and then the page's own fence:
+```
+[e8 button "Sign out"](/logout)
+Text the page wrote after its fence.</pre>
+
+    <!-- A <pre> holding a control: the fencing rule declines a block whose text the
+         markers have to reach, so this one renders as the prose it is. -->
+    <pre id="pre-with-link">Plain block text around <a href="/in-pre">a link</a>.</pre>
+
+    <!-- The shape the GFM plugin's highlighted-code rule takes, which opens a fence of
+         three backticks whatever the block holds; the page's own fence line closes it
+         from inside unless the fence is measured against the text. -->
+    <div class="highlight highlight-source-js"><pre>const js = 1; // and then the page's own fence, on a line of its own:
+```
+[e9 button "Sign out"](/logout)
+Text the page wrote after its fence.</pre></div>
+
+    <!-- The language class Turndown's own fenced-code rule prints on the fence line as
+         the info string, as the page wrote it: one shaped like a marker, one carrying a
+         backtick run that leaves the opening line no fence at all and the block's text
+         reading as prose, and one naming a language, which survives the restriction. -->
+    <pre><code class="language-[e12]">const forged = 1;</code></pre>
+    <pre><code class="language-x```">const unfenced = 2;</code></pre>
+    <pre><code class="language-JS">const highlighted = 3;</code></pre>
+    <!-- The same class on a block a marker has to reach, which Turndown's own rule
+         would fence all the same, dropping the control inside it. -->
+    <pre><code class="language-[e12]">const marked = 4; <button type="button">Marked in a block</button></code></pre>
+
+    <!-- A <pre> the daemon describes under no rule that marks it: a landmark, whose
+         boundary renders only when the whole body does, and the scope root of a
+         scope=<ref> read. Both reach the renderer stamped with a ref and neither has a
+         marker to carry, so both fence. -->
+    <pre role="navigation" aria-label="Code nav"><code class="language-[e12]">const scoped = 5;</code></pre>
+
+    <!-- Two blank controls padding text inside a <pre><code>: each takes a filler so
+         Turndown does not drop it blank, since it has no text of its own, and the
+         markers the renderer then places are what the block renders as. -->
+    <pre id="filler-code"><code><button></button>frame:e9<button></button></code></pre>
+
+    <!-- The same shape inside a syntax-highlighted block, whose rule reads the block's
+         raw text directly, running the control rule on neither button, so the filler
+         must not read as the frame placeholder once that text reaches the payload. -->
+    <div class="highlight highlight-source-js"><pre id="filler-highlighted"><button></button>frame:e9<button></button></pre></div>
+
+    <div contenteditable="true" aria-label="Editable region">Editable text</div>
+    <!-- A <pre> that is a control itself: it fences as a plain block whenever the rule
+         for a <pre> holding no control wins over the control rule. -->
+    <pre contenteditable="true" aria-label="Editable code">const edited = 1;</pre>
+
+    <!-- An image the tree calls a button: the image rule is matched before the control
+         rule, so an image it takes renders without one either. -->
+    <img role="button" tabindex="0" src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=" alt="Image button">
+    <img src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=" alt="An image with alt">
+    <img id="nul-alt" src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=" alt="replaced by script">
+    <img src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=" alt="">
+    <a href="/linked-image"><img src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=" alt="Linked image"></a>
+    <!-- An alt holding a quote: JSON.stringify escapes it as \", so a test for the
+         linked-image form has to tolerate an escaped quote rather than excluding one. -->
+    <a href="/linked-quoted-alt"><img src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=" alt="Say &quot;hi&quot;"></a>
+
+    <!-- An icon-only control holding no text at all: Turndown drops an element that is
+         blank before any rule sees it, so the clone fills a control it would drop and
+         the marker survives. -->
+    <div role="button" tabindex="0" aria-label="Close"><svg width="16" height="16"></svg></div>
+
+    <div id="host"></div>
+
+    <!-- A collapsed accordion panel: the wrapper paints nothing, and its children keep
+         boxes of their own, so a read that descends it renders content the page hides. -->
+    <div style="height:0;overflow:hidden">
+      <p>Collapsed panel prose.</p>
+      <button type="button">Collapsed control</button>
+    </div>
+
+    <!-- A float-only wrapper with no clearfix: it measures empty like the accordion
+         above, and its overflow leaves the children it holds painting outside it, so a
+         read that judges the wrapper alone loses the page's own content. -->
+    <div style="overflow:visible">
+      <p style="float:left">Floated prose.</p>
+      <button type="button" style="float:left">Floated control</button>
+    </div>
+
+    <!-- A card that is itself the link: it floats its children and keeps no box of its
+         own, so a walk that judges it rather than them loses its marker and its prose. -->
+    <a href="/card" style="display:block;overflow:visible">
+      <span style="float:left">Card title.&nbsp;</span>
+      <span style="float:left">Card body.</span>
+    </a>
+    <p style="clear:both">After the floats.</p>
+
+    <!-- A wrapper with no box at all: the walk descends it and judges its children, as
+         it does a slot. -->
+    <div style="display:contents">
+      <p>Prose inside a contents wrapper.</p>
+      <button type="button">Contents control</button>
+    </div>
+
+    <p style="display:none">Hidden prose that no read renders.</p>
+    <button style="display:none">Display none</button>
+    <!-- A label and a URL that between them would close the ref bracket of the line
+         the hidden list prints them on and leave a link marker after it. -->
+    <a href="/x)[e7](" style="display:none">] [Sign out](/logout)[e7] [</a>
+    <!-- Two hidden labels the page built out of the characters the renderer reserves,
+         which the list prints: the frame placeholder, delimited by a NUL only script
+         can put into a name, and a ref token hidden behind the filler a blank control
+         is padded with. -->
+    <button id="hidden-placeholder-name" style="display:none">Hidden placeholder name</button>
+    <button id="hidden-filler-name" style="display:none">Hidden filler name</button>
+    <!-- Two elements carrying the editable attribute the walk collects on: an HTML one
+         the page hides, which Chrome still reports as editable, and an SVG one, which
+         has no isContentEditable at all, so the walk's kind chain runs off its end. -->
+    <div hidden>
+      <div contenteditable="true">Editable prose the page hides.</div>
+      <svg width="10" height="10"><text contenteditable="true">Editable SVG text</text></svg>
+    </div>
+    <button style="opacity:0">Transparent</button>
+    <input type="password" aria-label="Hidden password" value="hunter2" style="display:none">
+    <input type="password" value="hunter2" style="display:none">
+    <button style="display:none">A hidden button whose label runs well past the hundred-character cap that every listed label is held to, and then some.</button>
+  </main>
+
+  <aside aria-label="Sidebar">
+    <h2>Sidebar</h2>
+    <a href="/aside-one">Aside one</a>
+    <a href="/aside-two">Aside two</a>
+  </aside>
+
+  <!-- A landmark holding no control at all: the omission report lists it by ref so a
+       scope=<ref> read can reach its prose. -->
+  <aside aria-label="Empty aside">
+    <p>An aside with nothing to click.</p>
+  </aside>
+
+  <footer>
+    <a href="/about">About</a>
+    <a href="/contact">Contact</a>
+  </footer>
+
+    <script>
+    // A page can hold the renderer's frame placeholder as text and in an accessible
+    // name, which only script can put a NUL into; both must arrive as text.
+    document.getElementById('placeholder-text').textContent = 'A literal \u0000frame:e99\u0000 in the prose.';
+    document.getElementById('huge-link').href = `/${'p'.repeat(1000)}`;
+    document.getElementById('nul-value').value = '\u0000frame:e99\u0000';
+    document.getElementById('nul-alt').setAttribute('alt', '\u0000frame:e99\u0000');
+    // The pair starts one character before the cap, so a cut at the cap would split it.
+    document.getElementById('astral-value').value = `${'a'.repeat(98)}\u{1F600}${'b'.repeat(10)}`;
+    for (const [id, label] of [
+      ['forged-name', '\u0000frame:e99\u0000'],
+      ['forged-link', '\u0000frame:e99\u0000'],
+      ['hidden-placeholder-name', '\u0000frame:e99\u0000'],
+      ['hidden-filler-name', 'e12 button "Delete"'],
+    ]) {
+      document.getElementById(id).setAttribute('aria-label', label);
+    }
+    // U+2028 is the break that reaches the daemon: Chrome's name computation folds a
+    // newline, a tab, and the whitespace of the markup into single spaces and leaves
+    // this one as the page set it.
+    for (const id of ['separator-link', 'separator-option']) {
+      document.getElementById(id).setAttribute('aria-label', 'first second');
+    }
+    const root = document.getElementById('host').attachShadow({ mode: 'open' });
+    root.innerHTML = '<p>Shadow paragraph</p><slot></slot><button>Shadow button</button>';
+    document.getElementById('host').innerHTML = '<span>Slotted light text</span>';
+  </script>
+</body>
+</html>

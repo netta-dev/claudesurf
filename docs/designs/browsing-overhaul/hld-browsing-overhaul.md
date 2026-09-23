@@ -1,14 +1,14 @@
 # browsing-overhaul
 
 **Last reviewed**: 2026-09-10
-**Status**: Phase 2 LLD committed
+**Status**: Phase 2 complete
 **Companions**: [use cases](../use-cases-browsing-overhaul.md) · [future](../future-claudesurf.md)
 
 ## Overview
 
 claudesurf's tool contract was built for a demo and has not changed since. `read_page` takes no arguments, returns `document.body.innerText` plus every `<a href>` on the page, and identifies each link by a CSS selector that is often a long `nth-child` path. On a link-dense page that produces tens of thousands of characters, most of them selector noise, which overflows the caller's token budget and spills to a temp file. The interactive half is worse: the tool returns anchors only, so a dashboard's tabs, menu items, and icon-only controls are absent from the output, leaving the agent to guess at a label and hope the text-matching click path finds it. The tool cannot type text.
 
-This project rebuilds the contract around what an agent needs to read a page and act on it. Reads come from Chrome's accessibility tree for structure and control identity, combined with a Readability and Turndown pass for prose, rendered as interleaved markdown where each interactive element carries a ref. Actions address those refs instead of guessed selectors, and the action set grows to cover typing, key presses, option select, history, and tab control. The fifteen actions this implies collapse into two tools — `claudesurf_read` and `claudesurf_act` — so the schema cost in a session's context stays close to today's six tools while the permission boundary between reading and acting stays addressable.
+This project rebuilds the contract around what an agent needs to read a page and act on it. Reads come from Chrome's accessibility tree for control identity and landmarks and from the page's own markup for structure, rendered through Turndown as interleaved markdown where each interactive element carries a ref, with Readability ahead of it when no landmark scopes the page or the caller asks for the article. Actions address those refs instead of guessed selectors, and the action set grows to cover typing, key presses, option select, history, and tab control. The fifteen actions this implies collapse into two tools — `claudesurf_read` and `claudesurf_act` — so the schema cost in a session's context stays close to today's six tools while the permission boundary between reading and acting stays addressable.
 
 The delivery mechanism changes underneath all of it. claudesurf stops driving the human's everyday Chrome and launches a dedicated instance under its own `--user-data-dir`, and the daemon speaks the DevTools Protocol to that instance over `--remote-debugging-pipe` rather than through a Chrome extension. Deleting the extension removes:
 
@@ -32,7 +32,7 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
 > [!example]- **Alternatives considered** — a third-party MCP engine, Playwright as a library, a `chrome.debugger` extension, `--remote-debugging-port` (the daemon speaks CDP over a pipe, with no extension)
 > Build on Chrome DevTools MCP or Playwright MCP and shrink claudesurf to a policy wrapper — would supply accessibility snapshots, trusted input, settle detection, and network capture ready-made, but chaining MCP servers to inject the nonce, domain policy, and action log is awkward, and the per-session window model would be grafted onto someone else's lifecycle rather than owned. Depend on Playwright as a library rather than as a server — dodges the chaining objection, and lost on keeping the daemon's browser lifecycle its own. Reach CDP through a `chrome.debugger` extension — raises a banner across every window of the browser it attaches to, and puts an MV3 service worker on the correctness path, since the keepalive would have had to hold the debugger session alive. `--remote-debugging-port` — an unauthenticated TCP port carrying full browser authority, reachable by any local process, breaching the per-user isolation the daemon exists to enforce.
 
-- **Reads combine the accessibility tree for controls with a Readability and Turndown pass for prose, the latter run in an isolated world inside the page.** This is the end state, reached in phase 2; the first shipped read is a flat DOM walk over the same isolated world.
+- **Reads combine the accessibility tree for controls with a Turndown pass for prose, run in an isolated world inside the page, and a Readability pass ahead of it on a page no landmark scopes or on request.** This is the end state, reached in phase 2; the first shipped read is a flat DOM walk over the same isolated world.
   - Chrome already computes accessible names through the full `aria-labelledby`, label-association, `alt`, and `title` chain, and already prunes what is invisible or `aria-hidden`. Reimplementing that would get the hard cases wrong.
   - The accessibility tree drops inline emphasis and code and flattens table structure, because a screen reader gets that from navigation rather than layout. On documentation and articles the loss is material — a config key becomes indistinguishable from an English word, and a wide options table loses which value belongs to which column.
   - Readability needs a DOM. Running it in the daemon would mean jsdom, a heavyweight dependency; running it in the page's own JavaScript context would let page script tamper with the extraction. `Page.createIsolatedWorld` gives a JavaScript context over the same DOM that page script cannot reach, avoiding both costs.
@@ -48,7 +48,7 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
 
 - **A ref is a `backendDOMNodeId` scoped to its target and document generation; a cross-site frame is its own target and its refs carry a frame prefix, while a frame in the page's renderer shares the page's scope.**
   - The browser owns the node mapping, so nothing in claudesurf holds a table that can drift from the document, and `DOM.scrollIntoViewIfNeeded`, `DOM.getBoxModel`, and `DOM.resolveNode` all accept the id directly.
-  - The id is unique within a renderer process rather than within a tab, so a bare id could resolve to a live node in the wrong document. Pairing it with its frame target and a generation counter makes cross-target or post-navigation reuse fail loudly.
+  - The id is unique within a renderer process rather than within a tab, so a bare id could resolve to a live node in the wrong document. Pairing it with the target whose renderer computed it — the page target for a frame that shares its process, its own target for a cross-site one — and with that target's generation counter makes cross-target or post-navigation reuse fail loudly.
 
 > [!example]- **Alternatives considered** — same-document reads only, a claudesurf-held ref map, role and name addressing (frame-scoped `backendDOMNodeId` refs, following out-of-process iframes)
 > Read the page target only and report frames as omitted — simpler and honest, and it blinds the tool to embedded logins and challenges. A ref map held by claudesurf and keyed by snapshot — was the original design when an extension held it; with the extension gone the browser's own identifier is simpler and survives more. Address elements by role and name, as WebDriver BiDi and Playwright locators do — reads closer to how an agent reasons, but duplicate names force a disambiguation protocol, which is the guessing problem refs exist to remove.
@@ -184,8 +184,8 @@ The `extension/` directory is deleted. Its session-identity page becomes `server
 
 **Read.** `claudesurf_read` reaches the daemon, which:
 
-1. Pulls the accessibility tree for the session's working target and every attached child frame target.
-2. Prunes generic containers and invisible nodes, and restricts to the main landmark unless asked otherwise.
+1. Pulls the accessibility tree for the session's working target and for each child frame inside the scope it renders, eight frames over three nesting levels at most.
+2. Reads each tree for controls, landmarks, named groups, and frame nodes alone; the render skips hidden elements and is scoped by the first of the `main` landmark, an `article` node, Readability's article, and the whole body, unless asked otherwise.
 3. Renders prose through Turndown in an isolated world over the page's DOM, with Readability ahead of it when no landmark scopes the page or the caller asks for the article.
 4. Places controls into that prose by `backendDOMNodeId`.
 5. Returns interleaved markdown with frame boundaries marked, and counts for everything omitted.
@@ -368,7 +368,7 @@ Against today, this phase adds buttons and `[role]` controls where reads returne
 
 Reads move onto the accessibility tree for controls and structure, with prose rendered through Turndown in an isolated world — Readability ahead of it when no landmark scopes the page or on request — and controls placed by `backendDOMNodeId`. Output becomes interleaved markdown restricted to main content, deduplicated, visibility-filtered, following child frames, and reporting what it omitted, with `find`, `scope`, article extraction, and link presentation as parameters.
 
-Phase 1's flat walk is replaced under an unchanged action signature and an `e<id>` ref scheme extended only by a frame prefix for cross-site frames, so nothing built on refs is rewritten. This is where a link-dense page stops overflowing the caller's token budget.
+Phase 1's flat walk is replaced as the read's source and kept for the hidden list, under an unchanged action signature and an `e<id>` ref scheme extended only by a frame prefix for cross-site frames, so nothing built on refs is rewritten. This is where a link-dense page stops overflowing the caller's token budget.
 
 **Key decisions:**
 - **Controls are placed into rendered prose by `backendDOMNodeId`, not by text matching.** Both passes derive from the same nodes, so the correspondence is a lookup.
@@ -377,6 +377,7 @@ Phase 1's flat walk is replaced under an unchanged action signature and an `e<id
 - `server/snapshot.js` (new — pruning, control and landmark extraction, scope resolution)
 - `server/render.js` (new — isolated-world extraction, control placement)
 - `server/read.js` (modified — the accessibility tree replaces the flat walk), `server/page/render.js` (new — the in-browser clone and Turndown rules), `server/sessions.js` (modified — iframe targets, worlds per frame), `server/input.js` (modified — frame refs)
+- `server/page/walk.js` (modified — restricted to hidden elements), `server/page/state.js` (modified — the boxless reading, the mask), `server/action-support.js` (modified — the renderer source and the caps)
 - `server/daemon.js` (modified — read arguments passed through), `server/dispatch.js` (modified — read parameters)
 - `server/package.json` (modified — Readability, Turndown, and the Turndown GFM plugin, whose browser-global files are injectable as shipped)
 - `test/snapshot.test.js`, `test/render.test.js` (new — recorded trees and pure assembly functions), `test/live/render.test.js` (new — fixture pages through the renderer), `test/read.test.js` (modified — flat-walk assertions replaced)

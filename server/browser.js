@@ -143,7 +143,9 @@ async function launch({ binary, profileDir, env, headless = false, log }) {
 }
 
 // Sent after every launch, once the attach handlers are registered: new targets pause
-// until released, and downloads are denied.
+// until released, and downloads are denied. The iframe filter entry is inert at
+// browser level, where Chrome surfaces page targets alone; sessions.js sends a
+// per-target call on every attach, which surfaces out-of-process frames.
 async function enableTargets(conn) {
   await conn.send('Target.setAutoAttach', {
     autoAttach: true, waitForDebuggerOnStart: true, flatten: true,

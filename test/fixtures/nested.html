@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Nested child</title>
+</head>
+<body>
+  <h1>Nested child</h1>
+  <!-- A landmark of the frame's own: its boundary renders when the whole frame does,
+       which a scope on this frame's ref asks for as scope=all does of the page. -->
+  <nav aria-label="Child nav">
+    <a href="/other">Child nav link</a>
+  </nav>
+  <p id="log">nothing yet</p>
+  <p>The cross-site child's own prose.</p>
+  <button onclick="document.getElementById('log').textContent = 'child clicked'">Child button</button>
+  <button onclick="alert('Alert from the nested frame')">Child alert</button>
+  <a href="/other">Child link</a>
+  <!-- Same site as this page, so it shares this frame's renderer and its ref prefix. -->
+  <iframe title="Deep child" src="/deep.html" width="200" height="100"></iframe>
+</body>
+</html>

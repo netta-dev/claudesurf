@@ -1,13 +1,13 @@
 // sessions.js against the in-process fake: window creation and role claims, opener
-// attribution, target preparation, repairs, generations and ref sets, dialogs, labels,
-// and EOF.
+// attribution, target preparation, iframe targets and their frame numbers, repairs,
+// generations, isolated worlds and ref sets, dialogs, labels, and EOF.
 
 const { test } = require('node:test');
 const assert = require('node:assert');
 const browser = require('../server/browser');
 const { Sessions, SESSION_PAGE, parseSessionPage } = require('../server/sessions');
 const { fakeSession, sleep, waitFor, isolatedPaths, silentLog, FAKE_CHROME } = require('./helpers');
-const { Connection } = require('../server/cdp');
+const { Connection, ProtocolError } = require('../server/cdp');
 const { FakeBrowser } = require('./fakes/fake-browser');
 
 const { enableTargets } = browser;
@@ -20,6 +20,19 @@ async function setup() {
 
 function pageUrl(sessionId, role) {
   return `${SESSION_PAGE}#role=${role}&session=${sessionId}&started=2026-01-01T00%3A00%3A00.000Z`;
+}
+
+// Attaches an out-of-process child frame of a fake target and waits for the registry
+// to record it; resolves with the fake's target, whose id the registry uses too.
+async function attachFrame(fake, sessions, parent, url = 'http://frame.test/child') {
+  const frame = fake.createTarget({ type: 'iframe', parent, url });
+  await waitFor(() => sessions.target(frame.targetId) !== null);
+  await fake.waitForCall('Page.enable', (c) => c.sessionId === frame.sessionId);
+  return frame;
+}
+
+function missingContext() {
+  return new ProtocolError('Runtime.callFunctionOn', -32000, 'Cannot find context with specified id');
 }
 
 test('first ensure creates the window: working tab by createTarget, identity tab claimed by URL role', async () => {
@@ -68,6 +81,83 @@ test('every attached page target receives focus emulation, and a rejected prepar
     assert.ok(released.includes(cdp), `${id} was released`);
   }
   assert.strictEqual(focused.length, 2);
+});
+
+test('a frame whose renderer is wedged fails every preparation command without an unhandled rejection', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const parent = fake.targets.get(session.workingTargetId);
+  // A wedged renderer answers none of them, so the first rejection must not leave the
+  // rest unawaited: node:test fails this file on the unhandled rejection that follows.
+  for (const method of ['Page.enable', 'Target.setAutoAttach']) {
+    fake.handle(method, (p, sid) => {
+      if (fake.bySession(sid).type !== 'iframe') return {};
+      return new Promise((resolve, reject) => setTimeout(() => reject(new Error(`${method} timed out`)), 10));
+    });
+  }
+  const frame = fake.createTarget({ type: 'iframe', parent, url: 'http://frame.test/wedged' });
+  await waitFor(() => sessions.target(frame.targetId) !== null);
+  await sleep(60);
+  assert.ok(sessions.target(frame.targetId), 'the target is recorded either way');
+  assert.ok(fake.callsTo('Runtime.runIfWaitingForDebugger').some((c) => c.sessionId === frame.sessionId), 'and released, so its load is not held');
+});
+
+test('the preparation commands are queued ahead of the release, so a target that answers nothing until then still attaches', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  // This tab answers Page.enable, the auto-attach, and the window lookup only once it
+  // has been released, as a renderer paused on attach does: a handler that awaited one
+  // of them first would wait for a document the pause holds back, and nothing below
+  // would happen.
+  const opened = fake.createTarget({ url: 'http://a.test/tab', windowId: 999, openerId: session.workingTargetId, holdUntilRelease: true });
+  await waitFor(() => session.opened.has(opened.targetId), 1000);
+  assert.strictEqual(sessions.target(opened.targetId).role, 'opened', 'the claim runs after the commands it queued were answered');
+  assert.strictEqual(sessions.target(opened.targetId).windowId, 999, 'and the window the lookup reported is recorded');
+  assert.ok(fake.targets.get(opened.targetId).enabled, 'Page.enable landed');
+  assert.ok(fake.callsTo('Target.setAutoAttach').some((c) => c.sessionId === opened.sessionId));
+});
+
+test('a preparation command that fails leaves the target recorded and released, so its load is not held', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const working = fake.targets.get(session.workingTargetId);
+  fake.handle('Page.enable', (p, sid) => {
+    const t = fake.bySession(sid);
+    if (t.type !== 'iframe') return {};
+    return fake.afterRelease(t, () => { throw { code: -32000, message: 'the renderer is gone' }; });
+  });
+  const frame = fake.createTarget({ type: 'iframe', parent: working, url: 'http://frame.test/failing', holdUntilRelease: true });
+  await waitFor(() => sessions.target(frame.targetId) !== null);
+  await fake.waitForCall('Runtime.runIfWaitingForDebugger', (c) => c.sessionId === frame.sessionId);
+  await waitFor(() => frame.released);
+  assert.ok(sessions.target(frame.targetId), 'a failed preparation leaves the target in the registry');
+  assert.strictEqual(sessions.target(frame.targetId).type, 'iframe');
+});
+
+test('a target that is neither a page nor a frame is released and never recorded', async () => {
+  const { fake, sessions } = await setup();
+  await sessions.ensure('s1');
+  const worker = fake.createTarget({ type: 'worker', url: 'http://a.test/worker.js' });
+  await fake.waitForCall('Runtime.runIfWaitingForDebugger', (c) => c.sessionId === worker.sessionId);
+  await sleep(20);
+  assert.strictEqual(sessions.target(worker.targetId), null, 'the registry holds pages and frames alone');
+  assert.ok(!fake.callsTo('Page.enable').some((c) => c.sessionId === worker.sessionId), 'and nothing is enabled on it');
+});
+
+test('an iframe whose attach arrives on a session the registry does not know is released and never recorded', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const page = fake.createTarget({ url: 'http://a.test/tab', openerId: session.workingTargetId });
+  await waitFor(() => sessions.target(page.targetId) !== null);
+  // The page went before its frame's attach was delivered, so the chain the frame
+  // would be numbered and owned along reaches nothing.
+  fake.destroyTarget(page.targetId);
+  await waitFor(() => sessions.target(page.targetId) === null);
+  const orphan = fake.createTarget({ type: 'iframe', parent: page, url: 'http://frame.test/orphan' });
+  await fake.waitForCall('Runtime.runIfWaitingForDebugger', (c) => c.sessionId === orphan.sessionId);
+  await sleep(20);
+  assert.strictEqual(sessions.target(orphan.targetId), null, 'a frame belonging to no page belongs to no session either');
+  assert.ok(!fake.callsTo('Page.enable').some((c) => c.sessionId === orphan.sessionId));
 });
 
 test('a page-opened target is attributed by opener in the session window and in a popup; one with neither is unowned', async () => {
@@ -265,17 +355,17 @@ test('generation increments on main-frame frameNavigated only, resetting the wor
   assert.notStrictEqual(await sessions.world(t.targetId), world0, 'a new world for the new document');
 });
 
-test('ref sets merge across reads of one generation and are replaced on a new one', async () => {
+test('a ref set survives a navigation and stops matching the generation it was read at', async () => {
   const { fake, sessions } = await setup();
   const session = await sessions.ensure('s1');
   const t = sessions.target(session.workingTargetId);
-  session.refs.set(t.targetId, { generation: t.generation, ids: new Set([1, 2]) });
+  // Each id maps to the frame of this target it was read in, null for the main frame.
+  session.refs.set(t.targetId, { generation: t.generation, ids: new Map([[1, null], [2, 'child-frame']]) });
   const set = session.refs.get(t.targetId);
-  for (const id of [2, 3]) set.ids.add(id);
-  assert.deepStrictEqual([...set.ids], [1, 2, 3]);
   fake.navigateTarget(fake.targets.get(t.targetId), 'http://a.test/next');
   await sleep(10);
-  assert.notStrictEqual(session.refs.get(t.targetId).generation, t.generation, 'the old set no longer matches');
+  assert.strictEqual(session.refs.get(t.targetId), set, 'the set itself is left alone');
+  assert.notStrictEqual(set.generation, t.generation, 'and no longer matches, so every ref in it is stale');
 });
 
 test('a dialog is answered per type and its note is taken once', async () => {
@@ -309,7 +399,7 @@ test('dropAll on EOF clears windows, targets, and refs but keeps labels', async 
   const { fake, sessions } = await setup();
   const session = await sessions.ensure('s1');
   await sessions.setLabel(session, 'kept');
-  session.refs.set(session.workingTargetId, { generation: 1, ids: new Set([1]) });
+  session.refs.set(session.workingTargetId, { generation: 1, ids: new Map([[1, null]]) });
   fake.close();
   await waitFor(() => session.windowId === null);
   assert.strictEqual(session.workingTargetId, null);
@@ -372,4 +462,184 @@ test('Sessions.attach rebinds to the new connection across a relaunch', async (t
   } finally {
     second.conn.close();
   }
+});
+
+test('an out-of-process frame is recorded as its own target: Page.enable and the release, no focus emulation or window lookup', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const working = fake.targets.get(session.workingTargetId);
+  const frame = await attachFrame(fake, sessions, working);
+  const record = sessions.target(frame.targetId);
+  assert.strictEqual(record.type, 'iframe');
+  assert.strictEqual(record.frameNumber, 1);
+  assert.strictEqual(record.parentTargetId, working.targetId);
+  assert.strictEqual(record.mainFrameId, frame.targetId, "an out-of-process frame's id is its target id");
+  await fake.waitForCall('Runtime.runIfWaitingForDebugger', (c) => c.sessionId === frame.sessionId);
+  assert.ok(!fake.callsTo('Emulation.setFocusEmulationEnabled').some((c) => c.sessionId === frame.sessionId), 'no focus emulation');
+  assert.ok(!fake.callsTo('Browser.getWindowForTarget').some((c) => c.params.targetId === frame.targetId), 'no window lookup');
+  assert.strictEqual(session.workingTargetId, working.targetId, 'the frame claims no role');
+  assert.strictEqual(record.role, null);
+  fake.destroyTarget(frame.targetId);
+  await waitFor(() => sessions.target(frame.targetId) === null);
+  assert.deepStrictEqual(sessions.frameTargets(working.targetId), []);
+});
+
+test('a frame attached before its first navigation is not asked for its frame tree', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const working = fake.targets.get(session.workingTargetId);
+  const blank = fake.createTarget({ type: 'iframe', parent: working, url: '' });
+  await waitFor(() => sessions.target(blank.targetId) !== null);
+  await fake.waitForCall('Page.enable', (c) => c.sessionId === blank.sessionId);
+  await sleep(20);
+  // Its URL is in its parent's frame tree, and an ad frame that never commits would
+  // hold the command for its whole timeout.
+  assert.ok(!fake.callsTo('Page.getFrameTree').some((c) => c.sessionId === blank.sessionId));
+  assert.strictEqual(sessions.target(blank.targetId).url, '');
+});
+
+test('frame numbers come from the root page and are never reused; each page numbers from 1', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const working = fake.targets.get(session.workingTargetId);
+  const identity = fake.targets.get(session.identityTargetId);
+  const first = await attachFrame(fake, sessions, working);
+  const second = await attachFrame(fake, sessions, working);
+  assert.deepStrictEqual([sessions.target(first.targetId).frameNumber, sessions.target(second.targetId).frameNumber], [1, 2]);
+  fake.destroyTarget(first.targetId);
+  await waitFor(() => sessions.target(first.targetId) === null);
+  const third = await attachFrame(fake, sessions, working);
+  assert.strictEqual(sessions.target(third.targetId).frameNumber, 3, "the destroyed frame's number stays spent");
+  assert.strictEqual(sessions.frameTarget(working.targetId, 1), null, 'a gone frame answers nothing');
+  assert.strictEqual(sessions.frameTarget(working.targetId, 2), sessions.target(second.targetId));
+  const other = await attachFrame(fake, sessions, identity);
+  assert.strictEqual(sessions.target(other.targetId).frameNumber, 1, 'the other page numbers from 1');
+  assert.deepStrictEqual(sessions.frameTargets(identity.targetId).map((t) => t.targetId), [other.targetId]);
+});
+
+test('a destroyed frame target takes its ref set with it, and a destroyed page takes its frames\' too', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const working = fake.targets.get(session.workingTargetId);
+  const alone = await attachFrame(fake, sessions, working);
+  // A frame target claims no session role, so its set is found along its parent chain.
+  session.refs.set(alone.targetId, { generation: 1, ids: new Map([[1, null]]) });
+  fake.destroyTarget(alone.targetId);
+  await waitFor(() => sessions.target(alone.targetId) === null);
+  assert.strictEqual(session.refs.has(alone.targetId), false, 'the frame that went took its refs');
+  const kept = await attachFrame(fake, sessions, working);
+  session.refs.set(working.targetId, { generation: 1, ids: new Map([[2, null]]) });
+  session.refs.set(kept.targetId, { generation: 1, ids: new Map([[3, null]]) });
+  fake.destroyTarget(working.targetId);
+  await waitFor(() => sessions.target(kept.targetId) === null);
+  assert.strictEqual(session.refs.size, 0, "the page's own set and its frames' go together");
+});
+
+test('a nested frame records the frame target that carried its attach, and its page takes both when it is destroyed', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const working = fake.targets.get(session.workingTargetId);
+  const outer = await attachFrame(fake, sessions, working);
+  const inner = await attachFrame(fake, sessions, outer, 'http://frame.test/nested');
+  assert.strictEqual(sessions.target(inner.targetId).parentTargetId, outer.targetId);
+  assert.strictEqual(sessions.target(inner.targetId).frameNumber, 2, 'numbered by the root page, two levels up');
+  assert.deepStrictEqual(sessions.frameTargets(working.targetId).map((t) => t.targetId), [outer.targetId, inner.targetId]);
+  session.refs.set(inner.targetId, { generation: 1, ids: new Map([[1, null]]) });
+  fake.destroyTarget(working.targetId);
+  await waitFor(() => sessions.target(working.targetId) === null);
+  assert.strictEqual(sessions.target(outer.targetId), null, "the page's frames go with it");
+  assert.strictEqual(sessions.target(inner.targetId), null);
+  assert.strictEqual(session.refs.has(inner.targetId), false, "and a frame two levels down takes its ref set along the chain");
+});
+
+test('a destroyed frame takes the frames inside it, and their ref sets, with it', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const working = fake.targets.get(session.workingTargetId);
+  const outer = await attachFrame(fake, sessions, working);
+  const inner = await attachFrame(fake, sessions, outer, 'http://frame.test/nested');
+  session.refs.set(inner.targetId, { generation: 1, ids: new Map([[1, null]]) });
+  fake.destroyTarget(outer.targetId);
+  await waitFor(() => sessions.target(outer.targetId) === null);
+  assert.strictEqual(sessions.target(inner.targetId), null, 'the frame inside it is gone too');
+  assert.strictEqual(session.refs.has(inner.targetId), false);
+  assert.strictEqual(session.workingTargetId, working.targetId, 'and the page is untouched');
+});
+
+test('the per-target auto-attach filters iframes and is sent to every page and frame target', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const working = fake.targets.get(session.workingTargetId);
+  const frame = await attachFrame(fake, sessions, working);
+  const calls = fake.callsTo('Target.setAutoAttach');
+  assert.strictEqual(calls.filter((c) => !c.sessionId).length, 1, 'one browser-level call, from enableTargets');
+  const perTarget = calls.filter((c) => c.sessionId);
+  for (const t of [working, fake.targets.get(session.identityTargetId), frame]) {
+    const sent = perTarget.find((c) => c.sessionId === t.sessionId);
+    assert.ok(sent, `${t.targetId} got the per-target call`);
+    assert.deepStrictEqual(sent.params, {
+      autoAttach: true, waitForDebuggerOnStart: true, flatten: true, filter: [{ type: 'iframe' }],
+    }, `${t.targetId}'s call carries the filter, so a frame of its own surfaces too`);
+  }
+});
+
+test('worlds are kept per frame and generation, and a frame target navigating on its own drops only its own', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const working = fake.targets.get(session.workingTargetId);
+  const t = sessions.target(working.targetId);
+  const main = await sessions.world(t.targetId);
+  assert.strictEqual(await sessions.world(t.targetId), main, 'the main frame is cached for the generation');
+  const child = await sessions.world(t.targetId, 'same-process-child');
+  assert.notStrictEqual(child, main, 'a same-process child frame gets its own world');
+  assert.strictEqual(await sessions.world(t.targetId, 'same-process-child'), child);
+  assert.deepStrictEqual(
+    fake.callsTo('Page.createIsolatedWorld').map((c) => c.params.frameId),
+    [t.targetId, 'same-process-child'],
+  );
+  const frame = await attachFrame(fake, sessions, working);
+  const frameRecord = sessions.target(frame.targetId);
+  await waitFor(() => frameRecord.generation === 1, 1000);
+  const frameWorld = await sessions.world(frame.targetId);
+  fake.emit('Page.frameNavigated', { frame: { id: 'grandchild', parentId: frame.targetId, url: 'http://frame.test/deep' } }, frame.sessionId);
+  await sleep(10);
+  assert.strictEqual(frameRecord.generation, 1, "a child of the frame's own document leaves its generation");
+  fake.navigateTarget(frame, 'http://frame.test/next');
+  await waitFor(() => frameRecord.generation === 2);
+  assert.strictEqual(frameRecord.url, 'http://frame.test/next');
+  assert.notStrictEqual(await sessions.world(frame.targetId), frameWorld, 'a new world for the new document');
+  assert.strictEqual(await sessions.world(t.targetId), main, "the page's world is untouched");
+});
+
+test('withWorld retries once in a fresh, un-injected world when the context is gone, and rethrows a second failure', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const t = sessions.target(session.workingTargetId);
+  const first = await sessions.world(t.targetId);
+  const seen = [];
+  const result = await sessions.withWorld(t.targetId, null, (contextId, world) => {
+    seen.push({ contextId, injected: world.injected });
+    world.injected = true;
+    if (seen.length === 1) throw missingContext();
+    return 'second attempt';
+  });
+  assert.strictEqual(result, 'second attempt');
+  assert.strictEqual(seen.length, 2, 'one retry');
+  assert.strictEqual(seen[0].contextId, first);
+  assert.notStrictEqual(seen[1].contextId, first, 'the retry ran in a recreated world');
+  assert.deepStrictEqual(seen.map((s) => s.injected), [false, false], 'the recreated world carries no injection');
+  const before = fake.callsTo('Page.createIsolatedWorld').length;
+  let attempts = 0;
+  await assert.rejects(sessions.withWorld(t.targetId, null, () => { attempts++; throw missingContext(); }), /Cannot find context/);
+  assert.strictEqual(attempts, 2, 'the second failure is not retried again');
+  assert.strictEqual(fake.callsTo('Page.createIsolatedWorld').length - before, 1, 'one world recreated for the retry');
+});
+
+test('an error that is not a missing context is not retried', async () => {
+  const { sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const t = sessions.target(session.workingTargetId);
+  let attempts = 0;
+  await assert.rejects(sessions.withWorld(t.targetId, null, () => { attempts++; throw new Error('page script failed'); }), /page script failed/);
+  assert.strictEqual(attempts, 1);
 });

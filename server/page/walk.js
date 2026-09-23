@@ -4,10 +4,17 @@
 // Collects the interactive elements of the document, descending open shadow roots,
 // and returns a summary by value. The element objects are stashed on the
 // world's global so the daemon can read their handles with one Runtime.getProperties.
-function claudesurfWalk() {
+//
+// Under `hiddenOnly` it collects the hidden elements alone, what the accessibility tree
+// keeps but a read leaves out and what Chrome prunes from the tree altogether, and
+// leaves the page text empty. `labelMax` is the daemon's cap on a label.
+function claudesurfWalk(hiddenOnly, labelMax) {
   const SELECTOR = 'a[href], button, input:not([type=hidden]), select, textarea, summary, [contenteditable=true], [role]';
-  const ROLES = new Set(['button', 'link', 'tab', 'menuitem', 'checkbox', 'radio', 'switch', 'option', 'combobox', 'textbox']);
-  const LABEL_MAX = 100;
+  const ROLES = new Set([
+    'button', 'link', 'tab', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'checkbox',
+    'radio', 'switch', 'option', 'combobox', 'listbox', 'textbox', 'searchbox', 'slider',
+    'spinbutton', 'treeitem',
+  ]);
 
   function collect(root, out) {
     for (const el of root.querySelectorAll(SELECTOR)) {
@@ -32,11 +39,22 @@ function claudesurfWalk() {
     }
     if (tag === 'textarea' || el.isContentEditable) return 'textbox';
     if (tag === 'select') return 'combobox';
-    if (tag === 'summary') return 'button';
-    return tag;
+    if (tag === 'summary' || tag === 'button') return 'button';
+    // What is left of collect()'s [contenteditable=true] arm: an SVG element carrying
+    // that attribute has no isContentEditable at all, so the chain above runs off its
+    // end. The word is fixed rather than the tag name, which the page sets, so this
+    // branch and any added later cannot print page text as a kind.
+    return 'element';
   }
 
-  function text(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
+  // A label and a URL are the page's to write, and the two characters the read's
+  // renderer reserves — the NUL that delimits its frame placeholder and the filler it
+  // pads a blank control with — are the two the daemon strips from every payload.
+  const plain = (value) => (value || '').replace(/[\0\uE000]/g, '');
+
+  function text(s) { return plain(s).replace(/\s+/g, ' ').trim(); }
+
+  const escapeField = (value) => value.replace(/[\\[\]]/g, '\\$&');
 
   function labelOf(el) {
     const candidates = [];
@@ -49,12 +67,26 @@ function claudesurfWalk() {
     if (img) candidates.push(img.getAttribute('alt'));
     candidates.push(el.getAttribute('title'));
     candidates.push(el.getAttribute('placeholder'));
-    if (el.tagName === 'INPUT' || el.tagName === 'SELECT') candidates.push(el.value);
+    if (el.tagName === 'INPUT' || el.tagName === 'SELECT') candidates.push(claudesurfMasked(el) ? CLAUDESURF_MASK : el.value);
     for (const c of candidates) {
       const t = text(c);
-      if (t) return t.length > LABEL_MAX ? t.slice(0, LABEL_MAX) : t;
+      // Cut with an ellipsis, as every other capped field is, then escaped the way the
+      // daemon escapes a name at its cap: the hidden list brackets a ref onto each
+      // line, and a `]` in a label would close it and leave a marker for a ref the page
+      // does not own. The escape follows the cut, so the cap still counts the
+      // characters the page wrote.
+      if (t) return escapeField(cap(t));
     }
     return '';
+  }
+
+  function cap(t) {
+    if (t.length <= labelMax) return t;
+    // The cut never lands between the halves of a surrogate pair, whose lone half
+    // renders as a replacement character; action-support.js holds the daemon's copy.
+    const end = labelMax - 1;
+    const code = t.charCodeAt(end);
+    return `${t.slice(0, code >= 0xdc00 && code <= 0xdfff ? end - 1 : end)}…`;
   }
 
   // @include state.js
@@ -65,24 +97,28 @@ function claudesurfWalk() {
     return aria === 'true';
   }
 
-  const elements = [];
-  collect(document, elements);
+  const found = [];
+  collect(document, found);
+  // One state per element: reading it costs a layout call, and the filter below and the
+  // summary read the same answer.
+  const states = new Map(found.map((el) => [el, claudesurfState(el)]));
+  const elements = hiddenOnly ? found.filter((el) => claudesurfSkipped(states.get(el))) : found;
   globalThis.__claudesurfElements = elements;
   const summary = elements.map((el) => {
-    const state = claudesurfState(el);
+    const state = states.get(el);
     return {
       kind: kindOf(el),
       label: labelOf(el),
-      href: el.tagName === 'A' ? el.href : undefined,
+      href: el.tagName === 'A' ? plain(el.href) : undefined,
       disabled: state.disabled,
       checked: checkedOf(el),
-      visible: !state.hidden,
+      visible: !claudesurfSkipped(state),
     };
   });
   return {
     url: location.href,
     title: document.title,
-    text: document.body ? document.body.innerText : '',
+    text: hiddenOnly ? '' : (document.body ? document.body.innerText : ''),
     elements: summary,
   };
 }

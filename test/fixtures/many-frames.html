@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Many frames fixture</title>
+</head>
+<body>
+  <h1>Many frames</h1>
+  <p>The page's own prose, above nine frames.</p>
+  <!-- Nine children, each longer than the per-frame cap, so one read meets the frame
+       limit, the per-frame cut, and the per-read cut at once. -->
+  <iframe title="Bulk one" src="/bulk.html?n=1" width="300" height="100"></iframe>
+  <iframe title="Bulk two" src="/bulk.html?n=2" width="300" height="100"></iframe>
+  <iframe title="Bulk three" src="/bulk.html?n=3" width="300" height="100"></iframe>
+  <iframe title="Bulk four" src="/bulk.html?n=4" width="300" height="100"></iframe>
+  <iframe title="Bulk five" src="/bulk.html?n=5" width="300" height="100"></iframe>
+  <iframe title="Bulk six" src="/bulk.html?n=6" width="300" height="100"></iframe>
+  <iframe title="Bulk seven" src="/bulk.html?n=7" width="300" height="100"></iframe>
+  <iframe title="Bulk eight" src="/bulk.html?n=8" width="300" height="100"></iframe>
+  <iframe title="Bulk nine" src="/bulk.html?n=9" width="300" height="100"></iframe>
+  <p>The page's own prose, below the frames.</p>
+</body>
+</html>

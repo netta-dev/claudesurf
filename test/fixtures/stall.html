@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Stalling frame</title>
+</head>
+<body>
+  <p>This frame holds its renderer past any read's budget for it.</p>
+  <script>
+    // A busy loop rather than a pending request: the document has to commit for the
+    // frame to get a target of its own, and then hold its process against the read.
+    const end = Date.now() + 8000;
+    while (Date.now() < end) { /* spin */ }
+  </script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Frames fixture</title>
+</head>
+<body>
+  <h1>Frames</h1>
+  <p>The page's own prose, before the frames.</p>
+  <a href="/other">Page link</a>
+  <!-- __CROSS_SITE__ is replaced with the second listener's base as the fixture is
+       served, so this child is a site of its own and gets its own target. -->
+  <iframe title="Cross-site child" src="__CROSS_SITE__/nested.html" width="400" height="200"></iframe>
+  <iframe title="Same-site child" src="/labels.html" width="400" height="200"></iframe>
+  <!-- A frame the page hides: Chrome keeps a transparent element in the tree, so the
+       read has a node for it and reports it hidden rather than reading it. -->
+  <iframe title="Hidden child" src="/article.html" width="400" height="200" style="opacity:0"></iframe>
+  <p>The page's own prose, after the frames.</p>
+</body>
+</html>
