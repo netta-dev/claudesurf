@@ -1,7 +1,7 @@
 # browsing-overhaul
 
 **Last reviewed**: 2026-09-10
-**Status**: Phase 2 complete
+**Status**: Phase 3 LLD committed
 **Companions**: [use cases](../use-cases-browsing-overhaul.md) · [future](../future-claudesurf.md)
 
 ## Overview
@@ -27,7 +27,7 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
 
 - **The daemon speaks CDP to the browser over `--remote-debugging-pipe`. The Chrome extension is deleted.**
   - Only the parent process holds the pipe's file descriptors, so only the parent can drive the browser. That is stronger than the peer-uid check it replaces, and a pipe stays off the network stack entirely.
-  - Tab pinning is the one capability given up — an extension API with no protocol equivalent — so the daemon identifies the working tab by target id recorded at creation. Window creation still raises the window once, since adding the second tab is a page-initiated tab creation and Chrome raises the window for those, and recreating a working tab the human closed raises it the same way, as does any click that opens a tab or popup; nothing else raises it, because pointer input is the other thing that does and clicks are scripted by default.
+  - Tab pinning is the one capability given up — an extension API with no protocol equivalent — so the daemon identifies the working tab by target id recorded at creation. Window creation still raises the window once, since adding the second tab is a page-initiated tab creation and Chrome raises the window for those. Every other page-initiated tab creation raises it the same way: recreating a working tab the human closed, a click or page script that opens a tab or popup, and the `tabs new` action. Pointer input raises it too, so a trusted click does; clicks are scripted by default. Keys, scripted clicks, and navigation leave the window where it is if they don't open a tab.
 
 > [!example]- **Alternatives considered** — a third-party MCP engine, Playwright as a library, a `chrome.debugger` extension, `--remote-debugging-port` (the daemon speaks CDP over a pipe, with no extension)
 > Build on Chrome DevTools MCP or Playwright MCP and shrink claudesurf to a policy wrapper — would supply accessibility snapshots, trusted input, settle detection, and network capture ready-made, but chaining MCP servers to inject the nonce, domain policy, and action log is awkward, and the per-session window model would be grafted onto someone else's lifecycle rather than owned. Depend on Playwright as a library rather than as a server — dodges the chaining objection, and lost on keeping the daemon's browser lifecycle its own. Reach CDP through a `chrome.debugger` extension — raises a banner across every window of the browser it attaches to, and puts an MV3 service worker on the correctness path, since the keepalive would have had to hold the debugger session alive. `--remote-debugging-port` — an unauthenticated TCP port carrying full browser authority, reachable by any local process, breaching the per-user isolation the daemon exists to enforce.
@@ -54,7 +54,7 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
 > Read the page target only and report frames as omitted — simpler and honest, and it blinds the tool to embedded logins and challenges. A ref map held by claudesurf and keyed by snapshot — was the original design when an extension held it; with the extension gone the browser's own identifier is simpler and survives more. Address elements by role and name, as WebDriver BiDi and Playwright locators do — reads closer to how an agent reasons, but duplicate names force a disambiguation protocol, which is the guessing problem refs exist to remove.
 
 - **The MCP surface is two tools that dispatch on an action name.**
-  - Fifteen separate tools would carry roughly 2,500 tokens of schema in every session, browsing or not; two carry roughly 600. One tool would put the whole surface behind a single permission rule, so a preference like "never prompt me for reads" would be inexpressible — MCP permission rules glob on tool names after a literal `mcp__<server>__` prefix and do not match arguments.
+  - Fifteen separate tools would carry roughly 2,500 tokens of schema in every session, browsing or not; two were estimated at roughly 600, and measured about 1,200 once the reads shipped. One tool would put the whole surface behind a single permission rule, so a preference like "never prompt me for reads" would be inexpressible — MCP permission rules glob on tool names after a literal `mcp__<server>__` prefix and do not match arguments.
   - Splitting at "does this change anything" puts the permission boundary where the risk changes. Three actions sit on the acting side for reasons worth naming:
     1. `scroll` changes viewport state.
     2. `fetch` spends the profile's cookies against a host of the agent's choosing.
@@ -68,8 +68,8 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
 | `claudesurf_read` | `page` | `scope`, `find`, `article`, `since`, `links`, `hidden`, `max_chars`, `offset` |
 | | `info` | — |
 | | `screenshot` | `full_page` |
-| | `console` | `since` |
-| | `network` | `filter`, `since` |
+| | `console` | a cursor, named in phase 4 |
+| | `network` | `filter`, a cursor, named in phase 4 |
 | `claudesurf_act` | `navigate` | `url`, `name`, `description` |
 | | `click` | `ref`, `trusted` |
 | | `type` | `ref`, `text` |
@@ -94,21 +94,23 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
 - **The domain allowlist is the only gate, it lives entirely in the daemon, and it gates document navigation to `http` and `https` hosts.**
   - Classifying a control as destructive from its label misses "Yes, I'm sure" and unlabelled trash icons while firing on every "Submit" and "Confirm". A gate that misfires often enough to be dismissed reflexively is worse than none.
   - The daemon receives every action's arguments and is the only component that can see a click's destination, so gating there covers explicit navigation, `fetch`, click-follow, `history`, redirect chains, and targets the page opens itself under one implementation. It also lets `allow_once` live in daemon memory and take effect on the retry.
-  - A `target=_blank` link or a `window.open` call creates a fresh target whose first navigation would otherwise race the gate, so the daemon attaches to new targets paused and releases them only after that navigation clears. Without it an injected page reaches an arbitrary host and the only security mechanism never sees it.
+  - A `target=_blank` link or a `window.open` call creates a fresh target whose first navigation would otherwise race the gate, so the daemon arms the interception on new targets while they are paused during attachment, and their first document request waits at the gate. Without it an injected page reaches an arbitrary host and the only security mechanism never sees it.
   - `navigate` and `fetch` accept `http` and `https` only, since every other scheme is either hostless or a code-execution vector. The identity page's `file://` URL is navigated by the daemon rather than through a gated action.
-  - Six residual risks are accepted rather than mitigated:
+  - Eight residual risks are accepted rather than mitigated:
     1. The agent has to notice an injection reached through an already-allowed domain; the delimiter helps, and the log records it after the fact.
     2. Any allowed domain is an exfiltration channel for content read from another, particularly through page-context fetch.
-    3. The gate covers document navigation, so subresource requests from an allowed page reach arbitrary hosts unrestricted. That is the cheapest exfiltration path, and gating it would mean inspecting every request the browser makes.
+    3. The gate covers top-level document navigation, so subresource and frame-document requests from an allowed page reach arbitrary hosts unrestricted. That is the cheapest exfiltration path, and gating it would mean inspecting every request the browser makes and stopping every embed that an allowed page carries.
     4. The policy file, the log, and the browser profile all live in the same home directory as an agent holding Write and Bash, so a compromised turn can append a domain or truncate the log. Any location in that home has the same exposure.
     5. The `policy` action exists so approval is expressible in the contract; it grants the agent the same write risk 4 (home-directory files are agent-writable) already concedes.
     6. A screenshot renders page-controlled text as pixels, outside any delimiter, on the read tool — so a rule that never prompts for reads waves it through.
+    7. A tab that a session's page opened goes ungated once the session drops it, as when the human closes the session window while the tab is open in another window; a page still running in the tab can navigate it to any host, and that top-level navigation carries the profile's SameSite=Lax cookies, which a subresource request under risk 3 doesn't.
+    8. A page-opened tab whose arming failed runs ungated until it is closed, since the daemon sends the arming commands before it releases the tab and acts on a failure after the tab's first commit.
 
 > [!example]- **Alternatives considered** — a two-tier read and act policy, gating on HTTP method, splitting the gate across both processes (a flat navigable-domain allowlist in the daemon alone)
 > Separate lists for domains allowed to be read and domains allowed to be acted on — would cap the blast radius of research browsing without label classification, at the cost of a second prompt in every session that ends in acting and a policy file that accretes columns. Intercept requests and confirm the first non-GET per domain — defines destructive by a mechanical property the browser already knows, but single-page applications post constantly for autosave, telemetry, and search-as-you-type, so without careful scoping it becomes the reflexively-dismissed prompt this decision rejects. Gate URL-bearing actions in `server.js` and the rest in the daemon — reads the URL closer to the caller, and leaves `allow_once` unable to unblock the retry, since a session-local grant never reaches the file the other gate consults.
 
 - **Secrets are kept out of the record.**
-  - The action log reduces `type` text to a length and a hash, since it carries whatever the agent entered into a login form on a site the human deliberately signed into.
+  - The action log reduces `type` text and the keys of a `press` that types printable characters to a length and a hash, since they carry whatever the agent entered into a login form on a site that the human deliberately signed into.
   - Network capture strips `Cookie`, `Set-Cookie`, `Authorization`, and `Proxy-Authorization` before the buffer, because the same credentials travel on every request the profile makes and the capture is readable through `claudesurf_read`. Response bodies are captured whole, and URLs are recorded verbatim in both the log and the capture — so a token in a body, a magic link, or an OAuth callback is still reachable. Redacting URLs would leave the log unable to answer what the agent did. Whole bodies and verbatim URLs are both accepted as risk 2 (any allowed domain exfiltrates).
 
 - **No tool call blocks waiting on the human, and a challenge reaches her through the desktop.**
@@ -149,18 +151,32 @@ Loaded by both:
 
 One per OS user:
 
-- **`server/daemon.js`** — the command server and action handlers; enforces the domain gate and writes the policy file and the action log.
+- **`server/daemon.js`** — the command server and action handlers; constructs the gate, the policy store, and the action log, and writes one log record per call.
 - **`server/cdp.js`** — protocol client: pipe framing, request correlation, event dispatch, target auto-attach.
 - **`server/browser.js`** — launches Chrome as a child with a pipe, owns the browser lifecycle, the browser record, and orphan reaping.
 - **`server/sessions.js`** — per-session window and target state, labels, and ref sets.
-- **`server/paths.js`** — the socket, profile, and browser-record paths and their overrides.
+- **`server/paths.js`** — the socket, profile, browser-record, policy-file, and action-log paths and their overrides.
 - **`server/policy.js`** — allowlist matching, persisted grants, and session-scoped once-grants.
-- **`server/read.js`** — isolated-world evaluation and read assembly.
+- **`server/read.js`** — assembles `page` reads from `region.js`'s render, handles `since` and paging, and implements `info` and `screenshot`.
 - **`server/snapshot.js`** — control, landmark, and frame-node extraction from the accessibility tree, scope resolution, the omission report.
 - **`server/render.js`** — isolated-world prose extraction and control placement.
-- **`server/diff.js`** — snapshot differencing for `since`.
-- **`server/input.js`** — ref resolution, scroll into view, input dispatch.
+- **`server/diff.js`** — line differencing of rendered markdown for `since` and the change summary.
+- **`server/refs.js`** — ref parsing, resolution, and the staleness rules.
+- **`server/input.js`** — click, type, press, select, and scroll.
+- **`server/keys.js`** — the key grammar that `press` takes, loaded by both processes.
+- **`server/navigation.js`** — `navigate` and `history`.
+- **`server/tabs.js`** — tab listing, opening, switching, and closing.
+- **`server/gate.js`** — navigation interception and the fallback check at document commit.
+- **`server/arming.js`** — the commands that put a tab under the gate.
+- **`server/refusals.js`** — each session's list of refusals.
+- **`server/overlays.js`** — the open dialogs, menus, and messages that a read renders as blocks.
+- **`server/region.js`** — the read's render pipeline, shared by reads and the change summary.
+- **`server/changes.js`** — the change summary and `since`.
+- **`server/respond.js`** — each response's assembly, with the dialog and refusal lines, moved out of `daemon.js`.
 - **`server/settle.js`** — quiescence detection.
+- **`server/requests.js`** — each session tab's in-flight requests, which settle detection reads.
+- **`server/retained.js`** — each tab's retained render.
+- **`server/act-result.js`** — what every acting call ends with: the navigation wait, settling, and the change summary.
 - **`server/challenge.js`** — challenge, login, and two-factor detection.
 - **`server/notify.js`** — desktop notification and urgency hint.
 - **`server/action-log.js`** — the JSONL action log. Named apart from `diagnostics.js` so an import mix-up cannot route credential-bearing action records into the journal.
@@ -170,12 +186,12 @@ The `extension/` directory is deleted. Its session-identity page becomes `server
 
 ### Data model
 
-- **Domain policy** — a newline-delimited list of hosts, per user, outside the repository. Written only by the daemon, so concurrent sessions cannot interleave appends.
+- **Domain policy** — a newline-delimited list of hosts, per user, outside the repository. The daemon is the only process that appends to it, so concurrent sessions cannot interleave appends; the daemon re-reads the file on each change, so the human's hand edits take effect.
 - **Once-grants** — hosts granted by `allow_once`, held in daemon memory keyed by session id and never written, so one session's grant does not widen another's reach.
-- **Action log record** — timestamp, session id, tool, action, arguments with `type` text reduced to a length and hash, resulting URL, and outcome. One JSON object per line.
+- **Action log record** — timestamp, session id, tool, action, arguments, resulting URL, outcome, and the refusals that the response carried. One JSON object per line. In the arguments, `type` text and the keys of a `press` that types printable characters are reduced to a length and hash.
 - **Browser record** — the child browser's process id and start time, persisted beside the socket so a daemon that crashed and restarted can identify and reap the browser it no longer controls. Written at launch, cleared when the daemon observes the browser exit or reaps it, and left in place on daemon shutdown, so a record present at startup means the browser outlived its daemon.
-- **Prior snapshot** — the last read's output per target, held so `since` and the change summary have something to diff against. Capped like the capture buffers, dropped on navigation and on target destruction, since it is the largest thing the daemon retains per session.
-- **Daemon session state** — session id to `{ windowId, workingTargetId, identityTargetId }`, plus a per-target document generation counter that increments on navigation and scopes every ref. Held in memory, and dropped when the session's window closes.
+- **Retained render** — the last render of each tab from a read, a `since` read, or a change summary. It includes the uncut overlay blocks, region, link lists, and hidden section, along with the parameters used to render it. The daemon retains it for `since`, the change summary, and paging reads. It does not retain renders over 500,000 characters, ignores the render once the tab navigates, and drops it with the tab, since it is the largest thing the daemon retains per session.
+- **Daemon session state** — session id to `{ windowId, workingTargetId, identityTargetId }`, the session's tab numbers, the tabs that it worked in before the current one, and the refusals that the gate has not yet reported, plus a per-target document generation counter that increments on navigation and scopes every ref. Held in memory, and dropped when the session's working tab is gone and none of its tabs remains in its window. The next tab number survives the drop, as the label does.
 - **Session label** — session id to `{ name, description }`, held separately so a closed window can be recreated under the name it had. Kept for the daemon's lifetime, since a label is a few dozen bytes and losing it would make a recreated window anonymous.
 
 ### Key flows
@@ -184,15 +200,16 @@ The `extension/` directory is deleted. Its session-identity page becomes `server
 
 **Read.** `claudesurf_read` reaches the daemon, which:
 
-1. Pulls the accessibility tree for the session's working target and for each child frame inside the scope it renders, eight frames over three nesting levels at most.
+1. Pulls the accessibility tree for the session's working target and for each child frame inside what it renders, overlay blocks included, eight frames over three nesting levels at most.
 2. Reads each tree for controls, landmarks, named groups, and frame nodes alone; the render skips hidden elements and is scoped by the first of the `main` landmark, an `article` node, Readability's article, and the whole body, unless asked otherwise.
 3. Renders prose through Turndown in an isolated world over the page's DOM, with Readability ahead of it when no landmark scopes the page or the caller asks for the article.
 4. Places controls into that prose by `backendDOMNodeId`.
-5. Returns interleaved markdown with frame boundaries marked, and counts for everything omitted.
+5. Renders each open dialog of the page's own document as a block of its own, cut from the prose. It renders each open menu or message outside the scope the same way when the scope is chosen from the tree or from a ref whose region lies in the page's own document.
+6. Returns the blocks and then the interleaved markdown, with frame boundaries marked, and counts for everything omitted.
 
 `server.js` then wraps the payload in the nonce delimiter and hands it to the caller.
 
-**Navigation under policy.** The daemon checks every route to a new document against persisted hosts and session once-grants: `navigate` and `fetch` before dispatch; click-follow, `history`, and redirect chains by intercepting the navigation and cancelling it, leaving the originating page loaded; and a page-opened target by attaching to it paused and releasing it only once its first navigation clears. An unlisted host returns `needs_confirmation`. The agent asks in chat and then issues `policy` with `allow_once` or `allow_always` before retrying; only `allow_always` reaches the file.
+**Navigation under policy.** The daemon gates a session's working tab and the tabs that its pages opened, but not its identity tab. It checks every route to a new top-level document in those tabs against persisted hosts and session once-grants, and checks `fetch`'s URL the same way: `navigate`, `history`, `tabs new`, and `fetch` before dispatch; click-follow, page script, and redirect chains by intercepting each document request and aborting it, leaving the originating page loaded; and a page-opened target by holding its first document request until it clears. A page that commits without a request seen by the interception (a back-forward cache restore) is caught at commit and sent to `about:blank`, or its tab is closed if the tab is still new. When an action caused a navigation to an unlisted host, the action returns `needs_confirmation`; otherwise the next call carries a `Blocked by the page:` line. The agent asks in chat and then issues `policy` with `allow_once` or `allow_always` before retrying; only `allow_always` reaches the file.
 
 ### Cross-cutting concerns
 
@@ -225,9 +242,13 @@ The second OS user is the case this serves, and the identical-shape requirement 
 
 **Concurrency and the time budget.** Every Claude Code session for one OS user multiplexes over a single pipe into a single browser process, and the daemon runs one command at a time per target while interleaving across targets. A CDP response arrives as one message, so a large payload cannot be streamed — a whole accessibility tree fits one message at the sizes measured (2 MB for 5,000 nodes), with narrowing over partial subtrees as the fallback if a page outgrows it. A screenshot cannot be narrowed that way, since it is one response of whatever size the page dictates. Full-page capture is therefore split into a capped number of viewport-sized segments; `max_chars` bounds text and does nothing for an image block. The budget is tightest at cold start, where a browser launch, handshake, and navigation all land inside a single tool call against `server.js`'s 35-second request timeout. Once settle detection exists it shares that window too, taking its timeout from what remains after the launch.
 
-**Diagnostics.** This project deletes a substantial `[debug]` instrumentation layer — focus-probe logging, bind-reason logging, extension-side window logging — while moving onto a protocol whose failures are opaque. The action log is a product feature rather than a diagnostic, so the daemon carries its own leveled logging to the journal: protocol commands and errors at debug, browser lifecycle and gate decisions at info.
+**Diagnostics.** This project deletes a substantial `[debug]` instrumentation layer — focus-probe logging, bind-reason logging, extension-side window logging — while moving onto a protocol whose failures are opaque. The action log is a product feature rather than a diagnostic, so the daemon carries its own leveled logging to the journal:
 
-**Session state accumulation.** MCP stdio gives no session-end signal, so the daemon learns nothing when a `claude` run exits. Window and target state is dropped when its window closes, and all of it at once on pipe EOF: the daemon watches target destruction. Closing a window is therefore how the human retires a session. Session labels are exempt, so a session whose window the human closed comes back under its own name.
+1. Debug logs record protocol commands, continued requests, and repeat refusals.
+2. Info logs record events such as browser lifecycle events, a host's first refusal on a tab in a minute, and a renderer exception.
+3. Warn logs record failures that the daemon works around, such as an unparseable allowlist line or a failed log write.
+
+**Session state accumulation.** MCP stdio gives no session-end signal, so the daemon learns nothing when a `claude` run exits. Window and target state is dropped when its window closes, and all of it at once on pipe EOF: the daemon watches target destruction. Closing a window is therefore how the human retires a session; a session working in a popup outside its window is retired when that popup closes as well. Session labels are exempt, so a session whose window the human closed comes back under its own name.
 
 **Testing.** Tests move to `node:test` behind an `npm test` script, replacing today's hand-run scripts.
 
@@ -262,14 +283,14 @@ Beyond those, the CDP client, tree pruning, and settle detection need a recorded
 9. Both processes carry leveled diagnostic logging — journal from the daemon, stderr from the bridge — in a module named apart from the action log.
 10. Each Claude Code session owns a dedicated Chrome window, created on first use and reused across MCP reconnects.
 11. Each session window carries an identity tab showing the session name, distinguished from the working tab by recorded target id rather than by pinning.
-12. Actions target the session's working tab; if the human closes it, a fresh one is created on demand.
-13. Session window and target state is dropped when its window closes, and all of it on pipe EOF. The session label survives, so a recreated window keeps its name.
+12. Actions target the session's working tab; when it closes, the most recent earlier working tab that is still open and still belongs to the session takes its place, and a fresh one is created on demand when there is none.
+13. Session window and target state is dropped when its working tab is gone and none of its tabs remains in its window, and all of it on pipe EOF. The session label survives, so a recreated window keeps its name.
 14. Reads combine the accessibility tree for controls and structure with a Turndown pass run in an isolated world, Readability ahead of it when no landmark scopes the page or on request.
 15. Reads follow attached out-of-process iframe targets, marking frame boundaries in the output.
 16. Read output is interleaved markdown with inline refs.
 17. A ref is a `backendDOMNodeId` scoped to its target and document generation (a cross-site frame being its own target, with prefixed refs; a same-process frame sharing the page's); a ref used after that document changed returns `stale_ref`, and a ref that is wrong within the same document — never read, or since removed — returns `error`.
 18. Reads return visible elements only by default, report the skipped count, and take a `hidden` parameter to include them.
-19. Reads strip to the main content region by default, report what was dropped, and take a parameter to include it.
+19. Reads strip to the main content region by default, report what was dropped, and take a parameter to include it. Ahead of the region they render any open dialog of the page's own document, wherever it sits. They also render any open menu, alert, or status message outside the scope when the scope is chosen from the tree (`main` or an `article` node) or from a ref whose region lies in the page's own document.
 20. Repeated links are deduplicated.
 21. Find, scope, article extraction, and link presentation are parameters of the read action rather than separate actions.
 22. A `since` parameter returns what changed after an action.
@@ -291,10 +312,10 @@ Beyond those, the CDP client, tree pruning, and settle detection need a recorded
 38. A `needs_human` result fires a `notify-send` notification and best-effort sets an `xdotool` urgency hint; a missing binary is logged and skipped.
 39. A daemon that starts and finds a persisted browser record from a previous run notifies through the same desktop channel as the `needs_human` handoff, since that record is the only evidence that a restart took live session windows with it.
 40. Every action is logged to a JSONL file, with typed text reduced to a length and hash.
-41. A flat allowlist in the daemon gates every route to a new document by host.
+41. A flat allowlist in the daemon gates, by host, every route to a new top-level document in a session's working and page-opened tabs.
 42. `navigate` and `fetch` accept `http` and `https` URLs only; `navigate` enforces this from the phase that ships it, ahead of the allowlist.
 43. An unlisted host returns `needs_confirmation`; the agent issues `policy` with `allow_once`, scoped to that session, or `allow_always`, which is persisted for all.
-44. Network and console capture run continuously into capped ring buffers, read with `since`. Capture retains response bodies and strips credential headers.
+44. Network and console capture run continuously into capped ring buffers, read from a cursor. Capture retains response bodies and strips credential headers.
 45. A page-context fetch performs an authenticated request with the browser's cookies, subject to the allowlist.
 46. The MCP surface is two tools, `claudesurf_read` and `claudesurf_act`, each taking an action plus arguments and carrying a compact verb index in its description.
 47. A malformed call returns `schema_error` carrying the schema for the action named.
@@ -394,9 +415,9 @@ Phase 1's flat walk is replaced as the read's source and kept for the hidden lis
 
 ---
 
-### Phase 3 — Acting (16%)
+### Phase 3 — Acting (20%)
 
-The daemon gates every route to a new document by host, ships the `policy` action so approval is expressible, and logs every action with typed text redacted. Typing, key presses, option select, history, and tab control arrive. Actions wait for the page to settle before returning and report what changed, and `since` returns a delta.
+The daemon gates by host every route to a new top-level document in a session's working tab and the tabs that its pages opened, ships the `policy` action so approval is expressible, and logs every action with typed text redacted. The identity tab stays outside the gate. Typing, key presses, option select, history, and tab control arrive. Actions wait for the page to settle before returning and report what changed, and `since` returns a delta. Reads render open dialogs, and open menus and messages outside their scope, as blocks ahead of the region.
 
 After this phase the agent has every action except capture and the challenge handoff, so a Cloudflare wall still reads as an ordinary page.
 
@@ -404,12 +425,35 @@ After this phase the agent has every action except capture and the challenge han
 - **The gate lands with the input actions rather than after them**, so the agent never holds the full action set ungated. Clicking has been available since phase 1, so this is not the first ungated acting — it is the point past which everything else arrives gated.
 
 **Key files:**
-- `server/policy.js` (new — matching, persisted grants, session once-grants), `server/action-log.js` (new — JSONL log)
-- `server/settle.js` (new — quiescence detection), `server/diff.js` (new — snapshot differencing)
-- `server/input.js` (modified — typing, key presses, option select)
-- `server/daemon.js` (modified — gate enforcement, navigation interception, action handlers, settle before return)
-- `server/dispatch.js` (modified — new actions, the `since` parameter)
-- `test/policy.test.js`, `test/input.test.js`, `test/settle.test.js`, `test/diff.test.js` (new)
+1. `server/policy.js` (new — matching, persisted grants, and session once-grants)
+2. `server/gate.js` (new — navigation interception, the fallback check at document commit)
+3. `server/arming.js` (new — arming and disarming a tab)
+4. `server/refusals.js` (new — the refusal list)
+5. `server/overlays.js` (new — overlay blocks)
+6. `server/region.js` (new — the render pipeline, moved out of `read.js`)
+7. `server/respond.js` (new — the response assembly, moved out of `daemon.js`)
+8. `server/tab-records.js` (new — the session's tab records)
+9. `server/frames.js` (new — whether a frame is still there)
+10. `server/changes.js` (new — the change summary and `since`)
+11. `server/action-log.js` (new — JSONL log)
+12. `server/settle.js` (new — quiescence detection)
+13. `server/requests.js` (new — in-flight requests per tab)
+14. `server/retained.js` (new — retained renders)
+15. `server/diff.js` (new — line differencing)
+16. `server/act-result.js` (new — what every acting call ends with: the navigation wait, settling, and the change summary)
+17. `server/input.js` (modified — typing, key presses, and option select; `navigate` and ref resolution move out)
+18. `server/keys.js` (new — the key grammar)
+19. `server/refs.js` (new — ref resolution)
+20. `server/navigation.js` (new — `navigate`, `history`)
+21. `server/tabs.js` (new — tab control)
+22. `server/page/settle.js`, `server/page/edit.js`, and `server/page/select.js` (new — the page scripts for settling, typing, and option select)
+23. `server/snapshot.js`, `server/render.js`, and `server/page/render.js` (modified — overlays, option refs, and a combobox or listbox scope root)
+24. `server/sessions.js` (modified — interception armed at attachment, calls into `tab-records.js`, and the lifecycle of in-flight requests and retained renders)
+25. `server/read.js` (modified — the read's assembly, `since`, and paging from the retained render; the render pipeline moves to `region.js`)
+26. `server/daemon.js` (modified — gate and log wiring, action handlers; the response assembly moves to `respond.js`)
+27. `server/dispatch.js` (modified — new actions, the `since` parameter)
+28. `test/policy.test.js`, `test/gate.test.js`, `test/overlays.test.js`, `test/changes.test.js`, `test/respond.test.js`, `test/refusals.test.js`, `test/action-log.test.js`, `test/settle.test.js`, `test/diff.test.js`, `test/keys.test.js`, `test/tabs.test.js`, `test/navigation.test.js`, `test/live/gate.test.js`, `test/live/act.test.js`, and `test/live/settle.test.js` (new)
+29. `test/input.test.js` (modified)
 
 **Open questions:**
 
@@ -450,6 +494,9 @@ Challenges, login walls, and two-factor prompts are detected, returned as `needs
 3. How are repeated detections on one page rate-limited so the notification channel stays credible?
 4. What buffer cap balances usefulness against memory held for an instrumented target?
 5. How does a page-context fetch reach a cross-origin URL — a target on that origin first, or through the protocol directly?
+6. The gate stops the human's own navigation in a session tab as it stops the page's. How does a handoff proceed when clearing a login wall takes her through a sign-in host that the list does not name?
+7. What buffer sizes does capture pass to `Network.enable`, which the acting phase sends to every session tab with both buffers at zero for settle detection?
+8. What do `console` and `network` call their cursor, given that `page`'s `since` is a boolean and one tool's schema carries one type per argument name?
 
 ---
 
@@ -460,8 +507,8 @@ Challenges, login walls, and two-factor prompts are detected, returned as `needs
 | HLD | 10 |
 | 1. Foundation | 27 |
 | 2. Structured reads | 18 |
-| 3. Acting | 16 |
+| 3. Acting | 20 |
 | 4. Handoff and capture | 8 |
 | Wrap-up | 5 |
-| Unexpected | 16 |
+| Unexpected | 12 |
 | **Total** | **100** |
