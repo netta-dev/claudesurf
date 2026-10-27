@@ -10,3 +10,4 @@ node_modules/
 # /engineer worktree isolation
 .claude/worktrees/
 .eng-provisioned
+/local
