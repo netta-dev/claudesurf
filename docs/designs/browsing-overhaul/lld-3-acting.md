@@ -21,7 +21,7 @@ The agent gains the remaining actions — `type`, `press`, `select`, `history`, 
 > 1. A prefetched or prerendered activation needs HTTPS and a cross-site speculation rule.
 > 2. Input into an out-of-process frame in a headful window.
 > 3. A tab opened from inside a cross-site frame.
-> 4. Whether the service-worker bypass, which answers only after a held tab's first commit, covers that tab's first navigation; live gate test 25.4's new-tab case checks it.
+> 4. Whether the service-worker bypass, which answers only after a held tab's first commit, covers that tab's first navigation. On Chrome 156 headless it does, and live gate test 25.4's new-tab case checks it.
 >
 > The spike ran the `tabs new` ordering of decision 23's evidence headless only, which the live act test and its headful case cover. This LLD's commit also amends the HLD, the use cases (UC2, UC2a, UC8, UC9, UC10, UC21, and UC26 amended; UC28–UC39 appended), and the future doc to match.
 >
@@ -40,7 +40,7 @@ The agent gains the remaining actions — `type`, `press`, `select`, `history`, 
 > [!example]- **Alternatives considered** — exact match with a `*.` wildcard, registrable-domain matching (a host covers its subdomains) (decision 1)
 > Exact match plus an explicit `*.example.com` form — precise, and the common `example.com` → `www.example.com` redirect stops at the gate until the agent asks a second time. Match on the registrable domain from the public-suffix list — groups `docs.google.com` with `google.com` whichever the list names, and costs a list dependency to refuse the entry `github.io`, which the human approving it can see for herself.
 
-2. **The gate stops routes to a new top-level document in a session's working tab and in the tabs that a session's pages opened; the page a tab already shows is not re-checked.** A read or an action on the current document runs whatever its host, since that document arrived through the gate or through the human. The identity tab and the tabs the human opens herself are outside the gate. A tab she opens from a link in a session tab, with a middle click or Ctrl and a click, has one of the session's pages as its opener, so it is gated, listed by `tabs list`, and open to `tabs switch`. She cannot navigate a gated tab to an unlisted host by hand either: the request is aborted and the tab stays where it was (UC29), so she browses in a tab of her own. The phase-4 handoff, where she may sign in through a provider the list does not name, needs an answer to this, and the HLD's phase-4 open questions carry it.
+2. **The gate stops routes to a new top-level document in a session's working tab, its earlier working tabs, and the tabs that a session's pages opened; the page a tab already shows is not re-checked.** A read or an action on the current document runs whatever its host, since that document arrived through the gate or through the human. The identity tab and the tabs the human opens herself are outside the gate. A tab she opens from a link in a session tab, with a middle click or Ctrl and a click, has one of the session's pages as its opener, so it is gated, listed by `tabs list`, and open to `tabs switch`. She cannot navigate a gated tab to an unlisted host by hand either: the request is aborted and the tab stays where it was (UC29), so she browses in a tab of her own. The phase-4 handoff, where she may sign in through a provider the list does not name, needs an answer to this, and the HLD's phase-4 open questions carry it.
 
 > [!example]- **Alternatives considered** — let the browser's own navigations through (gate every navigation in a session tab) (decision 2)
 > Treat a paused main-frame request as the human's when no `Page.frameRequestedNavigation` preceded it for that frame and the daemon has no `navigate`, `history`, or reload in flight on the target, and let it through — closes UC29 and answers the phase-4 handoff question now, and the gate's allow branch would then rest on an experimental event *not* firing, so any script-started route that skips it becomes a silent bypass; the spike did not map which routes fire it.
@@ -73,7 +73,7 @@ The agent gains the remaining actions — `type`, `press`, `select`, `history`, 
 
 ### The action log
 
-8. **The log is `$XDG_STATE_HOME/claudesurf/actions.jsonl`, `0600` in a `0700` directory and rotated once at 10 MB, with one record per call that reaches the daemon.** A write that fails logs a warning and the call proceeds, since a full disk would otherwise stop every action. Design (the action log) describes each record.
+8. **The log is `$XDG_STATE_HOME/claudesurf/actions.jsonl`, `0600` in a `0700` directory and rotated once the next record would pass 10 MiB, with one record per call that reaches the daemon.** A write that fails logs a warning and the call proceeds, since a full disk would otherwise stop every action. Design (the action log) describes each record.
 
 9. **`type`'s text is recorded as its length and the first 16 hex characters of an HMAC-SHA256. The daemon draws the key at start and keeps it only in memory.** `press`'s keys are recorded verbatim when no press types a printable character, and the same way as `type`'s text otherwise, as for `press "1 2 3 4 5 6"`, which types a one-time code; `Space` types one, while `Enter`, `Tab`, and a chord with Control, Alt, or Meta don't. Design (the action log) describes the recorded fields. URLs are recorded verbatim, as the HLD's secrets decision accepts.
 
@@ -191,7 +191,7 @@ The agent gains the remaining actions — `type`, `press`, `select`, `history`, 
 
 ### Tabs and history
 
-22. **A session's tabs are its working tab, its identity tab, and the tabs its pages opened, each named `t<n>` from a per-session counter that never reuses a number.** A recreated window's tabs take new numbers, so an old number can't name a new tab. Design (tabs) carries the list format.
+22. **A session's tabs are its working tab, its identity tab, its earlier working tabs, and the tabs its pages opened, each named `t<n>` from a per-session counter that never reuses a number.** A recreated window's tabs take new numbers, so an old number can't name a new tab. Design (tabs) carries the list format.
 
 23. **`tabs new` opens a tab from a session tab in the session's window with `window.open('about:blank#<nonce>', '_blank', 'noopener')`, takes the tab whose URL carries the nonce, navigates it through the gate, and makes it the working tab.** Opening the tab brings the window to the front once, as a link that opens a tab does. Design (tabs) describes the opening sequence.
 
@@ -229,11 +229,12 @@ The agent gains the remaining actions — `type`, `press`, `select`, `history`, 
     |---|---|---|
     | A refused URL | `Blocked:` line | `safeUrl`, cut at `URL_MAX` with `…` |
     | A refused host | `Blocked:` line | the URL parser's normalized host |
-    | A tab's title | `tabs list` | `safeText`, cut at `LABEL_MAX`, quoted |
-    | A tab's URL | `tabs list` | `safeUrl`, cut at `URL_MAX` |
-    | The focused element's label | `Keys to:`, `Focus now:` | `safeText`, cut at `LABEL_MAX`, quoted |
+    | A tab's title | `tabs list` | `cappedText` (cut at `LABEL_MAX`, then escaped), quoted |
+    | A tab's URL | `tabs list` | `safeUrl`, cut at `URL_MAX` with `…` |
+    | The focused element's label | `Keys to:`, `Focus now:` | `cappedText` (cut at `LABEL_MAX`, then escaped), quoted |
     | The focused element's tag | `Keys to:`, `Focus now:` | lowercased node name, `[a-z0-9-]` only, cut at 40 characters |
     | An overlay's accessible name | `Overlays:` line, the overlay block's boundary marker | `snapshot.js`'s cap on a marker name, quoted |
+    | A custom listbox's or combobox's option name | reads and the change summary, as `name [ref]` | `snapshot.js`'s `cappedText` (cut, then escaped) |
     | Rendered lines | the change summary and a `since` region | the renderer's own escaping, plus the line prefix of the change summary's format |
     | A new working tab's URL and title | state lines | `stateLines` |
     | A select option or an input type | error messages | an option is left out; a type is from the browser's fixed set |
@@ -247,7 +248,7 @@ The agent gains the remaining actions — `type`, `press`, `select`, `history`, 
 > [!info]- **Rationale** — one commit for the acting result path (decision 29)
 > Every acting call ends in `finishAction`, which reads the gate's refusals and the settle state, and the HLD requires the gate to land with the input actions, so a commit holding part of the phase would ship acting calls whose results report through a half-built path.
 
-30. **After integration, each user's daemon restarts.** The npm dependencies stay as they are, so `npm ci` isn't needed. Both users' daemons run the code their checkout had at start, and a new bridge against an old daemon answers every new action with `schema_error`; `c` restarts its own unit, and `z`'s restart goes to the human as `systemctl --user restart claudesurf`. The allowlist starts empty, so the agent asks once per host.
+30. **After integration, each user's daemon restarts.** The npm dependencies stay as they are, so `npm ci` isn't needed. Both users' daemons run the code their checkout had at start, apart from the session page, which Chrome loads from the checkout for each session tab, and the page renderer, which the daemon reads at its first render, and a new bridge against an old daemon answers every new action and new argument, such as `since`, with `schema_error`, while a bridge that started before the upgrade refuses them itself, so each Claude Code session restarts too; `c` restarts its own unit, and `z`'s restart goes to the human as `systemctl --user restart claudesurf`. The allowlist starts empty, so the agent asks once per host.
 
 ## Out of scope
 
@@ -296,11 +297,11 @@ sequenceDiagram
 ### The gate
 
 `gate.js` registers `Fetch.requestPaused` and sets itself as the registry's interceptor. Arming a tab sends `Network.enable`, `Network.setBypassServiceWorker` with `bypass: true`, `Page.setPrerenderingAllowed` with `isAllowed: false`, and, with an interceptor present, `Fetch.enable`; live tests that drive `Sessions` directly have no interceptor, so they keep working. The registry calls `arming.js`, which holds the commands, their order, the disarm sequence, and the rule for a rejection (below). A target's `armed` flag is set once every command but the prerendering switch has answered without error. Arming happens in two places:
-1. **At attach**, when the target's `openerId` names a target in a session; a frame target as the opener counts through its root page. `onAttached` first attributes the tab to that session with the role `opened` and gives it its tab number, then queues the commands ahead of the release without awaiting them. The rejection rule below acts after the claim.
+1. **At attach**, when the target's `openerId` names a target in a session; a frame target as the opener counts through its root page. `onAttached` first attributes the tab to that session with the role `opened` and gives it its tab number, then queues the commands ahead of the release without awaiting them. It wakes the opener's waiters once the commands are queued, and the release goes out even when a step before it throws. The rejection rule below acts after the claim.
 
 > [!question]- **Anticipated questions** — why the release doesn't wait for `Fetch.enable`
 > Queued commands take effect in order, so a queued `Fetch.enable` already gates the first request; waiting for its answer would matter only if the daemon acted on a rejection before the release, and the only action open there is a close. The identity tab and a repaired working tab attach with a session opener too, and their roles aren't known until their claim, after the first commit, so a close before the release would take them as well. The attribution comes first because the tab's first request can be refused, and the tab closed, before the queued commands answer.
-2. **In `repair`**, for the session's working tab when it isn't armed: `repair` sends and awaits the commands. The daemon's `ensureWithNotes` and the tests' `ensure` both run `repair` before they return, so an action never reaches an unarmed working tab, including the one that `createWindow` opens with `Target.createTarget`, which has no opener.
+2. **In `repair`**, for the session's working tab when it isn't armed: `repair` sends and awaits the commands. A working tab whose attach queued its arming is waited for first, until the call's deadline; a wait that runs out answers `the working tab could not be put under the domain gate; call again`. The daemon's `ensureWithNotes` and the tests' `ensure` both run `repair` before they return, so an action never reaches an unarmed working tab, including the one that `createWindow` opens with `Target.createTarget`, which has no opener.
 
 A tab the human opened herself stays unarmed. The identity tab, opened from the working tab, is armed and passes every request. A tab can lose its session in three ways:
 1. `disown` leaves it open before a window is recreated;
@@ -348,7 +349,7 @@ The handler finds the target by protocol session and its session by the target's
 2. its URL is not `http` or `https`;
 3. its `frameId` is not the target's main frame, as for a child frame's document request (decision 7). The main frame's id is the one the registry recorded at the first commit, or the target id before then, the fallback that the registry's `frameKey` already uses, so a new tab's first request counts as its main frame's.
 
-The handler checks the host of every other request, each redirect hop included, against the list and the session's `allow_once` grants. It records a refused one on the session before it sends `Fetch.failRequest` with `Aborted`, so a `Page.navigate` answering `net::ERR_ABORTED` finds the refusal already there. It answers on every path: an exception inside it fails the request for a gated target and continues it for any other.
+The handler checks the host of every other request, each redirect hop included, against the list and the session's `allow_once` grants. It records a refused one on the session before it sends `Fetch.failRequest` with `Aborted`, so a `Page.navigate` answering `net::ERR_ABORTED` finds the refusal already there. A refused request of a tab the daemon is already closing fails without an entry or a second close. It answers on every path: an exception inside it fails the request for a gated target and continues it for any other.
 
 A tab that the registry attributed by its opener counts as new until it commits an `http` or `https` document or becomes the working tab. The gate closes a new tab on a refusal; a refusal after the tab committed a web page leaves it on its page. The registry records the commit on the target from `onFrameNavigated` and from the attach handler's frame-tree read, made when `Page.enable` answers. A paused tab's first commit can come before `Page.enable` answers, without a `Page.frameNavigated`, so that read now runs for every page target attributed by opener; it already runs for any page target attached without a URL. A refusal in the round trip before the read answers, or after a `Page.enable` that timed out, closes a tab that holds an allowed page (risk 22). While a tab counts as new, three kinds of request can arrive:
 1. its first request;
@@ -400,7 +401,7 @@ A `navigate` whose `Page.navigate` answers `net::ERR_ABORTED` looks for a refusa
 
 ### The policy store
 
-`policy.js` normalizes every host, from the file, from `policy`, or from a URL, with the WHATWG URL parser (`new URL('http://' + text).hostname`), which lowercases and punycodes it; `normalizeHost` then drops a trailing dot, which the parser keeps. An entry that is not a bare host after normalization — one carrying a scheme, userinfo, a path, a port, a wildcard, or whitespace — is refused by `policy` and skipped with a warning when read from the file. A single-label host other than `localhost` is refused the same way, so `policy` can't allow a whole top-level domain. Bracketed IPv6 and dotted IPv4 addresses match themselves alone; any other entry matches itself and every host ending in `.` plus the entry. The policy store follows these rules:
+`policy.js` normalizes every host, from the file, from `policy`, or from a URL, with the WHATWG URL parser (`new URL('http://' + text).hostname`), which lowercases and punycodes it; `normalizeHost` then drops a trailing dot, which the parser keeps. An entry that is not a bare host as written — one carrying a scheme, userinfo, a path, a port, a wildcard, or whitespace — is refused by `policy` and skipped with a warning when read from the file. The check reads the text before parsing, since the parser drops a default port, takes `https://example.com` as the host `https`, and keeps `*` in a host. A single-label host other than `localhost` is refused the same way, so `policy` can't allow a whole top-level domain. Bracketed IPv6 and dotted IPv4 addresses match themselves alone; any other entry matches itself and every host ending in `.` plus the entry. The policy store follows these rules:
 1. **Format**: one host per line; blank lines and lines starting with `#` are skipped, and an unparseable line logs a warning once per read.
 2. **Reads**: every check stats the file. A missing file is an empty list. The store re-reads the file when the stat differs from the last one.
 3. **`allow_always`**: appends the normalized host unless an entry already covers it, preceded by a newline when the file does not end in one. The directory is created `0700` and the file `0600`. `CLAUDESURF_POLICY_FILE` overrides the path. A write that fails, for a read-only home, a full disk, or a directory that can't be created, answers `error` (`the allowlist could not be written: EACCES; nothing was saved`), naming the system error code, and leaves no grant.
@@ -411,13 +412,13 @@ A `navigate` whose `Page.navigate` answers `net::ERR_ABORTED` looks for a refusa
 
 ### The action log
 
-`action-log.js` reduces `type`'s text and a printable `press` to a length and the first 16 hex characters of an HMAC-SHA256 under a key drawn at daemon start and held in memory; `parseKeys` marks each press that types a printable character, and `action-log.js` reads that mark. `action-log.js` appends one record per call that reaches the daemon, after the envelope is built and before the response is sent; the bridge answers its own schema errors and the daemon never sees them. `CLAUDESURF_ACTION_LOG` overrides the path. At 10 MB the file is renamed to `actions.jsonl.1`, replacing an earlier one, and a new file starts. Each record has this form:
+`action-log.js` reduces `type`'s text and a printable `press` to a length and the first 16 hex characters of an HMAC-SHA256 under a key drawn at daemon start and held in memory; `parseKeys` marks each press that types a printable character, and `action-log.js` reads that mark. `action-log.js` appends one record per call that reaches the daemon, after the envelope is built and before the response is sent; the bridge answers its own schema errors and the daemon never sees them. `CLAUDESURF_ACTION_LOG` overrides the path. At 10 MiB the file is renamed to `actions.jsonl.1`, replacing an earlier one, and a new file starts. Each record has this form:
 
 ```json
 {"ts":"2026-09-23T14:02:11.482Z","session":"4f2c9a1e-…","tool":"claudesurf_act","action":"type","args":{"ref":"e42","text":{"length":12,"hmac":"9b1f0c3a7d2e4b60"}},"url":"https://app.example/login","outcome":"needs_confirmation","blocked":[{"own":true,"tab":"t3","kind":"navigation","how":"stopped","host":"evil.example","url":"https://evil.example/x","count":1}]}
 ```
 
-`url` is the working tab's URL after the call as the registry holds it, and `onSameDocument` now updates a page target's URL from `Page.navigatedWithinDocument`, so a pushState is reflected. `respond` and `failureEnvelope` read `url` inside the handler's queue slot, before a later call can switch tabs, and return it with the envelope. For a call that never reached a slot, `daemon.js` reads it from the registry through `sessions.peek` as it writes the record; `get` creates a session for an unknown id, and `peek` doesn't. `url` is left out when the session lacks a working tab, as after the `Tab:` path.
+`url` is the working tab's URL after the call as the registry holds it, and `onSameDocument` now updates a page target's URL from `Page.navigatedWithinDocument`, so a pushState is reflected; it counts a same-document landing for the target's own main frame alone, and ignores a child frame's event on the page's session. `respond` and `failureEnvelope` read `url` inside the handler's queue slot, before a later call can switch tabs, and return it with the envelope. For a call that never reached a slot, `daemon.js` reads it from the registry through `sessions.peek` as it writes the record; `get` creates a session for an unknown id, and `peek` doesn't. `url` is left out when the session lacks a working tab, as after the `Tab:` path.
 
 `blocked` lists the refusals the response carried, each with `own` (true for a `Blocked:` entry the call led to, false for a `Blocked by the page:` one), the tab, `kind`, `how`, the host, the URL, and the merged `count`, and is left out when the response carried none.
 
@@ -432,25 +433,37 @@ Frame targets keep phase 2's URL, so a frame's marker doesn't follow an embed th
 ### Settling
 
 `settle(sessions, t, { from, budget, deadline, frame })` combines three signals:
-1. **Network**: `requests.js` keeps the in-flight requests of each target with `Network` enabled, from `Network.requestWillBeSent` to `loadingFinished` or `loadingFailed`. Arming (Design, the gate) sends `Network.enable` with or without an interceptor, since the domain only listens, and with `maxTotalBufferSize` and `maxResourceBufferSize` both 0, which Chrome accepts while still sending every event. Requests of the types `Document`, `Script`, `Stylesheet`, `XHR`, and `Fetch` count; a counted request in flight for more than 5 s stops counting, so a long poll holds settling for at most that long. The store is capped at 1,000 entries per target, oldest out. A same-process frame's requests arrive on the page's session and count; an out-of-process frame's don't, since `Network` is off on frame targets.
+1. **Network**: `requests.js` keeps the in-flight requests of each target with `Network` enabled, from `Network.requestWillBeSent` to `loadingFinished` or `loadingFailed`. Arming (Design, the gate) sends `Network.enable` with or without an interceptor, since the domain only listens, and with `maxTotalBufferSize` and `maxResourceBufferSize` both 0, which Chrome accepts while still sending every event. Requests of the types `Document`, `Script`, `Stylesheet`, `XHR`, and `Fetch` count; a counted request in flight for more than 5 s stops counting, so a long poll holds settling for at most that long, unless the acting call started it: a request whose first `Network.requestWillBeSent` arrived after `beforeAction` counts until it ends, its redirect hops included, while a request that started before the action stays under the cut through its hops, each hop restarting its 5 s, so an action's own slow request holds settling to the end of the budget. A read applies the 5 s cut to every request. The store is capped at 1,000 entries per target, oldest out. A same-process frame's requests arrive on the page's session and count. An out-of-process frame's document request arrives there too and counts until the frame's target attaches, since Chrome sends its `loadingFinished` to that target; the frame's other requests don't count, since `Network` is off on frame targets. A main-frame commit drops the old document's requests, whose ends Chrome doesn't report, and keeps those of the new document's loader.
 2. **DOM**:
     1. **The page observer**: `claudesurfSettle` installs a `MutationObserver`[^settle-script-file] on the document in the main frame's isolated world on first call, watching `childList` and `characterData` over the whole subtree, and returns `{ installedAt, lastMutationAt, readyState }` in `Date.now()` milliseconds. Attribute changes are left out, so an animation that restyles every frame doesn't hold settling. The observer also watches every open shadow root in the document at installation and each one that an added subtree carries, since the renderer flattens open shadow roots into the markdown and a web component's content fills in there. The observer lasts as long as the world, which is one document, so later calls answer from it at once.
-    2. **The frame observer**: the observer also runs in a child frame's world when the action touched that frame — when the action's element sits there, named by an `f`-ref or by a bare ref that the ref set records in a same-process frame, or, for `press`, when the frame's `<iframe>` held focus as the keys went. That document has to be quiet too, so typing into a cross-site payment or sign-in field waits for the frame's own re-render.
+    2. **The frame observer**: the observer also runs in a child frame's world when the action touched that frame — when the action's element sits there, named by an `f`-ref or by a bare ref that the ref set records in a same-process frame, or, for `press`, when the frame's `<iframe>` or `<frame>` held focus as the keys went. That document has to be quiet too, so typing into a cross-site payment or sign-in field waits for the frame's own re-render.
     3. **A failing frame probe**: when a frame's probe fails, `settle.js` asks `frameThere`[^frames-file] whether the frame is still there, as `region.js` does, and counts the frame as there when `frameThere` itself fails. A same-process frame whose id now names a registered frame target has moved to a process of its own, as a checkout frame does when it navigates to a cross-site 3-D Secure page, so `frameThere` answers that it went. A frame that went — a sign-in frame that removes itself after a submit, or one that moved — drops its signal, and settling continues on the page. A frame still there counts as busy. `frameThere` takes the probes' deadline, the end of the settle budget, so against a wedged renderer it too ends at the budget, and settling doesn't wait past it. A call that runs out on that frame names it from what the call already holds:
         1. the action's own ref, as in `Settled: no — after 5.0 s, the frame holding f1e42 did not answer`;
         2. for `press`, the frame's ref that `Keys to:` printed, as in `… the frame e40 did not answer`;
         3. `… a frame did not answer` when `Keys to:` printed none.
-    4. **Errors and deadlines**: a closed pipe and the working tab's `TargetGoneError` propagate out of `settle.js`. Every probe, the page's and a frame's, takes the end of the settle budget as its deadline, so a probe left unanswered ends at the budget and leaves the summary its 3 s.
+    4. **Errors and deadlines**: a closed pipe and the working tab's `TargetGoneError` propagate out of `settle.js`. Every probe, the page's and a frame's, takes the end of the settle budget as its deadline, extended to at least 50 ms after it is sent and capped at the request deadline, so a probe left unanswered ends near the budget and leaves the summary its 3 s.
 3. **The rule**: settled when no counted request is in flight, `readyState` is past `loading`, and 500 ms have passed since the latest of `from`, the last counted request event, the last mutation, and the observer's installation. The rule takes `readyState` past `loading` rather than `complete`, since `complete` waits on the images, frames, and fonts that the network signal ignores. A read doesn't pass `from`, so a read of a quiet page whose observer is running settles at once, and the first read of a document waits out the 500 ms after the observer's installation. The loop re-checks every 100 ms and on every counted event.
 
-**The navigation wait.** `finishAction` treats a navigation as started when the target's cross-document navigation counter moves at any point before settling ends. It then waits for the new document's commit and `Page.domContentEventFired`, which `sessions.js` now counts, for up to 10 s, and settles in that document. `navigate` waits the same way for up to 25 s. A refusal of the working tab's own navigation ends the wait, since `Page.frameStartedNavigating` moves the counter before the gate sees the request and a refused navigation commits nothing. A download ends it too, as phase 1's click wait did, since a denied download commits nothing either (UC19a). A refusal on another tab, a new tab's included, leaves the wait and settling to run their course. `Navigated:` reads:
-1. `yes` when the generation moved and the new document's `DOMContentLoaded` fired;
-2. `no` when nothing started, or the navigation was refused or was a download;
-3. `started (the new page has not finished loading)` when a navigation started, passed the gate, and the wait ran out.
+**The navigation wait.** `finishAction` treats a navigation as started when the target's cross-document navigation counter moves at any point before settling ends. It then waits up to 10 s, and `navigate` up to 25 s, and settles in the document it reaches. A wait ends at the first of these:
+1. The tab's current document is newer than the wait's start and has fired its own `Page.domContentEventFired`; `sessions.js` records, per target, the generation whose own `DOMContentLoaded` fired.
+2. The tab's latest navigation, started since the wait's start, has stopped without a commit. Chrome fails the navigation's document request with `net::ERR_ABORTED` under the loader id that `Page.frameStartedNavigating` carried, and `sessions.js` records `navigations` then as `navigationsStopped` while that navigation is the main frame's latest and uncommitted. Chrome does so when the gate refuses the request, since `Page.frameStartedNavigating` moves the counter before the gate sees it; for a 204 or 205 answer; for a `window.stop()`; for a URL handed to another application; and for a document that turns into a download (UC19a). A network error fails that request too, before Chrome commits its error page under the same id, so only `ERR_ABORTED` counts. Neither the gate nor `Page.downloadWillBegin` moves the counters: a same-origin `<a download>` link's request pauses at the gate as the main frame's document request without a navigation, and an `<a download>` link or a blob URL fires `Page.downloadWillBegin` without one.
+3. The wait's timeout.
 
-A back-forward cache restore fires neither `DOMContentLoaded` nor `load`, so `sessions.js` counts its `frameNavigated` as both.
+A stop of an earlier navigation, after a newer one started, leaves the wait running for the newer one, and a refusal on another tab, a new tab's included, leaves the wait and settling to run their course. Each later wait starts from the tab's state as the wait before it ended. A wait covers the navigations started by the commit of the document it saw load, or by its own end when none loaded, so one that starts in the events that end a wait, the handler's own wait included, gets a wait of its own. `Navigated:` is judged once, from the tab's state as the head is built. A navigation is under way when it started after both the call's start and the current document's commit, and Chrome hasn't dropped it since.
 
-**The budget.** Settling runs for up to 5 s in an acting call, cut so that 3 s of the request deadline remain for the change summary, and up to 2 s in a read. A call that runs out returns `unsettled` with its full result and a head line naming what was still busy: `Settled: no — after 5.0 s, 2 requests in flight`, `… the document is still changing`, or `… the page has not finished loading` (UC31). When several hold, the line names each, joined by commas, in the order loading, requests, the document, and a frame. A `navigate` whose wait runs out returns `unsettled` with the new document's state lines when the generation moved, since the document is committed and readable, and `error` as before when nothing committed. Tests set `CLAUDESURF_SETTLE_QUIET_MS` to shorten the 500 ms window, as they set `CLAUDESURF_REQUEST_TIMEOUT_MS` today; `settle.js` reads it on each call, so `test/helpers.js`'s `fakeSession` sets it to 20 for the in-process tests (Files, `test/helpers.js`), and `spawnDaemon` sets it for the daemon.
+| Current document against the call's start | Its own `DOMContentLoaded` | A navigation under way | `Navigated:` |
+|---|---|---|---|
+| newer | fired | no | `yes` |
+| newer | fired | yes | `started (the new page has not finished loading)` |
+| newer | not fired | either | `started (…)` |
+| the same | — | yes | `started (…)` |
+| the same | — | no: nothing started, or every navigation was refused, a download, or dropped | `no` |
+
+So a document that commits or loads during settling, after its wait ended or ran out, reads `yes`, and a navigation refused or dropped during settling reads `no`.
+
+A back-forward cache restore fires neither `DOMContentLoaded` nor `load`, so `sessions.js` counts its `frameNavigated` as a load and records its generation as loaded.
+
+**The budget.** Settling runs for up to 5 s in an acting call, cut so that 3 s of the request deadline remain for the change summary, and up to 2 s in a read. A call that runs out returns `unsettled` with its full result and a head line naming what was still busy: `Settled: no — after 5.0 s, 2 requests in flight`, `… the document is still changing`, `… a request just finished` when only the quiet window after a request's end held it, or `… the page has not finished loading` (UC31). When several hold, the line names each, joined by commas, in the order loading, requests, the document, and a frame. A `navigate` whose wait runs out returns `unsettled` with the new document's state lines when the generation moved, since the document is committed and readable, and `error` as before when nothing committed. Tests set `CLAUDESURF_SETTLE_QUIET_MS` to shorten the 500 ms window, as they set `CLAUDESURF_REQUEST_TIMEOUT_MS` today; `settle.js` reads it on each call, so `test/helpers.js`'s `fakeSession` sets it to 20 for the in-process tests (Files, `test/helpers.js`), and `spawnDaemon` sets it for the daemon.
 
 ### Retained renders
 
@@ -461,7 +474,7 @@ A back-forward cache restore fires neither `DOMContentLoaded` nor `load`, so `se
 4. the time the render began, taken before the tree pull, so a mutation during the render counts as one after it;
 5. the generation.
 
-A paging read reassembles the blocks, the region, the links index, and the hidden section from those pieces and slices the result, and reads the state lines fresh. A read, a `since` read, and a change summary each replace it. A render over 500,000 characters is not kept; the tab keeps a marker saying so for that generation, so a summary or `since` reports the size rather than a missing read. A retained render is ignored once the target's generation moves and is dropped with the target, the window, and the pipe, as ref sets are.
+A paging read reassembles the blocks, the region, the links index, and the hidden section from those pieces and slices the result, and reads the state lines fresh. A read, a `since` read, and a change summary each replace it. A render over 500,000 characters, its link lists' URLs and refs counted, is not kept; the tab keeps a marker saying so for that generation, so a summary or `since` reports the size rather than a missing read. A retained render is ignored once the target's generation moves and is dropped with the target, the window, and the pipe, as ref sets are.
 
 A read with `offset` greater than 0 whose parameters match the retained render of the same document slices it instead of rendering again, without a settle wait. The retained render records its source — `read`, `since`, or `summary` — which `renderRegion` takes as an argument and passes to `keep`; `renderChanges` passes `since` or `summary`. When the source wasn't a plain read, or the settle observer saw a mutation after the render, the head carries a `Paged:` line naming the source:
 1. `Paged: from the render the last action made 40 s ago`;
@@ -481,13 +494,13 @@ A call that moved to a new document prints `Navigated: yes` or `started (…)`, 
 1. **Untracked**: `renderChanges` answers `untracked`, and the summary prints `Changed: not tracked (…)` with the reason, in four cases. Cases 1 and 4, and a size marker already in place, show before rendering; a crossed size cap and a lost scope ref show in the re-render below:
     1. no retained render of this document — `read the page first`;
     2. the size marker, or a render that crosses the size cap and leaves the marker in place of the render — `the page is too large to keep`;
-    3. a scope ref of the retained render that no longer resolves, which drops the retained render — `the scope e42 is gone; read the page again`. A ref root that goes between the tree pull and the render counts as gone too. The page script renders the body in its place and reports `lostRoot` in its result; under `since` or `summary`, `region.js` then throws `scopeUnit`'s `e42 is not in this document any more` error instead of comparing that body against the retained subtree. When the lost root is the `main` landmark or `article` node that the `main` scope resolved to, `region.js` throws `DocumentChangedError` under `since` or `summary` instead, and the table maps it;
+    3. a scope ref of the retained render that no longer resolves, which drops the retained render — `the scope e42 is gone; read the page again`. A ref root that goes between the tree pull and the render counts as gone too, unless a commit replaced the document meanwhile: under `since` or `summary`, `region.js` checks the generation after the page's tree pull and before the lost-root check, so a navigation reads as `DocumentChangedError`; a plain read scoped to a ref skips that check, and the ref answers `stale_ref`. The page script renders the body in its place and reports `lostRoot` in its result; under `since` or `summary`, `region.js` then throws `scopeUnit`'s `e42 is not in this document any more` error instead of comparing that body against the retained subtree. When the lost root is the `main` landmark or `article` node that the `main` scope resolved to, `region.js` throws `DocumentChangedError` under `since` or `summary` instead, and the table maps it;
     4. a working tab that the session's last read didn't cover, after a `tabs switch` — `the working tab changed; read the page`. `refs.js` answers that tab's refs with `stale_ref` until a read.
 
     `since` prints the reason as its `Since:` line instead, above a full read (the `since` paragraph below). Otherwise `renderChanges` re-renders the tab with `renderRegion` and the retained render's parameters.
 2. **A render that fails**: `renderChanges` answers `notMeasured`, and the summary prints `Changed: not measured (the document changed while it was rendered)`, `(the renderer failed)`, `(the deadline passed)`, or `(the frame e40 was not readable)`, as the table in Acting calls maps each throw; the outcome stays the call's own. The renderer's exception text, which a page can shape, goes to the journal at info and stays out of the line.
-3. **The algorithm**: `diffLines`[^diff-file] trims the common prefix and suffix of the two line lists and runs Myers's O(ND) diff over the middle, keeping one array of 2d+1 entries per edit step, so memory grows with the square of the edit count rather than with the page. Past 1,000 edits in the region it gives up on the region.
-4. **The output**: a head line `Changed: 2 lines added, 1 removed`, counting the overlay blocks and the region together, or `Changed: nothing`, then the hunks as the body. The overlay blocks are diffed apart from the region and their hunks print first, so a dialog that opened survives the cut even when the page hid its main content from the tree as it opened, which modal libraries do by setting `aria-hidden` on the app's root. When the region's diff gives up at the edit cap, the head reads `Changed: most of the page (N lines differ); read the page` and the body carries the overlay hunks alone; when the overlays' diff gives up too, the body reads `… the overlays changed too much to list; read the page`. A hunk opens with `@@` and one line of context, and every line of it carries a two-character prefix — `+ `, `- `, or two spaces — so a page line reading `@@` or `+ x` cannot pass for structure. The overlay hunks are cut on a line at 4,000 characters, a block's size, and the region's hunks at 3,000, each with `… N more changed lines; read the page for the rest`, so a dialog that opened shows whole, buttons included, when its added lines fit the 4,000 characters. The links index and the hidden section aren't diffed, so a link whose destination changes while its text stays the same, under `links=index`, reports `Changed: nothing`.
+3. **The algorithm**: the diff compares the two renders' non-blank lines. `diffLines`[^diff-file] trims the common prefix and suffix of the two line lists and runs Myers's O(ND) diff over the middle, keeping one array of 2d+1 entries per edit step, so memory grows with the square of the edit count rather than with the page. Past 1,000 edits in the region it gives up on the region.
+4. **The output**: a head line `Changed: 2 lines added, 1 removed`, counting the overlay blocks and the region together, or `Changed: nothing`, then the hunks as the body. The overlay blocks are diffed apart from the region and their hunks print first, so a dialog that opened survives the cut even when the page hid its main content from the tree as it opened, which modal libraries do by setting `aria-hidden` on the app's root. When the region's diff gives up at the edit cap, the head reads `Changed: most of the page (N lines differ); read the page` and the body carries the overlay hunks alone; when the overlays' diff gives up too, the body reads `… the overlays changed too much to list; read the page`. When the overlays' diff gives up and the region is unchanged, the head reads `Changed: most of the overlays (N lines differ); read the page`, or under `since`, `Since: most of the overlays changed (N lines differ)`. A hunk opens with `@@` and one line of context, and every line of it carries a two-character prefix — `+ `, `- `, or two spaces — so a page line reading `@@` or `+ x` cannot pass for structure. The overlay hunks are cut on a line at 4,000 characters, a block's size, and the region's hunks at 3,000, each with `… N more changed lines; read the page for the rest`, so a dialog that opened shows whole, buttons included, when its added lines fit the 4,000 characters. The links index and the hidden section aren't diffed, so a link whose destination changes while its text stays the same, under `links=index`, reports `Changed: nothing`.
 5. **The render moves**: the re-render replaces the retained render and refreshes the ref set.
 
 `since=true` calls `renderChanges` inside a read, with `Since:` in place of `Changed:` and the diff as the region (UC37). A `since` read is a read, so it diffs a switched-to tab's retained render like any other and then sets the session's last-read target; untracked case 4 belongs to the change summary alone. Its line reads:
@@ -509,7 +522,7 @@ A `RenderError` or a `DocumentChangedError` ends the `since` read with `error`, 
 5. **Skipping**: an overlay render passes an option under which the page script skips these roots:
 
     1. A root hidden by `state.js`'s rule renders empty. Examples include a closed dialog kept in the DOM and a toast faded to `opacity: 0`.
-    2. A root that no longer resolves renders empty, such as a toast that dismissed itself after the tree pull.
+    2. A root that the page removed renders empty, such as a toast that dismissed itself after the tree pull. Chrome still resolves a removed element, detached, so the page script takes a detached root as lost.
     3. An `alert` or `status` root whose box measures 2 px or less in either dimension is skipped unless it is boxless by `state.js`'s rule. The page script reports this case. A box that small marks a screen-reader announcement, such as a router's route announcer.
 6. **Limits**: dialogs and alert dialogs take the render slots first, then the rest in tree order. At most eight render calls are made, skipped overlays included, and at most four blocks render. `overlays.js` cuts each block on a line at 4,000 characters of its own text, before its frames are inlined, as a nested frame's own text is cut before the frames inside it; a cut block ends with `… cut; scope=e88 reads it whole`. A skipped overlay doesn't count toward the four, the `Overlays:` line, or its `… and N more`; one past the eight calls counts as one more. When the clone walk leaves the region empty and at least one block rendered, the region reads `(nothing readable outside the overlays above)` in place of phase 2's `(no readable text; use screenshot)`.
 7. **Frames**: a frame inside a block is read as a frame of the page is. `readFrames` takes each block's render and then the region unit's as the parents of the first frame level, in that order, within the read's eight frame units, so a dialog's frame is read ahead of the page's own when units run short. A block's markdown arrives already cut, so a placeholder past the cut is gone and doesn't spend a unit. The frames inlined into the blocks share the read's 16,000-character frame text with the region's. A sign-in or payment dialog that holds its form in a cross-site frame shows its controls.
@@ -532,7 +545,7 @@ A ref scope that names a combobox or listbox renders that control's marker as th
 2. a field disabled by `state.js`'s rule, or one with `readonly` set;
 3. a field that did not take focus, which says to click it first.
 
-**`select`** runs `claudesurfSelect`[^select-script-file] on the element in its frame's world. Labels are whitespace-collapsed before comparing. The first option whose label equals `option` is selected, else the first whose value does, else the one option whose label equals it ignoring case; every other option is deselected, a `multiple` select included, and `input` then `change` are dispatched with `bubbles: true`. It refuses these cases as `error`, without echoing any option text:
+**`select`** runs `claudesurfSelect`[^select-script-file] on the element in its frame's world. Labels are whitespace-collapsed before comparing. The first option whose label equals `option` is selected, else the first whose value equals `option` exactly, the empty value included, else the one option whose label equals it ignoring case; every other option is deselected, a `multiple` select included, and `input` then `change` are dispatched with `bubbles: true`. It refuses these cases as `error`, without echoing any option text:
 
 1. An element that is not a `<select>`, with the recourse "click the control to open it, then click the option's ref".
 2. A disabled `<select>` or a disabled matching option.
@@ -544,14 +557,14 @@ A read scoped to the `<select>` lists every option (Design, options in reads).
 1. `Keys to: [e42] input "Search"`, when the element's backend id is in the ref set of the target the session's last read covered, that target is the working tab, and the document hasn't changed by the time the head is built;
 2. `Keys to: input "Search"`, the same line without the ref, otherwise;
 3. `Keys to: the page (nothing focused)`, when `document.activeElement` is the body or absent;
-4. `Keys to: [e40] frame`, when an `<iframe>` holds focus, the ref under item 1's conditions.
+4. `Keys to: [e40] frame`, when an `<iframe>` or a `<frame>` holds focus, the ref under item 1's conditions.
 
 The tag is the lowercased node name. The label is the first of `aria-label`, `placeholder`, `name`, the element's own text cut at `LABEL_MAX`, and `id`, each made safe by decision 27's rules. `finishAction` takes the `Keys to:` line through its `lines` option and prints it after the state lines, ahead of `Navigated:`. Its `focus` option carries the backend id that `press` read before the keys. When the call stayed on its document, `finishAction` reads focus again after the change summary has refreshed the ref set and adds `Focus now: [e13] button "Next"`, in the same form, after `Keys to:` when the focused element's id differs; a call that navigated prints neither a summary nor `Focus now:`.
 
 `parseKeys` accepts the following key grammar:[^keys-file]
 1. **Modifiers**: `Control` (or `Ctrl`), `Shift`, `Alt`, `Meta`, case-insensitive.
 2. **Named keys**, case-insensitive: `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, `Space`, `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `F1`–`F12`.
-3. **One character** otherwise, case-sensitive; `+` is written as the last character of a press (`Control++`), and a space as `Space`.
+3. **One character** otherwise, case-sensitive; `Shift` with a letter of any script gives its uppercase, in a chord too, unless that uppercase is more than one character (ß), and any other character keeps what was written; `+` is written as the last character of a press (`Control++`), and a space as `Space`.
 
 Each press dispatches the following events, with the US-layout `code` and `windowsVirtualKeyCode` for letters, digits, punctuation, and the named keys:
 
@@ -581,7 +594,7 @@ An unknown key name is a `schema_error` naming it.
 
         1. The working tab, when it is in that window.
         2. The most recent live earlier working tab there (Tabs, item 5).
-        3. The identity tab.
+        3. The identity tab, whose window isn't checked.
 
         It answers `error` when none is available: `no session tab is in the session's window to open from; close the popup or call navigate`.
     4. It identifies the call's tab. The evaluation and the identification share phase 1's 5 s window budget. `tabs` registers the opener's waiter before the evaluation, since the attach can arrive before `Runtime.evaluate` answers. The waiter wakes for each tab attributed to the opener and numbered at or above the recorded next number. `tabs` awaits each target's `ready` and then reads the tab's URL with `Target.getTargetInfo`.[^tabs-file]
@@ -594,21 +607,23 @@ An unknown key name is a `schema_error` naming it.
         2. The evaluation rejects or times out, as when the opener's renderer hangs.
 
         A tab that arrives too late stays behind (risk 20).
-    5. It reads arming's outcomes from the value that step 4's `ready` resolved with. It answers `error` when `Network.enable`, the bypass, or `Fetch.enable` rejected, or when `ready` resolved with no outcomes at all, as for a destroyed target, and leaves the close to the rule. With no interceptor, as in live tests that drive `Sessions` directly, `Fetch.enable` isn't sent, and its absence doesn't count (the gate, rejected arming). This `error` comes after the point at which the action counts as having acted (Acting calls, item 7) and skips `finishAction`, since the call hasn't navigated a tab. Otherwise it records the new tab's own navigation, `DOMContentLoaded`, and generation counters, navigates it, and makes it the working tab, pushing the old working tab onto the stack as `switch` does.
-    6. It ends with `finishAction` on the new tab, taking step 1's counters with the new tab's from step 5 in place of the old working tab's. The navigation wait takes what is left of `navigate`'s 25 s after the open wait, and the new tab, being the working tab, is left off the `Opened:` lines.
+    5. It reads arming's outcomes from the value that step 4's `ready` resolved with. It answers `error` when `Network.enable`, the bypass, or `Fetch.enable` rejected, or when `ready` resolved with no outcomes at all, as for a destroyed target, and leaves the close to the rule. With no interceptor, as in live tests that drive `Sessions` directly, `Fetch.enable` isn't sent, and its absence doesn't count (the gate, rejected arming). This `error` comes after the point at which the action counts as having acted (Acting calls, item 7) and skips `finishAction`, since the call hasn't navigated a tab. Otherwise it records the new tab's own navigation, download, same-document, and generation counters, navigates it, and makes it the working tab, pushing the old working tab onto the stack as `switch` does.
+    6. It ends with `finishAction` on the new tab, taking step 1's counters with the new tab's from step 5 in place of the old working tab's. The navigation wait takes what is left of `navigate`'s 25 s after the open wait, or an acting call's 10 s when `Page.navigate` answers an `errorText`, and the new tab, being the working tab, is left off the `Opened:` lines.
+
+    When the new tab closes before its page loads, or the daemon has begun closing it, and the gate's request handler didn't refuse its navigation, the call ends with `finishAction` on the tab it began on, which adds `Tab: the new tab closed before its page loaded; tabs list shows the open tabs`; a close by the backstop prints its `Blocked by the page:` line there. A tab that closes after the switch, before its page loaded, gives the working role back to the tab the call began on, so the stack is as it was before the call.
 
     When the gate refuses a redirect hop of that navigation, it closes the new tab under its rule for new tabs, and `tabs` finds the refusal recorded for the new tab whatever `Page.navigate` answers (`net::ERR_ABORTED`, a protocol error, or a `TargetGoneError`), so the call returns the after-acting `needs_confirmation` with the working tab unchanged. `finishAction` runs on the working tab that the call began on, with step 1's counters as recorded, and the payload carries that tab's state lines and its `Changed:` line.
-3. **`switch`** and **`close`** answer `error` for a number that isn't one of the session's open tabs: `t9 is not an open tab of this session; tabs list shows them`. **`switch`** to the working tab answers its state lines and changes nothing. Switching to the identity tab is `error`, and so is switching to a tab whose arming rejected (`t5 could not be put under the domain gate and is closing`). A tab armed at attach whose `armed` flag is still down makes `switch` await the target's `ready` under phase 1's 5 s window budget; a wait that runs out answers `error` (`t5 is still loading its first page; call again`). A tab with its flag up, one that `repair` armed, or one whose only failure was a timeout of `Network.enable` or the bypass switches at once; `repair` arms the last kind again.
+3. **`switch`** and **`close`** answer `error` for a number that isn't one of the session's open tabs: `t9 is not an open tab of this session; tabs list shows them`. **`switch`** to the working tab answers its state lines and changes nothing. Switching to the identity tab is `error`, and so is switching to a tab the daemon is closing: `t5 could not be put under the domain gate and is closing` when its arming rejected, and `t5 is closing; tabs list shows the open tabs` otherwise. A tab armed at attach whose `armed` flag is still down makes `switch` await the target's `ready` under phase 1's 5 s window budget; a wait that runs out answers `error` (`t5 is still loading its first page; call again`). A tab with its flag up, one that `repair` armed, or one whose only failure was a timeout of `Network.enable` or the bypass switches at once; `repair` arms the last kind again.
 
     A switch that passes these checks moves the working role: the old working tab joins the session's opened tabs, and its id is pushed onto the stack. The payload is the new working tab's state lines and `Working tab: t3`.
 
     The session records the target that its most recent `page` read covered; a paging read and a `since` read count, and a change summary records its refs but leaves the target alone. `refs.js` answers `stale_ref` ("the working tab changed since the ref was read; read the page again") for any ref while that target is set and differs from the working one; a session that hasn't read yet keeps phase 1's `error` for a ref that no read returned. The recorded target outlives its tab, so when the tab the agent last read closes and `repair` returns to an earlier one (UC35), refs stay stale until a read of that tab.
-4. **`close`** refuses the identity tab and runs `Target.closeTarget` on any other, which doesn't run the page's `beforeunload` handlers. It waits, under phase 1's 5 s window budget, for the target's destruction, and answers `error` (`t3 did not close within 5 s; tabs list shows whether it is still open`) when the destruction doesn't arrive. The payload is `Closed: t3` above the working tab's state lines. When the closed tab was the working tab, the payload is `Closed: t3; the next call returns to a working tab`, without state lines, and repair waits for the next call's `ensureWithNotes`, as on the `Tab:` path, so a failed repair can't fail a `close` whose tab is already gone.
+4. **`close`** refuses the identity tab and runs `Target.closeTarget` on any other, which doesn't run the page's `beforeunload` handlers. It waits, under phase 1's 5 s window budget, which starts before the command, for the target's destruction, even when the command rejects, and answers `error` (`t3 did not close within 5 s; tabs list shows whether it is still open`) when the destruction doesn't arrive. The payload is `Closed: t3` above the working tab's state lines. When the closed tab was the working tab, the payload is `Closed: t3; the next call returns to a working tab`, without state lines, and repair waits for the next call's `ensureWithNotes`, as on the `Tab:` path, so a failed repair can't fail a `close` whose tab is already gone.
 5. **The working tab gone**, whoever closed it: the next call's `repair` takes the most recent live tab off the stack before it tries the identity page's working link, with the note `the working tab closed; t1 is the working tab again`. A tab on the stack is live while it is registered and still the session's, so a tab that `claim` left unowned is skipped.
 
     A session's window state goes when the working tab is gone and none of the session's tabs remains in the session's window; phase 1 dropped it once the working and identity tabs were both gone. The drop disowns every tab the session still holds, the stack's included, and empties the stack.
 
-    The `windowId` that the registry last recorded decides which tabs are in the session's window. A tab's record comes from its attach, and repair's `openIdentityTab` and `openWorkingTab` re-read the session's and the two tabs' records with `Browser.getWindowForTarget`. The drop rule reads the record because `onDestroyed` runs synchronously, and it counts a tab whose lookup is pending or failed as in the window. `list`'s kinds, `tabs new`'s choice of a tab to open from, and `Opened:`'s tab-or-popup choice read the same record, so a tab's kind agrees with the drop rule; when the record is empty, they await `windowOf`, as phase 1's `Opened:` does. A tab that the human drags to another window still counts as in the session's window (risk 19).
+    The `windowId` that the registry last recorded decides which tabs are in the session's window. A tab's record comes from its attach, and repair's `openIdentityTab` and `openWorkingTab` re-read the session's and the two tabs' records with `Browser.getWindowForTarget`. The drop rule reads the record because `onDestroyed` runs synchronously, and it counts a tab whose lookup is pending or failed as in the window. `list`'s kinds, `tabs new`'s choice of a tab to open from, and `Opened:`'s tab-or-popup choice read the same record; when the record is empty, they await `windowOf` within the call's deadline, as phase 1's `Opened:` does, and a failed lookup counts as in the window, as the drop rule counts a pending one. A tab whose lookup is pending as the drop runs therefore counts as in the window for the drop, while `list` can find it in another window and call it `popup`. A tab that the human drags to another window still counts as in the session's window (risk 19).
 
     The stack and the drop rule give three cases:
     1. With the identity tab closed (UC11b), a popup that closes itself still returns the agent to the tab it switched from in the window.
@@ -621,15 +636,15 @@ An unknown key name is a `schema_error` naming it.
 
 ### Acting calls
 
-Every handler that acts calls `beforeAction` before it acts and `finishAction` after: `click`, `type`, `press`, `select`, `scroll`, `navigate`, `history`, and `tabs new`. `tabs switch`, `tabs close`, and `tabs list` don't, so a refusal during one of them is case 2 (Design, refusals: any other refusal). `beforeAction` records the counters that `finishAction` compares against: `navigations`, the `DOMContentLoaded` count, `downloads`, and `generation` of the tab, and the session's opened tabs, refusal counter, next tab number, and working tab. `finishAction`:
+Every handler that acts calls `beforeAction` before it acts and `finishAction` after: `click`, `type`, `press`, `select`, `scroll`, `navigate`, `history`, and `tabs new`. `tabs switch`, `tabs close`, and `tabs list` don't, so a refusal during one of them is case 2 (Design, refusals: any other refusal). `beforeAction` records the counters the call's result is measured against: `navigations`, `downloads` (which `navigate`'s download wait reads), `sameDocument`, and `generation` of the tab, and the session's opened tabs, refusal counter, next tab number, and working tab. `finishAction`:
 1. Waits for a navigation the action started (settling, the navigation wait).
 2. Settles.
 3. Builds the head: state lines, `Navigated:`, `Opened:` lines, and `Settled:` when the budget ran out. A tab counts as attributed during the call when its number is at or above `marks.nextTab`, as in case 1 (Design, refusals), so the old working tab that `tabs new` moves into the opened tabs isn't one. Each tab attributed during the call, whoever opened it, gets an `Opened:` line with its number, as in `Opened: t4, a popup window (not the working tab)`, except:
     1. the working tab;
     2. a tab destroyed during the call;
     3. a tab whose target record has `closing` set; the daemon sets `closing` whenever it sends `Target.closeTarget`, so the tab drops out before its destruction arrives. A close by the gate or the backstop prints on a `Blocked:` or `Blocked by the page:` line instead, and a close by the rule leaves its session note.
-4. Adds the change summary when the document and the tab are the ones the call started on.
-5. Returns `{ head, body, outcome, blocked }`, the outcome `needs_confirmation` when a refusal the call led to landed, `unsettled` when the budget ran out, and `success` otherwise.
+4. Adds the change summary when the document and the tab are the ones its starting counters came from (for `tabs new`, the new tab), so a `tabs new` whose navigation Chrome dropped prints `Changed: not tracked (read the page first)`.
+5. Returns `{ head, body, outcome, blocked }`: `outcome` is `unsettled` when the budget ran out or the check failed, and absent otherwise; `respond` makes a non-empty `blocked` `needs_confirmation` whatever `outcome` says.
 
 An action counts as having acted once the first command that can change the page has answered, unless that command is a page script that declined, as `select`'s and `click`'s can. That point is:
 1. for `type`, the `Control+a` key event;
@@ -640,7 +655,7 @@ An action counts as having acted once the first command that can change the page
 6. for `history` and `navigate`, the navigation command;
 7. for `tabs new`, the identification of its tab (item 4 of Tabs, `new`).
 
-When the first command times out, the call answers `error` with the message `the action may have run, but its command timed out; read the page before repeating it`: a timeout doesn't cancel the command in the browser, so it may have acted without its answer arriving.
+When the first command times out, the call answers `error` with the message `the action may have run, but its command timed out; read the page before repeating it`: a timeout doesn't cancel the command in the browser, so it may have acted without its answer arriving. `tabs new` is the exception: an open that times out answers `no tab opened; …` (Tabs, `new`, item 4).
 
 When the gate doesn't refuse `tabs new`'s `Page.navigate`, `tabs new` makes the tab the working tab however the command answers, and a refused hop closes the tab (Tabs, item 2). `Navigated:` follows the navigation wait's rule, and an `errorText` adds `Navigation error: net::ERR_NAME_NOT_RESOLVED` after it, a name from Chrome's fixed list rather than page text.
 
@@ -663,6 +678,7 @@ When a step after the action acted fails, `finishAction` checks whether the work
 A failure before the action acted maps as phase 1 maps it, with one exception: a `TargetGoneError` that names a frame target while the working tab is still registered answers `stale_ref` with `refUnit`'s message for a ref whose frame went, as when a `type` or `select` on an `f`-ref loses its frame. `failureEnvelope`, which moves from `daemon.js` to `respond.js`, makes that mapping from the call's `ref`, so `click`, `type`, and `select` share it.
 
 `renderRegion(sessions, session, t, { scope, article, links, hidden, source, deadline })` is a new export containing the part of today's `readPage` that:[^region-file]
+requireSameDocuments(documents)     // throws DocumentChangedError when a target's generation moved since the pull
 1. pulls the tree and resolves the scope;
 2. renders the region's unit;
 3. renders the overlay blocks through `overlays.js`;
@@ -702,7 +718,7 @@ On the `<iframe>` path, `unitOf`'s catch keeps today's rule and also rethrows a 
 
 ### The tool schema
 
-`toolDefinitions` merges a property that several actions of one tool declare: its `enum` becomes the union of theirs, and its description joins each action's own under the action's name (`history: back, forward, or reload; tabs: list, new, switch, or close; policy: allow_once or allow_always`). Two actions that declare one property name with different types are an error when the module loads. Validation stays per action, against that action's own spec.
+`toolDefinitions` merges a property that several actions of one tool declare: its `enum` becomes the union of theirs when each of them declares one, and is left out otherwise, and its description joins each action's own under the action's name, separated by spaces, since each ends with a period (`history: back, forward, or reload. tabs: list, new, switch, or close. policy: allow_once or allow_always.`). Two actions that declare one property name with different types are an error when the module loads. Validation stays per action, against that action's own spec.
 
 ### Head and body
 
@@ -720,7 +736,7 @@ An envelope that carries none gains one made of the `Blocked by the page:` lines
 The 33 s request deadline includes these waits:
 
 1. `navigate` waits up to 25 s for its document and then settles.
-2. `tabs new` waits up to 5 s for its tab and gives its navigation wait what is left of 25 s.
+2. `tabs new` waits up to 5 s for its tab and gives its navigation wait what is left of 25 s, or, when `Page.navigate` answers an `errorText`, an acting call's 10 s.
 3. An acting call waits up to 10 s for a navigation it started and settles for up to 5 s; a call that stayed on its document keeps 3 s for the summary render.
 
 The summary's frame units each run under phase 2's 5 s budget, cut to the deadline less its 2 s margin, so inside the summary's 3 s a frame level gets about 1 s, and a frame that misses it renders `(not readable)`. A read settles for up to 2 s before it renders. Every acting call pays at least the 500 ms quiet window, and so does the first read of each document; a summary render costs what a read costs, under 400 ms on phase 2's heaviest spike page, plus one render call per overlay.
@@ -750,7 +766,7 @@ The action specs gain an action-level `check(args)`[^dispatch-file] beside the p
 5. `tabs`(op, target) — use `list` to list the session's tabs; `new` opens `target=URL` and makes it the working tab; use `switch` or `close` with `target=t2`.
 6. `policy`(op, host) — call `policy` only after the human approves a host that a `Blocked:` line named. Use `allow_once` for this session or `allow_always` to save the host.
 
-`claudesurf_act`'s postamble adds: `Results end with a Changed: diff of the page since your last read or action. needs_confirmation means the domain gate stopped a navigation; ask the human before calling policy.` `click`'s summary replaces "if a click changed nothing" with "if the Changed: line says nothing changed". `page`'s entry adds `since=true returns what changed since your last read or action`. Today's `tools/list` answer measures 4,233 characters, about 1,200 tokens, where the HLD estimated 600 for two tools; the six entries, their arguments' schema descriptions, the merged `op` and `ref`, and the two sentences add roughly 400 tokens more, and the build reports the measured total.
+`claudesurf_act`'s postamble adds: `Results end with a Changed: diff of the page since your last read or action. needs_confirmation means the domain gate stopped a navigation; ask the human before calling policy.` `click`'s summary replaces "if a click changed nothing" with "if the Changed: line says nothing changed". `page`'s entry adds `since=true returns what changed since your last read or action`. Today's `tools/list` answer measures 4,233 characters, about 1,200 tokens, where the HLD estimated 600 for two tools; the six entries, their arguments' schema descriptions, the merged `op` and `ref`, and the two sentences bring it to 6,519 characters, about 1,850 tokens, as measured after the build.
 
 ### Payloads
 
@@ -858,7 +874,7 @@ class Gate {
 }
 
 // arming.js — the commands that put a tab under the gate, and back
-arm(sessions, t, { queued })   // queued: send ahead of the release without awaiting; else send and await; → a promise of the settled outcomes
+arm(sessions, t, { deadline })   // sends the commands; → a promise of the settled outcomes that never rejects; the attach handler leaves it unawaited ahead of the release, and repair awaits it
 onRejections(sessions, t, outcomes)   // the rejection rule for a tab armed at attach; onAttached calls it after its claim step, or when Page.enable rejects or the frame-tree read fails
 disarm(sessions, t)                 // Fetch.disable, the bypass and the switch set back, then Network.disable
 
@@ -869,26 +885,28 @@ class ActionLog {
 }
 
 // settle.js
-settle(sessions, t, { from, budget, deadline, frame })   // → { settled: true } | { settled: false, reason }; frame = the child frame an input action touched
+settle(sessions, t, { from, own, budget, deadline, frame })   // → { settled: true } | { settled: false, reason }; own = the request mark beforeAction took; frame = the child frame an input action touched
 
 // requests.js — the in-flight requests of each target with Network enabled
 attachRequests(conn, sessions)      // Network.requestWillBeSent, loadingFinished, loadingFailed → the target's entry
-busy(t, now)                        // → { count, lastEventAt }: counted requests in flight for under 5 s
+mark()                              // → the request counter, numbering requests across every tab
+busy(t, now, own)                   // → { count, lastEventAt }: counted requests in flight for under 5 s, and those numbered after own whatever their age
 
 // retained.js — one retained render per tab
 keep(session, t, { params, overlayBlocks, region, linkLists, hiddenSection, header, source, startedAt, generation })   // source: 'read' | 'since' | 'summary'; startedAt: the time the render began, before the tree pull; replaces the tab's render; → false past 500,000 characters, keeping the size marker instead
 current(session, t)                 // → the render at t's current generation, { tooLarge: true }, or null
 drop(session, t)
+dropAll(session)
 
 // diff.js — pure
-diffLines(before, after, { maxEdits = 1000 })     // → { added, removed, hunks } | { tooLarge: true, differing }
-formatDiff(result, { maxChars, context = 1 })     // → { text, cut }
+diffLines(before, after, { maxEdits = 1000 })     // → { added, removed, script } | { tooLarge: true, differing }; script: [{ op, text }] over the whole page
+formatDiff(result, { maxChars, context = 1 })     // groups the script into hunks → { text, cut }
 
 // keys.js — pure, loaded by both processes
 parseKeys(text)                     // → [{ key, code, keyCode, text, modifiers, printable }]; printable: the press types a character, which the action log reads; throws a message for an unknown key or past 16 presses
 
 // refs.js — moved from input.js, plus switch's rule
-parseRef(ref); refUnit(sessions, session, t, ref, { ownRender }); resolveNode(sessions, located, ref, objectGroup, opts);   // ownRender waives the tab-switch rule
+refUnit(sessions, session, t, ref, { ownRender }); resolveNode(sessions, located, ref, objectGroup, opts);   // ownRender waives the tab-switch rule
 
 // refusals.js — the session's refusal list
 record(session, entry)              // raises the counter, stamps seq, merges a repeat, drops by rule 4; gate.refuse notifies the waiters after it
@@ -896,19 +914,30 @@ takeOwn(session, marks)             // → the running call's entries of case 1 
 takeRest(session)                   // → every entry left on the list and the dropped count, removed and reset
 
 // respond.js — the response, moved out of daemon.js
-respond(sessions, session, result, { notes, log })   // → { envelope, carried, url }; the envelope: result's head, the dialog lines from takeDialogs, the Blocked: and Blocked by the page: lines, a blank line, and the body, with ensureWithNotes's notes, the session notes pushed during the slot, and the dialog notes merged; the message picked from result.blocked; carried: every entry the response took, printed or not, for the log's blocked
+respond(sessions, session, result, { notes })   // → { envelope, carried, url }; the envelope: result's head, the dialog lines from takeDialogs, the Blocked: and Blocked by the page: lines, a blank line, and the body, with ensureWithNotes's notes, the session notes pushed during the slot, and the dialog notes merged; the message picked from result.blocked; carried: every entry the response took, printed or not, for the log's blocked
 failureEnvelope(e, sessions, session, { notes, ref, log })   // → { envelope, carried, url }; the envelope for a thrown error, with ensureWithNotes's notes and the session notes pushed during the slot merged, with the Blocked by the page: lines as its payload when any are pending; session is null for a failure outside the handler's queue slot, which leaves the refusals on the session; logs an unmapped error at warn
+workingUrl(sessions, session)       // → the working tab's URL, undefined without a session or a working tab; daemon.js passes Sessions.peek's session
 
 // handlers: input.js, navigation.js, tabs.js — each takes (ctx, session, args, deadline), ctx = { sessions, gate, policy, log }; daemon.js answers policy itself from ctx.policy
 // gate is null in tests that build Sessions alone, and a pre-check then passes every URL
 navigate(ctx, session, { url, name, description }, deadline); history(ctx, session, { op }, deadline)
+precheck(gate, sessions, session, t, url, kind, opts)   // navigation.js; navigate, history, and tabs new's pre-check refusal
 click(ctx, session, { ref, trusted }, deadline); type(ctx, session, { ref, text }, deadline); press(ctx, session, { keys }, deadline)
 select(ctx, session, { ref, option }, deadline); scroll(ctx, session, { direction, amount }, deadline)
 tabs(ctx, session, { op, target }, deadline)   // each → { head, body?, images?, outcome?, blocked? }
 
 // act-result.js
-beforeAction(sessions, session, t)                         // → the counters finishAction compares against; stores the running call's marks on the session for gate.refuse
-finishAction(sessions, session, t, before, { deadline, frame, lines, focus })  // → { head, body, outcome, blocked }; lines = extra head lines after the state lines; focus = the backend id focused before the keys, compared after the summary; takes the call's own refusals off the session; reports a failure of its own steps in the head
+beforeAction(sessions, session, t)                         // → the counters finishAction compares against, with the request mark; stores the running call's marks on the session for gate.refuse
+finishAction(sessions, session, t, before, { deadline, frame, lines, focusNow, navigation, navigationError })  // → { head, body, outcome, blocked }; lines = extra head lines after the state lines, each a string or a function called as the head is built; focusNow = an async callback, called after the summary, whose line prints after lines, which press uses to compare the focus with the backend id focused before the keys; takes the call's own refusals off the session; reports a failure of its own steps in the head
+
+// navigation-wait.js — the navigation wait, shared by act-result.js, navigation.js, and tabs.js
+waitForDocument(sessions, t, from, { timeout, deadline, sameDocument })   // → { committed, loaded, ended }
+navigatedVerdict(t, before)         // → the Navigated: value, by the table in Design, settling
+refusedOwn(session, t, marks)       // → whether the gate refused a navigation of t since the marks
+NAVIGATION_MS                       // the 10 s wait
+
+// focus.js — press's focus read
+readFocus(sessions, t, objectGroup, opts); focusMoved(sessions, session, t, focus, objectGroup, opts); focusLine(prefix, session, t, node); focusedFrame(sessions, session, t, focus)
 
 // snapshot.js — additions
 Snapshot.overlays                   // [{ nodeId, backendId, role, name, modal }]; dialog, alertdialog, menu, and alert or status with a name or text, outermost only, tree order
@@ -923,25 +952,32 @@ renderRegion(sessions, session, t, { scope, article, links, hidden, source, dead
 renderChanges(sessions, session, t, { source, deadline })  // → { untracked: reason, render? } | { notMeasured: reason } | { line, body, render }; untracked says why there is nothing to compare against and carries the render when it crossed the size cap; notMeasured says why a summary's render failed; line and body hold the counts and the hunks against the retained render, which renderRegion has replaced; render is renderRegion's answer, which since uses for its header, past the edit cap, and past the size cap
 
 // sessions.js — additions
-// target record: closing (the daemon has sent Target.closeTarget: the gate, the backstop, arming.js's rule, or tabs close; a rejected close clears it and warns when the target is still registered), armingSent (arming has sent its commands, queued at attach or awaited by repair), openerPage (the page target that opened it, through a frame's root page), ready (a promise that never rejects; the attach handler resolves it with arming's outcomes as its value once its queued Page.enable and, for a tab armed at attach, the arming commands have settled; on the target's destruction it resolves with no outcomes), armed, contentLoads (the DOMContentLoaded count), committedWeb (an http(s) document has committed, recorded from onFrameNavigated or from the frame tree's committed frame.url in the attach handler's read), everWorking (it has been a working tab); a tab keeps its number when an opened tab is claimed for a role
+// target record: closing (the daemon has sent Target.closeTarget: the gate, the backstop, arming.js's rule, or tabs close; a rejected close clears it and warns when the target is still registered), armingSent (arming has sent its commands, queued at attach or awaited by repair), openerPage (the page target that opened it, through a frame's root page), ready (a promise that never rejects; the attach handler resolves it with arming's outcomes as its value, or null for a tab not armed at attach, once its queued Page.enable and, for a tab armed at attach, the arming commands have settled; on the target's destruction it resolves with no outcomes), armed, loadedGeneration (the generation whose own DOMContentLoaded fired), navigationsStopped (navigations at Chrome's last drop of the main frame's latest navigation without a commit, which a refusal of that navigation leads to), pendingLoader (the loader id of the main frame's latest cross-document navigation, until a commit), committedWeb (an http(s) document has committed, recorded from onFrameNavigated or from the frame tree's committed frame.url in the attach handler's read), everWorking (it has been a working tab); a tab keeps its number when an opened tab is claimed for a role
 // attach(conn) also runs requests.js's attachRequests(conn, this), so a registry without a Gate tracks requests too
 // Session: refusals ([{ kind, how, url, host, targetId, tab, opener, count, seq }]), refusalCount, droppedRefusals, marks ({ seq, nextTab, workingTargetId, newTab } while a call runs, cleared by daemon.js; tabs.js sets newTab to the target id of the tab that tabs new identified), tabIds (Map<targetId, n>), nextTab, earlierWorking ([targetId]), refsTarget, retained (retained.js's store, by target); the window-state drop, a repair's createWindow, and dropAll clear the window fields that phase 1's disown and dropAll clear, and also tabIds, earlierWorking, refsTarget, retained, the refusals and droppedRefusals, both of which a running call's marks keep; label, startedAt, nextTab, refusalCount, marks, and the queue survive, so a seq stays past every mark
 interceptor                         // set by Gate.attach; arming.js sends Fetch.enable only while it is set (Design, the gate)
 peek(sessionId)                     // → the session, or undefined; doesn't create a session; get does
 
 // tab-records.js — the session's tab records, a new module beside sessions.js
-number(session, t)                  // assigns the tab's number from session.nextTab when sessions.js claims or attributes it
+addOpened(session, t)               // records a tab one of the session's pages opened, and numbers it from session.nextTab
+addClaimed(session, t)              // records a tab claimed for a role, out of the opened tabs, and numbers it
+release(session, targetId)          // drops a tab that left the session: its number and its place among the opened tabs; its stack entries stay, no longer live
+remove(session, targetId)           // drops every record of a tab that is gone, its stack entries included
+clear(session)                      // drops every tab record as the window's state goes; the counter stays, so no number is reused
 switchWorking(sessions, session, targetId)   // the old working tab joins the opened tabs and goes on the stack
 earlier(sessions, session)          // → the most recent live earlier working tab, taken off the stack, or null; repair uses it
-latestIn(sessions, session, windowId)   // → the most recent live earlier working tab in that window, left on the stack, or null; tabs new uses it
-tabs(sessions, session)             // → a promise of [{ id, targetId, kind }], the working tab first; awaits windowOf for a tab whose window record is empty
+latestIn(sessions, session, opts)   // → a promise of the most recent live earlier working tab in the session's window, left on the stack, or null; tabs new uses it
+tabs(sessions, session, opts)       // → a promise of [{ id, targetId, kind }], the working tab first; awaits windowOf, by opts.deadline, for a tab whose window record is empty
+inWindow(session, windowId)         // whether a tab recorded in windowId, null while unknown, is in the session's window
+inSessionWindow(sessions, session, targetId, opts)   // → a promise of whether the tab is in the session's window, looked up by opts.deadline when unrecorded; never rejects
 // frames.js — whether a frame is still there, shared by settle.js and region.js
 frameThere(sessions, target, frameId, opts)   // → a promise of whether a frame is still there: a frame target while registered, a same-process frame while its id is in Page.getFrameTree and names no registered frame target; opts.frameTrees caches each target's tree across one check
 
 // page scripts
 claudesurfSettle()                  // page/settle.js, in the main frame's world and an input action's frame's → { installedAt, lastMutationAt, readyState }
 claudesurfEdit(step)                // page/edit.js, `this` the element; step 'focus' → { state: 'ok' | 'detached' | 'disabled' | 'readonly' | 'not-editable' | 'no-focus', type? }; step 'select', after Control+a → { state: 'selected' | 'by-script' | 'focus-lost' }
-claudesurfSelect(option)            // page/select.js → { state: 'ok' | 'not-select' | 'disabled' | 'option-disabled' | 'no-match' }
+claudesurfSelect(option)            // page/select.js → { state: 'ok' | 'not-select' | 'disabled' | 'option-disabled' | 'no-match' | 'detached' }
+claudesurfCollapse(text)            // page/collapse.js, spliced into edit.js and select.js
 ```
 
 ### Fake browser
@@ -954,7 +990,7 @@ An overlay render passes the overlay option, so the fake answers it from `site[u
 4. A reload.
 5. A created target's first document other than `about:blank`, which doesn't pause in Chrome either.
 
-`Fetch.failRequest` emits `Network.loadingFailed` and answers `Page.navigate` with `net::ERR_ABORTED`, committing nothing. A `site[url].redirect` names a second URL that pauses again with `redirectedRequestId`. `Network.enable` answers, and `site[url].network` lists request events the fake emits after a navigation, with delays. `Input.insertText` and `Input.dispatchKeyEvent` act on the element the last `claudesurfEdit` focused, recording the calls; `Page.getNavigationHistory`, `Page.navigateToHistoryEntry` (with `site[url].restored` for a back-forward cache restore), `Page.reload`, and `Target.getTargetInfo` answer from the target's history and page.
+`Fetch.failRequest` emits `Network.loadingFailed` under the navigation's loader id with `net::ERR_ABORTED` and answers `Page.navigate` with `net::ERR_ABORTED`, committing nothing. `announce` gives each `Page.frameStartedNavigating` a loader id, which `Page.navigate`'s answer, the commit's `Page.frameNavigated`, and the committed document's requests carry too, under which `failNavigation(target, errorText)` emits its document request's `Network.loadingFailed`. A navigation that reaches `site[url].download`, the page's own included, fails its document request under its loader id, answers a `Page.navigate` with `net::ERR_ABORTED`, and then fires `Page.downloadWillBegin`, as Chrome does; `site[url].noContent` drops a navigation the same way without the download. A `site[url].redirect` names a second URL that pauses again with `redirectedRequestId`. `Network.enable` answers, and `site[url].network` lists request events the fake emits after a navigation, with delays. `Input.insertText` and `Input.dispatchKeyEvent` act on the element the last `claudesurfEdit` focused, recording the calls; `Page.getNavigationHistory`, `Page.navigateToHistoryEntry` (with `site[url].restored` for a back-forward cache restore), `Page.reload`, and `Target.getTargetInfo` answer from the target's history and page.
 
 A `Runtime.evaluate` of `window.open` in a world, with `userGesture` set, answers `null` and creates a paused target in the opener's window with that `openerId`, as Chrome does under `noopener`; without `userGesture` it opens nothing, as Chrome's popup blocker does. The target attaches with an empty URL, and `Target.getTargetInfo` answers an empty URL too until the fake commits the document that `window.open` named. The fake commits it silently after the release, emitting no `Page.*` event for it, and then answers the target's `Page.enable`, as Chrome does for a paused tab. `site[url].firstCommitDelay` holds a page-opened target's first commit, and with it the answer to its `Page.enable`, for the case of a slow page popup during `tabs new`. `openLink` sets `openerId` on the identity tab and a repaired working tab, as Chrome does for every link target, so those tabs take the attribution path at attach before their claim.
 
@@ -992,15 +1028,15 @@ A `Runtime.evaluate` of `window.open` in a world, with `userGesture` set, answer
     5. The frame-tree read on `Page.enable`'s answer running for every page target attributed by opener and for any attached without a URL, recording `committedWeb`, its rejection caught on its own, and the claim following it;
     6. `arming.js`'s rejection rule applied after the claim step for every tab armed at attach;
     7. Focus emulation on frame targets;
-    8. `Page.domContentEventFired` counted;
-    9. A `BackForwardCacheRestore` counted as a load and as `DOMContentLoaded`;
+    8. `Page.domContentEventFired` recorded as its document's load, by generation;
+    9. A `BackForwardCacheRestore` counted as a load, with its generation recorded as loaded;
     10. The target record's `closing`, `ready`, `armingSent`, `armed`, `openerPage`, `committedWeb`, and `everWorking`;
     11. `peek`;
     12. `attach(conn)` running `attachRequests`;
     13. `onSameDocument` updating a page target's URL for its own main frame alone;
     14. `TargetGoneError` carrying the target id it names;
     15. The backstop call from `onFrameNavigated`;
-    16. Calling `tab-records.js`'s `number` when it claims or attributes a tab and `earlier` in `repair`; `tabs.js` calls `switchWorking`, `latestIn`, and `tabs`;
+    16. Calling `tab-records.js`'s `addClaimed` and `addOpened` when it claims or attributes a tab, `release`, `remove`, and `clear` as tabs and the window's state go, `inWindow` in the drop rule, and `earlier` in `repair`; `tabs.js` calls `switchWorking`, `latestIn`, and `tabs`;
     17. Refusals and `refsTarget` on `Session`;
     18. `requests.js`'s and `retained.js`'s entries dropped with the target, the window, and the pipe;
     19. `onDestroyed` dropping a session's window state when the working tab is gone and none of the session's tabs remains in the session's window, and disowning a popup left elsewhere; the drop takes the refusals too unless a call is running on the session.
@@ -1032,24 +1068,23 @@ A `Runtime.evaluate` of `window.open` in a world, with `userGesture` set, answer
 7. `server/snapshot.js` — `overlays`, with the `modal` property, and `blockOverlays` (Design, overlays); up to 500 options kept per combobox or listbox, each with its backend id, all of them listed for the ref set.
 8. `server/page/render.js` needs these changes:
 
-    1. A combobox or listbox root renders as its marker, with every option the descriptor carries;
-    2. An option prints its ref unless its control is a native `<select>`;
-    3. The clone walk leaving an `overlay` descriptor's subtree out of the clone;
-    4. Under the overlay option, a hidden root, a lost root, and an `alert` or `status` root of 2 px or less render empty.
-    5. A lost scope root reported as `lostRoot` in the result, beside the body render that replaces it.
+    1. An option prints its ref unless its control is a native `<select>`;
+    2. The clone walk leaving an `overlay` descriptor's subtree out of the clone;
+    3. Under the overlay option, a hidden root, a lost root, and an `alert` or `status` root of 2 px or less render empty.
+    4. A lost scope root reported as `lostRoot` in the result, beside the body render that replaces it.
 
 9. `server/input.js` needs these changes:
 
     1. `click` and `scroll` end with `finishAction`, `scroll` passing its `Scroll:` line through `lines`, and `click`'s 300 ms wait goes;
-    2. `type`, `press`, and `select`;
+    2. `type`, `press`, and `select`, with press's focus read and its `Keys to:` and `Focus now:` lines in `focus.js`;
     3. `navigate`, `parseRef`, `refUnit`, and `resolveNode` move out.
 
-10. `server/action-support.js` — `SETTLE_SOURCE`, `EDIT_SOURCE`, and `SELECT_SOURCE`; `releaseObjects` taking the earlier of its 2 s and the request deadline, so the overlay renders' releases can't carry a summary past the deadline.
+10. `server/action-support.js` — `SETTLE_SOURCE`, `EDIT_SOURCE`, and `SELECT_SOURCE`; every release takes the request deadline: the command goes out however little of it is left, and the deadline only cuts the wait for Chrome's answer.
 11. `server/paths.js` — `policyFile()` and `actionLogPath()` with their overrides.
 12. `server/server.js` — `serverInfo.version` read from `package.json`.
 13. `server/package.json`, `server/package-lock.json` — version 2.2.0.
 14. `test/fakes/fake-browser.js` — API / Schema, Fake browser.
-15. `test/fixtures/serve.js` — `/redir?to=` (302), `/delay?ms=` (a response held that long), `/busy.json` (a response that never ends), `/sw.js` (a service worker that answers `/sw-only` itself, which the server answers 404).
+15. `test/fixtures/serve.js` — `/redir?to=` (302), `/delay?ms=` (a response held that long), `/busy.json` (a response that never ends), `/sw.js` (a service worker that answers `/sw-only` itself, which the server answers 404), `/no-content` (a 204 to any method).
 16. `test/live/read.test.js`, `test/live/windows.test.js`, `test/live/screenshot.test.js`, `test/live/render.test.js` need these changes:
 
     1. `navigate` called from `navigation.js` and `click` from `input.js` with a context and an argument object, and results read as `{ head, body }`. Their exact assertions on results change with the new lines: a click's `Navigated: no` is no longer the last line, now that `Changed:` follows;
@@ -1068,7 +1103,7 @@ A `Runtime.evaluate` of `window.open` in a world, with `userGesture` set, answer
 
 19. `README.md` needs these changes:
 
-    1. The Setup line's tested Chrome version, 155;
+    1. The Setup line's tested Chrome version, 156;
     2. The tool table's six actions and `since`;
     3. The read format section's `Overlays:`, `Settled:`, and `Paged:` lines, the overlay blocks ahead of the region and their closing markers, the empty-region line, and option refs;
     4. The outcomes line, with `needs_confirmation` and `unsettled` built and `needs_human` not built yet;
@@ -1091,7 +1126,7 @@ A `Runtime.evaluate` of `window.open` in a world, with `userGesture` set, answer
     17. Migration: the allowlist starts empty, and after an upgrade each user's daemon is restarted.
 
 20. `.claude/context/architecture.md`:
-    1. the module list: `read.js` for the read's assembly, `respond.js`, `region.js`, `overlays.js`, `changes.js`, `navigation.js`, `tabs.js`, `tab-records.js`, `frames.js`, `refs.js`, `gate.js`, `arming.js`, `refusals.js`, `policy.js`, `action-log.js`, `settle.js`, `requests.js`, `retained.js`, `diff.js`, `keys.js`, and `act-result.js`;
+    1. the module list: `read.js` for the read's assembly, `respond.js`, `region.js`, `navigation-wait.js`, `focus.js`, `overlays.js`, `changes.js`, `navigation.js`, `tabs.js`, `tab-records.js`, `frames.js`, `refs.js`, `gate.js`, `arming.js`, `refusals.js`, `policy.js`, `action-log.js`, `settle.js`, `requests.js`, `retained.js`, `diff.js`, `keys.js`, and `act-result.js`;
     2. the request flow: `repair` in `ensureWithNotes` arming the working tab, and `policy` skipping `ensureWithNotes` and `ensureBrowser`; the envelope step, which becomes `respond.js`, with the dialog and `Blocked:` lines in the head; the action-log record after the response is built; a budget list in which `navigate` waits for `DOMContentLoaded` and then settles, and an acting call keeps a 5 s settle and a 3 s summary reserve;
     3. new passages on the gate and backstop, settling, the change summary and retained renders, overlays, tabs and the earlier-working stack, `refs.js`, and the head/body assembly;
     4. new gotchas:
@@ -1115,7 +1150,7 @@ A `Runtime.evaluate` of `window.open` in a world, with `userGesture` set, answer
     16. "Refs and worlds": the fill rule takes overlay nodes, every kept option, and a frame-scoped read's overlay nodes and block controls; the `stale_ref` and `error` sentence for a click now covers `type` and `select` too, and gains the tab-switch rule;
     17. "Storage", whose persistent state gains the allowlist and the action log;
     18. "Session windows": repair tries the earlier-working stack before the identity page's working link; the window state lasts while the working tab or another session tab remains in the window, or while the session works in a popup outside it;
-    19. the `sessions.js` line: `Session` records gain tab numbers, refusals, the marks, the stack, the last-read target, and retained renders; the target registry gains `closing`, `ready`, `armingSent`, `armed`, `openerPage`, `contentLoads`, `committedWeb`, and `everWorking`.
+    19. the `sessions.js` line: `Session` records gain tab numbers, refusals, the marks, the stack, the last-read target, and retained renders; the target registry gains `closing`, `ready`, `armingSent`, `armed`, `openerPage`, `loadedGeneration`, `navigationsStopped`, `pendingLoader`, `committedWeb`, and `everWorking`.
 21. `.claude/context/capabilities.md` — the headful test line gains the headful act cases.
 22. `.claude/context/worktree.md` — the worktree daemon command gains `CLAUDESURF_POLICY_FILE` and `CLAUDESURF_ACTION_LOG` under `/tmp`.
 23. `.claude/context/docs.md` — the README and architecture summaries gain the allowlist, the log, settling, and overlay blocks.
@@ -1143,9 +1178,9 @@ A `Runtime.evaluate` of `window.open` in a world, with `userGesture` set, answer
     8. a region-unit render whose `lostRoot` is set under `since` or `summary`, turned into the lost-scope error for a ref root and `DocumentChangedError` for the root that the `main` scope resolved to, leaving an overlay render's lost root to the overlay skips;
     9. `report` adding the rendered overlay blocks' refs and hidden refs;
     10. the generation checks, the `keep` call, and `renderRegion` returning the pieces and the errors it can throw.
-3. `server/policy.js`, `server/gate.js`, `server/arming.js`, `server/refusals.js`, `server/overlays.js`, `server/changes.js`, `server/action-log.js`, `server/settle.js`, `server/requests.js`, `server/retained.js`, `server/diff.js`, `server/keys.js`, `server/refs.js`, `server/navigation.js`, `server/tabs.js`, `server/tab-records.js`, `server/frames.js`, `server/act-result.js` — API / Schema, Module interfaces.
-4. `server/page/settle.js`, `server/page/edit.js`, `server/page/select.js` — the page scripts of decisions 10, 16, and 18; `edit.js` and `select.js` splice `state.js` in.
-5. `test/policy.test.js`, `test/gate.test.js`, `test/overlays.test.js`, `test/changes.test.js`, `test/respond.test.js`, `test/refusals.test.js`, `test/action-log.test.js`, `test/settle.test.js`, `test/diff.test.js`, `test/keys.test.js`, `test/tabs.test.js`, `test/navigation.test.js` — see Tests.
+3. `server/policy.js`, `server/gate.js`, `server/arming.js`, `server/refusals.js`, `server/overlays.js`, `server/changes.js`, `server/action-log.js`, `server/settle.js`, `server/requests.js`, `server/retained.js`, `server/diff.js`, `server/keys.js`, `server/refs.js`, `server/navigation.js`, `server/tabs.js`, `server/tab-records.js`, `server/frames.js`, `server/act-result.js`, `server/navigation-wait.js`, `server/focus.js` — API / Schema, Module interfaces.
+4. `server/page/settle.js`, `server/page/edit.js`, `server/page/select.js`, `server/page/collapse.js`, `server/page/focused.js` — the page scripts of decisions 10, 16, and 18; `edit.js` and `select.js` splice `state.js` and `collapse.js` in, and `edit.js` splices `focused.js`.
+5. `test/policy.test.js`, `test/gate.test.js`, `test/overlays.test.js`, `test/changes.test.js`, `test/respond.test.js`, `test/refusals.test.js`, `test/action-log.test.js`, `test/settle.test.js`, `test/diff.test.js`, `test/keys.test.js`, `test/tabs.test.js`, `test/navigation.test.js`, `test/retained.test.js` — see Tests; `test/frame-setup.js` and `test/fixtures/ax/nodes.js` hold shared test setup.
 6. `test/live/act.test.js`, `test/live/gate.test.js`, `test/live/settle.test.js` — see Tests.
 7. `test/fixtures/ax/menu.json` — `menu.html`'s tree with its menu and its `aria-modal` dialog open, recorded by `record.js`.
 8. `test/fixtures/overlay-render.html` — an ARIA combobox whose list the tree places under it, a `role=status` faded to `opacity: 0`, and a 1×1 clipped `role=alert`, for the live render cases; a fixture of its own, so `render.html` and its recorded tree stay as they are.
@@ -1156,7 +1191,8 @@ A `Runtime.evaluate` of `window.open` in a world, with `userGesture` set, answer
 13. `test/fixtures/popup.html` — opens a same-site popup that closes itself when its button is clicked.
 14. `test/fixtures/leave.html` — links, redirects, and opens tabs toward the other site, from its own document and from a cross-site frame, and holds an image whose response never ends.
 15. `test/fixtures/worker.html` — registers `/sw.js` and links to `/sw-only`.
-16. `test/fixtures/menu.html` — a header holding a `menubar`, a `main` holding too little prose for Readability to find an article, a `role=status` with text and an empty one, and three dialogs, each appended to the end of `<body>`:
+16. `test/fixtures/no-content.html` — a link and a form answered 204, and a navigation that `window.stop()` cancels.
+17. `test/fixtures/menu.html` — a header holding a `menubar`, a `main` holding too little prose for Readability to find an article, a `role=status` with text and an empty one, and three dialogs, each appended to the end of `<body>`:
 
     1. One sets `aria-hidden` on the app's root as it opens, as modal libraries do.
     2. A native `<dialog>` opens with `showModal()`.
@@ -1294,7 +1330,7 @@ None; `input.js` keeps click, scroll, and the new input actions.
     4. A frame probe that times out while its frame is there counting as busy and naming the frame on `Settled: no`;
     5. Settled after the quiet window;
     6. A counted request holding it and an image not;
-    7. A request past 5 s ignored;
+    7. A request past 5 s ignored, unless the action started it;
     8. A mutation timestamp holding it;
     9. `readyState` `loading` holding it and `interactive` not;
     10. The budget running out with each reason;
@@ -1398,7 +1434,8 @@ None; `input.js` keeps click, scroll, and the new input actions.
 
 14. **Modified** `test/paths.test.js` — `policyFile()` and `actionLogPath()`, each default and override.
 15. **Modified** `test/envelope.test.js` — `needsConfirmation` in both `acted` forms, its message free of the payload, and `unsettled` outside the error outcomes.
-16. **Modified** `test/action-support.test.js` — the three new page-script sources spliced with `state.js` where they use it.
+16. **Modified** `test/action-support.test.js` — the three new page-script sources spliced with `state.js` where they use it, and `collapse.js` spliced once into `edit.js` and `select.js`.
+    **New** `test/retained.test.js` covers the 500,000-character cap over the region, the hidden section, the overlay blocks, and the link lists together, and the size marker past it.
 17. **Modified** `test/snapshot.test.js` covers these cases:
 
     1. 500 options kept on a long `<select>` and 12 on its marker outside a scope;
@@ -1471,7 +1508,7 @@ None; `input.js` keeps click, scroll, and the new input actions.
     8. Focus emulation on a frame target;
     9. `Fetch.enable` queued under an interceptor alone;
     10. Network events kept and capped by `requests.js`;
-    11. `DOMContentLoaded` counted;
+    11. `DOMContentLoaded` marking its own generation loaded;
     12. A restore counted as a load;
     13. A pushState updating the target's URL and a child frame's leaving it alone;
     14. Retained renders and tab records dropped with the target, the window, and on EOF, and refusals with the window and on EOF but not with their tab;
@@ -1484,7 +1521,7 @@ None; `input.js` keeps click, scroll, and the new input actions.
     3. `tabs` `target` against each `op`;
     4. `policy` refusing a URL, a wildcard, and `com`;
     5. A `keys` error from the bridge;
-    6. The merged `op` enum and the joined `ref` description in `toolDefinitions`, and two actions declaring one property with different types throwing at load.
+    6. The merged `op` enum and the joined `ref` description in `toolDefinitions`, and two actions declaring one property with different types throwing from `toolDefinitions`, which the module runs as it loads.
 
 22. **Modified** `test/daemon.test.js` covers these cases:
 
@@ -1547,7 +1584,7 @@ None; `input.js` keeps click, scroll, and the new input actions.
 
     1. `skeleton.html` read and clicked into: settled with its content, not the placeholders, the content inside a web component's shadow root included;
     2. `busy.html` returning `unsettled` with `the document is still changing`;
-    3. A `/busy.json` fetch returning `unsettled` with a request in flight until it passes 5 s;
+    3. A click's `/busy.json` fetch returning `unsettled` with `Settled: no — after 5.0 s, 1 request in flight`;
     4. `leave.html`'s hanging image leaving a read settled;
     5. All without a `Gate`, since `Network.enable` doesn't need one.
 
@@ -1600,11 +1637,12 @@ Manual: run a worktree daemon with its own socket, profile, policy file, and log
 16. **Page chrome that uses overlay roles prints ahead of every read.** A site navigation misusing `role=menu`, a closed menu parked off-screen, a header cart badge as `role=status`, or a consent banner as a `dialog` renders as a block ahead of the main content on every default read and takes block slots before a later toast. The shared state rule counts closed menus parked off-screen as visible.[^state-file] The `Overlays:` line names them, and the four-block cap bounds them.
 17. **Under the `auto` chain and `article=true`, a menu or a toast outside the rendered content is missed.** On a page with neither a `main` landmark nor an `article` node, or under `article=true`, the read takes dialogs alone as blocks, so a click that opens a menu or a toast outside the article reports `Changed: nothing`; a `scope=all` read shows it.
 18. **A modal hosted in an `<iframe>` without a `dialog` wrapper in the page isn't picked.** Some consent, sign-in, and payment widgets append a frame outside `main` with the modal inside it; overlays come from the page's own tree, so the frame shows only under `frames not read`, and a click that opens it reports `Changed: nothing`. A `scope=` read on the frame's ref shows it.
-19. **A tab the human drags to another window still counts as in the session's window.** The drop rule reads the `windowId` that the registry last recorded, since `onDestroyed` runs synchronously, and `tabs list` reads the same record so that its kinds agree with that rule; `list` therefore calls a dragged tab `tab`. The window's state lasts while that tab remains, so after the human closes the session window the next call returns to the tab when it is on the stack, and otherwise recreates the window and disowns the tab. A `tabs new` from a working tab dragged elsewhere opens its tab in that other window, which `list` then calls `popup`.
+19. **A tab the human drags to another window still counts as in the session's window.** The drop rule reads the `windowId` that the registry last recorded, since `onDestroyed` runs synchronously, and `tabs list` reads the same record, so its kinds agree with that rule for a tab whose window is recorded; `list` therefore calls a dragged tab `tab`. The window's state lasts while that tab remains, so after the human closes the session window the next call returns to the tab when it is on the stack, and otherwise recreates the window and disowns the tab. A `tabs new` from a working tab dragged elsewhere opens its tab in that other window, which `list` then calls `popup`.
 20. **A tab that `tabs new` opened after its wait ran out stays behind.** When the opener's renderer recovers after the 5 s and runs the queued `window.open`, the tab arrives on `about:blank` and is attributed as a page-opened tab. A tab that arrives between calls shows only in `tabs list`. A tab that arrives during a later call prints on that call's `Opened:` line and is attributed to that call. `tabs close` closes it.
 21. **A page-opened tab that a session lets go runs ungated.** When the window-state drop or a window recreation disowns a tab that a session's page opened, the tab is disarmed and behaves as a tab of the human's own, though the human didn't open it. A page still running there can navigate it to any host, and that top-level navigation carries the profile's SameSite=Lax cookies, which a subresource request under decision 7 doesn't. Two paths lead there. When the working tab goes while none of the session's tabs remains in the session's window, as when the human closes the window, the window-state drop disowns every tab the session holds elsewhere, stack tabs included. When the working tab is gone, no stack tab is live, and the identity tab is closed or navigated away before the next call repairs, the repair recreates the window and disowns a page-opened tab still in the old window. The agent can't read the tab afterwards. The HLD's residual risks carry it.
 22. **A refusal can close a page-opened tab that holds an allowed page.** The registry learns of a paused tab's first commit from the frame-tree read when `Page.enable` answers. A refusal in the round trip before that read answers, as when the page redirects at once, still finds the tab new and closes it. If `Page.enable` times out because the first response takes more than 10 s, refusals also close the tab until its next `Page.frameNavigated` records the commit. The call reports `a new tab to …, closed` for what was a navigation.
 23. **A page-opened tab whose arming command rejected runs ungated until the rule closes it.** The commands are queued ahead of the release, and the rule waits for the claim step, after the first commit, so a tab whose `Fetch.enable` rejected loads its first document ungated, and one whose `Network.enable` or bypass rejected can have a navigation answered by a service worker in that time. The backstop runs from `Page.frameNavigated`, so it misses a first commit that came without one. The HLD's residual risks carry it.
+24. **A refused same-origin download link reads as a refused navigation.** When the page's own host is off the allowlist, as after the human edits it, a same-origin `<a download>` link's request pauses at the gate as the main frame's document request without a navigation. The gate records it as a `navigation` refusal, the call returns `needs_confirmation`, and allowing the host doesn't help, since Chrome denies the download anyway. The refusal kinds don't cover a download, and the case needs a host the human removed.
 
 [^envelope-file]: `server/envelope.js`.
 [^keys-file]: `server/keys.js`.

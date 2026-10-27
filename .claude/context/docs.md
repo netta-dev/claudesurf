@@ -1,4 +1,4 @@
 # Docs
 
-- `README.md` — setup, systemd and the graphical environment, the two tools and their actions, the dedicated profile, troubleshooting, migration from the extension.
-- `.claude/context/architecture.md` — daemon/bridge modules, request flow, the read pipeline and its frame units, targets and attach including iframe targets, session windows and repair, refs and generations, isolated worlds per frame, dialogs, protocol gotchas.
+- `README.md` — setup, systemd and the graphical environment, the two tools and their actions, the read format with its overlay blocks, an acting call's result (settling and `Changed:`), the domain-gate allowlist with its `Blocked:` lines, the action log, the dedicated profile, troubleshooting, upgrading, and migration from the extension.
+- `.claude/context/architecture.md` — daemon/bridge modules, request flow and its budgets, responses, the read pipeline and its frame units, overlay blocks, targets and attach including iframe targets, the domain gate with arming and refusals, acting calls, settling, the change summary and retained renders, session windows and repair, tabs and the earlier-working stack, refs and generations, isolated worlds per frame, dialogs, storage, protocol gotchas.

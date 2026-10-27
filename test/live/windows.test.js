@@ -9,7 +9,8 @@ const assert = require('node:assert');
 const { execFileSync } = require('child_process');
 const read = require('../../server/read');
 const input = require('../../server/input');
-const { liveBinary, liveBrowser, refsIn, sleep } = require('../helpers');
+const navigation = require('../../server/navigation');
+const { liveBinary, liveBrowser, readPayload, refsIn, sleep } = require('../helpers');
 const { serve } = require('../fixtures/serve');
 
 const skip = !process.env.CLAUDESURF_LIVE_HEADFUL ? 'set CLAUDESURF_LIVE_HEADFUL=1 to run'
@@ -28,7 +29,7 @@ test('the working tab is the active tab, the identity tab joins its window, and 
   const site = await serve();
   const before = activeWindow();
   try {
-    const sessions = live.sessions;
+    const { sessions, context } = live;
     const session = await sessions.ensure('live-window');
     await sleep(500);
     const working = sessions.target(session.workingTargetId);
@@ -38,28 +39,28 @@ test('the working tab is the active tab, the identity tab joins its window, and 
     if (before === null) return; // xdotool absent: the grouping assertion above is all we can check
     assert.notStrictEqual(chromeWindow, before, 'window creation raised the session window');
 
-    await input.navigate(sessions, session, { url: `${site.base}/actions.html`, name: 'window test' });
+    await navigation.navigate(context, session, { url: `${site.base}/actions.html`, name: 'window test' });
     await sleep(300);
     assert.match(windowName(chromeWindow), /^Actions fixture/, 'the working tab is the window\'s active tab');
 
     activate(before);
     await sleep(300);
     assert.strictEqual(activeWindow(), before, 'parked the desktop focus on the previous window');
-    const { payload } = await read.readPage(sessions, session, { maxChars: 40000, offset: 0, hidden: false });
+    const { payload } = await readPayload(sessions, session, { maxChars: 40000, offset: 0, hidden: false });
     const refs = refsIn(payload);
     const started = Date.now();
-    await input.click(sessions, session, refs['Handler button'], {});
+    await input.click(context, session, { ref: refs['Handler button'] });
     assert.ok(Date.now() - started < 3000, 'a scripted click into a background window does not stall');
-    await input.scroll(sessions, session, 'down', 100, {});
+    await input.scroll(context, session, { direction: 'down', amount: 100 });
     await read.screenshot(sessions, session, { fullPage: false });
-    await input.navigate(sessions, session, { url: `${site.base}/actions.html`, name: 'window test' });
+    await navigation.navigate(context, session, { url: `${site.base}/actions.html`, name: 'window test' });
     await sleep(300);
     assert.strictEqual(activeWindow(), before, 'navigate, scripted click, scroll, and screenshot left the active window alone');
     assert.match(windowName(chromeWindow), /^Actions fixture/, 'the working tab stayed active');
 
-    const again = refsIn((await read.readPage(sessions, session, { maxChars: 40000, offset: 0, hidden: false })).payload);
-    const r = await input.click(sessions, session, again['New tab link'], {});
-    assert.match(r.payload, /Opened: a new tab/);
+    const again = refsIn((await readPayload(sessions, session, { maxChars: 40000, offset: 0, hidden: false })).payload);
+    const r = await input.click(context, session, { ref: again['New tab link'] });
+    assert.match(r.head, /\nOpened: t\d+, a new tab \(not the working tab\)\n/);
     await sleep(500);
     assert.strictEqual(activeWindow(), chromeWindow, 'a click that opens a tab raises the session window');
     for (const id of session.opened) await live.conn.send('Target.closeTarget', { targetId: id });
@@ -67,7 +68,7 @@ test('the working tab is the active tab, the identity tab joins its window, and 
     activate(before);
     await sleep(300);
     assert.strictEqual(activeWindow(), before, 'parked the desktop focus again');
-    await input.click(sessions, session, again['Handler button'], { trusted: true });
+    await input.click(context, session, { ref: again['Handler button'], trusted: true });
     await sleep(500);
     assert.strictEqual(activeWindow(), chromeWindow, 'a trusted click brings the session window to the front');
   } finally {

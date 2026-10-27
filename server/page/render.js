@@ -8,14 +8,22 @@
 // describes `nodes[i]`, the live element behind it; the live element is what a value is
 // read from, since a clone's value is the element's default rather than what was typed.
 //
-// The daemon decides what is a control, a landmark, a group, a frame, and the scope
-// root; this script decides where each marker goes and what the prose around it reads
-// like.
+// The daemon decides what is a control, a landmark, a group, a frame, an overlay, and
+// the scope root; this script decides where each marker goes and what the prose around
+// it reads like. An `overlay` descriptor names a dialog, a menu, or a message that the
+// daemon renders as a block of its own, so the clone leaves it out wherever it sits.
+// Under `options.overlay`, { role }, the render is that block's own, rooted at the
+// overlay, and a root that is hidden, gone, or a screen-reader announcement renders
+// empty.
 function claudesurfRender(options, descriptors, ...nodes) {
   // @include state.js
 
   const REF_ATTR = 'data-cs-ref';
   const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT']);
+  const ANNOUNCEMENT_ROLES = new Set(['alert', 'status']);
+  // The size in CSS pixels, in either dimension, at or below which an alert or a status
+  // is a message for screen readers alone, such as a router's route announcer.
+  const ANNOUNCER_PX = 2;
   const VALUE_ROLES = new Set(['textbox', 'searchbox', 'combobox', 'spinbutton', 'slider']);
   // Turndown discards an element whose text is blank before any rule sees it, unless
   // the element is one of these or holds one — its `voidElements` and its
@@ -117,6 +125,7 @@ function claudesurfRender(options, descriptors, ...nodes) {
         continue;
       }
       if (child.nodeType !== Node.ELEMENT_NODE || SKIP_TAGS.has(child.tagName)) continue;
+      if (isOverlay(child)) continue;
       // An element with no box of its own paints through its children, so the walk
       // descends it and judges them instead — a float-only card that is itself a link
       // included, whose marker and prose both hang off it.
@@ -129,6 +138,11 @@ function claudesurfRender(options, descriptors, ...nodes) {
 
   function skipped(element) {
     return claudesurfSkipped(claudesurfState(element));
+  }
+
+  function isOverlay(element) {
+    const ref = refs.get(element);
+    return Boolean(ref) && entries.get(ref).descriptor.kind === 'overlay';
   }
 
   function cloneInto(element, target, dropText) {
@@ -220,9 +234,13 @@ function claudesurfRender(options, descriptors, ...nodes) {
     return field(value) || null;
   }
 
-  function optionsOf(descriptor) {
+  // Returns the `(options: …)` text of a control's marker. A native <select>'s options
+  // print by name, since `select` takes one by its label; any other control's print
+  // with their refs, so the agent can click a custom list's option.
+  function optionsOf(descriptor, node) {
     if (!descriptor.options) return null;
-    const names = [...descriptor.options.names];
+    const native = Boolean(node) && node.tagName === 'SELECT';
+    const names = descriptor.options.names.map(({ name, ref }) => (native || !ref ? name : `${name} [${ref}]`));
     if (descriptor.options.more) names.push(`… and ${descriptor.options.more} more`);
     return `(options: ${names.join(', ')})`;
   }
@@ -252,8 +270,8 @@ function claudesurfRender(options, descriptors, ...nodes) {
     if (value !== null) parts.push(`= ${JSON.stringify(value)}`);
     if (descriptor.range) parts.push(`(${descriptor.range.min}–${descriptor.range.max})`);
     if (descriptor.state && descriptor.state.length) parts.push(`(${descriptor.state.join(', ')})`);
-    const options = optionsOf(descriptor);
-    if (options) parts.push(options);
+    const listed = optionsOf(descriptor, node);
+    if (listed) parts.push(listed);
     emitted.add(ref);
     const marker = `[${parts.join(' ')}]${controlTarget(ref, node)}`;
     // A control the page lays out as a block gets a line of its own, so two of them
@@ -308,8 +326,8 @@ function claudesurfRender(options, descriptors, ...nodes) {
   // forms are built out of are percent-encoded, since the URL parser leaves all four in
   // a path as the page wrote them and a crafted href would otherwise close its own
   // marker and open one for a ref the page does not own; whitespace is encoded with
-  // them, since a newline would break the line the marker sits on. render.js holds the
-  // daemon's copy of this rule, for the URLs it prints itself.
+  // them, since a newline would break the line that the marker sits on. action-support.js
+  // holds the daemon's copy of this rule, for the URLs that the daemon prints itself.
   function safeUrl(url) {
     return url.replace(/[()[\]\s]/g, (c) => URL_ESCAPES[c] || encodeURIComponent(c));
   }
@@ -516,13 +534,18 @@ function claudesurfRender(options, descriptors, ...nodes) {
     return service;
   }
 
-  const rootEntry = descriptors.find((descriptor) => descriptor.kind === 'root');
+  const rootEntry = descriptors.find((descriptor) => descriptor.kind === 'root' || descriptor.root === true);
   const rootNode = rootEntry ? entries.get(rootEntry.ref).node : null;
-  // A scope root the daemon could not resolve — the element went between the tree pull
-  // and the resolve — falls through to the body, and the chain reported says so, since
-  // the Scope: header names what rendered.
-  const lostRoot = Boolean(rootEntry) && !rootNode;
-  const root = rootNode || document.body;
+  // A scope root that disappeared between the tree pull and the render — one that the
+  // daemon could not resolve, or one that Chrome resolved detached — falls through to
+  // the body, and the reported chain says so, since the Scope: header names what
+  // rendered; the daemon is told, since a render that has to match an earlier one of
+  // that root can't use the body.
+  const lostRoot = Boolean(rootEntry) && !(rootNode && rootNode.isConnected);
+  const overlayRole = options.overlay ? options.overlay.role : null;
+  const skip = overlayRole ? overlaySkip() : null;
+  if (skip) return { markdown: '', links: [], chain: options.chain, refs: [], hiddenRefs: [], article: null, lostRoot, skipped: skip };
+  const root = rootNode && !lostRoot ? rootNode : document.body;
   // A frame is reported alongside the controls, so the daemon can tell a frame the
   // page hides from one the render dropped.
   const hiddenRefs = descriptors
@@ -570,5 +593,18 @@ function claudesurfRender(options, descriptors, ...nodes) {
     refs: [...emitted],
     hiddenRefs,
     article: readability ? article : null,
+    lostRoot,
   };
+
+  // Returns why an overlay's root renders empty, or null: it has disappeared since the
+  // tree was pulled, the shared rule hides it, or it is an announcement too small to
+  // see, which a boxless wrapper isn't.
+  function overlaySkip() {
+    if (lostRoot) return 'lost';
+    const state = claudesurfState(rootNode);
+    if (claudesurfSkipped(state)) return 'hidden';
+    if (!ANNOUNCEMENT_ROLES.has(overlayRole) || state.boxless) return null;
+    const rect = rootNode.getBoundingClientRect();
+    return rect.width <= ANNOUNCER_PX || rect.height <= ANNOUNCER_PX ? 'tiny' : null;
+  }
 }

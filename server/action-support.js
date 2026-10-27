@@ -1,15 +1,19 @@
-// Shared by read.js and input.js: the error that carries an envelope, the state
-// lines every payload starts with, the working-target lookup, the http check, the
-// page-state read, and the page-side scripts as source.
+// Shared by the handlers: the error that carries an envelope, the state lines that every
+// payload starts with, the sanitizers for page text on a payload line, the
+// working-target lookup, the http check, the load wait's budget, a wait cut at a
+// deadline, the page-state read, the object-group release, and the page-side scripts
+// as source.
 
 const fs = require('fs');
 const path = require('path');
 const envelope = require('./envelope');
 const { SetupError } = require('./browser');
+const { isWeb } = require('./policy');
 
 const PAGE_DIR = path.join(__dirname, 'page');
-// The one copy of the cap on a name, a label, or a value: snapshot.js imports it and
-// both page scripts take it as an argument, so a marker field is one bounded line.
+// The one copy of the cap on a name, a label, or a value: cappedText cuts to it, and
+// the render and walk page scripts take it as an argument, so a marker field is one
+// bounded line.
 const LABEL_MAX = 100;
 // The one copy of the cap on a URL; past it a marker prints the URL's length instead,
 // since a cut URL is not navigable. render.js applies it to a frame's URL and passes it
@@ -20,12 +24,12 @@ const URL_MAX = 200;
 // strips from the finished markdown. Every page-controlled string is stripped of both,
 // there and here.
 const RESERVED = /[\0\uE000]/g;
-// A release runs under a deadline of its own: the call that took the objects may have
-// spent its own, and an object group left unreleased pins its document's nodes for as
-// long as the document lives. It never throws — the caller is already returning.
-const RELEASE_MS = 2_000;
+// The margin that a load wait leaves before the request deadline, so the page state that
+// follows it still has time to be read.
+const LOAD_MARGIN_MS = 2_000;
 const NAVIGATE_FIRST = 'The working tab is not on an http(s) page; navigate first.';
 const WORKING_TAB_GONE = 'The working tab is gone; retry the action.';
+const TIMED_OUT = Symbol('timed out');
 
 // Handlers throw this to return a specific envelope.
 class OutcomeError extends Error {
@@ -33,8 +37,9 @@ class OutcomeError extends Error {
 }
 function fail(env) { throw new OutcomeError(env); }
 
-// Both values are the page's to set (history.pushState, document.title), and every
-// action's payload carries them, so each is made safe the way a marker field is.
+// Returns the URL: and Title: lines that every action's payload carries. Both values are the
+// page's to set (history.pushState, document.title), so each is made safe the way a
+// marker field is.
 function stateLines(url, title) {
   return `URL: ${safeUrl(url)}\nTitle: ${safeText(title)}`;
 }
@@ -42,28 +47,48 @@ function stateLines(url, title) {
 // The characters safeUrl percent-encodes by hand, since encodeURIComponent leaves them be.
 const URL_ESCAPES = { '(': '%28', ')': '%29' };
 
-// A URL made safe to sit inside a marker or a list line: the brackets and parentheses
-// the marker forms are built out of are percent-encoded, since a URL the page crafted
-// would otherwise close its own marker and open one for a ref the page does not own;
-// whitespace goes with them, since a newline would break the line it sits on.
+// Returns a URL made safe to sit inside a marker or a list line: the brackets and
+// parentheses that the marker forms are built out of are percent-encoded, since a URL
+// that the page crafted would otherwise close its own marker and open one for a ref that
+// the page does not own; whitespace goes with them, since a newline would break the line it
+// sits on.
 // encodeURIComponent leaves the parentheses alone and encodes the rest, multi-byte
 // whitespace included. server/page/render.js holds the page script's copy of the rule.
 function safeUrl(url) {
   return url.replace(RESERVED, '').replace(/[()[\]\s]/g, (c) => URL_ESCAPES[c] || encodeURIComponent(c));
 }
 
-// Page text made safe for a header line: the characters the renderer reserves stripped,
-// whitespace collapsed to one space, and brackets and backslashes escaped as a marker
-// field is at its cap (snapshot.js's `capped`), so the text cannot close or open a
-// marker. Uncapped, since a page may legitimately set a long title.
+// Returns page text made safe for a header line: the characters that the renderer
+// reserves are stripped, whitespace is collapsed to one space, and brackets and
+// backslashes are escaped as cappedText escapes a marker field, so the text cannot close
+// or open a marker. The text isn't capped, since a page may legitimately set a long
+// title.
 function safeText(text) {
   return (text || '').replace(RESERVED, '').replace(/\s+/g, ' ').trim().replace(/[\\[\]]/g, '\\$&');
 }
 
+// Returns page text as one bounded field, such as a marker's name, a tab's title, or a
+// focused element's label: the characters that the renderer reserves are stripped,
+// whitespace is collapsed, the text is cut to at most `max` characters with an ellipsis,
+// and then brackets and backslashes are escaped, so the field can't close the marker it
+// sits in or open one. The cap counts the page's characters, not the escapes.
+function cappedText(text, max = LABEL_MAX) {
+  const collapsed = (text || '').replace(RESERVED, '').replace(/\s+/g, ' ').trim();
+  const cut = collapsed.length > max ? `${collapsed.slice(0, codePointBoundary(collapsed, max - 1))}…` : collapsed;
+  return cut.replace(/[\\[\]]/g, '\\$&');
+}
+
+// Returns a URL made safe by safeUrl and cut at URL_MAX with an ellipsis, for a line
+// that names a page rather than links to it.
+function cappedUrl(url) {
+  const safe = safeUrl(url || '');
+  return safe.length <= URL_MAX ? safe : `${safe.slice(0, codePointBoundary(safe, URL_MAX - 1))}…`;
+}
+
 // Steps a cut back so it never splits a surrogate pair, whose lone half renders as a
-// replacement character: snapshot.js cuts a name at LABEL_MAX, render.js a region at
-// max_chars and a frame at its cap. The page scripts hold their own copies, since they
-// run in the browser.
+// replacement character: cappedText cuts a field at its cap, cappedUrl a URL at
+// URL_MAX, and render.js a region at max_chars and a frame at its cap. The page
+// scripts hold their own copies, since they run in the browser.
 function codePointBoundary(text, index) {
   if (index > 0 && index < text.length) {
     const code = text.charCodeAt(index);
@@ -79,12 +104,28 @@ function workingTarget(sessions, session) {
 }
 
 function requireHttp(t) {
-  if (!/^https?:/i.test(t.url || '')) fail(envelope.error(NAVIGATE_FIRST));
+  if (!isWeb(t.url)) fail(envelope.error(NAVIGATE_FIRST));
 }
 
-// A page script is one function declaration sent as source. A `// @include <file>`
-// line inside it is replaced by that file's content, so walk.js and click.js share
-// one copy of state.js.
+// Returns the milliseconds that a load wait of `limit` gets: cut to the deadline less the
+// margin, and at least 1, so a spent deadline still runs one check.
+function loadBudget(limit, deadline) {
+  if (deadline === undefined) return limit;
+  return Math.max(1, Math.min(limit, deadline - LOAD_MARGIN_MS - Date.now()));
+}
+
+// Resolves with the promise's value, or TIMED_OUT at `deadline`.
+function within(promise, deadline) {
+  let timer;
+  const expired = new Promise((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), Math.max(1, deadline - Date.now())); });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+}
+
+// Returns the page script `name` as source: one function declaration, with each
+// `// @include <file>` line inside it replaced by that file's content, so the scripts
+// that judge an element's state share one copy of state.js, those that find the
+// focused element one copy of focused.js, and those that compare whitespace-collapsed
+// text one copy of collapse.js.
 function pageScript(name) {
   const source = fs.readFileSync(path.join(PAGE_DIR, name), 'utf8');
   return source.replace(/^[ \t]*\/\/ @include (\S+)\n/gm, (line, file) => fs.readFileSync(path.join(PAGE_DIR, file), 'utf8'));
@@ -100,10 +141,10 @@ const RENDER_LIBRARIES = [
 ];
 const INSTALL_COMMAND = 'npm --prefix server ci --ignore-scripts';
 
-// The renderer as one script: the libraries, then render.js. A caller evaluates it
-// once per isolated world and then calls claudesurfRender there. A library that
+// Returns the renderer as one script: the libraries, then render.js. A caller evaluates
+// it once per isolated world and then calls claudesurfRender there. A library that
 // cannot be resolved or read is a SetupError naming the install command, which
-// daemon.js renders as setup_error.
+// respond.js's failureEnvelope answers as setup_error.
 //
 // Kept once it succeeds, since a read asks for 140 KB of it per unit; a failure is not
 // kept, so an install repairs it without a restart.
@@ -133,16 +174,30 @@ function buildRenderSource() {
 const WALK_SOURCE = pageScript('walk.js');
 const CLICK_SOURCE = pageScript('click.js');
 const SCROLL_SOURCE = pageScript('scroll.js');
+const SETTLE_SOURCE = pageScript('settle.js');
+const EDIT_SOURCE = pageScript('edit.js');
+const SELECT_SOURCE = pageScript('select.js');
+const FOCUSED_SOURCE = pageScript('focused.js');
 
-// The target's url, title, and scroll position: the scroll script called with no
-// arguments reports them without scrolling.
+// Resolves with the target's url, title, and scroll position: the scroll script, when
+// called with no arguments, reports them without scrolling.
 function pageState(sessions, t, opts) {
   return sessions.callInWorld(t.targetId, SCROLL_SOURCE, [], opts);
 }
 
-function releaseObjects(sessions, targetId, objectGroup) {
-  return sessions.send(targetId, 'Runtime.releaseObjectGroup', { objectGroup }, { deadline: Date.now() + RELEASE_MS })
+// Resolves with the state lines of the target's document as it is now.
+async function currentStateLines(sessions, t, opts) {
+  const info = await pageState(sessions, t, opts);
+  return stateLines(info.url, info.title);
+}
+
+// Releases an object group, waiting for Chrome's answer until `deadline`, the
+// request's, at most. The command goes out however little of the deadline is left,
+// since a group left unreleased pins its document's nodes for as long as the document
+// lives. Never rejects: the caller is already returning.
+function releaseObjects(sessions, targetId, objectGroup, deadline) {
+  return sessions.send(targetId, 'Runtime.releaseObjectGroup', { objectGroup }, { deadline })
     .catch((e) => sessions.log.debug(`releasing ${objectGroup}: ${e.message}`));
 }
 
-module.exports = { OutcomeError, fail, stateLines, codePointBoundary, workingTarget, requireHttp, pageState, releaseObjects, renderSource, LABEL_MAX, URL_MAX, RESERVED, WORKING_TAB_GONE, WALK_SOURCE, CLICK_SOURCE, SCROLL_SOURCE, safeUrl, safeText };
+module.exports = { OutcomeError, fail, stateLines, codePointBoundary, workingTarget, requireHttp, loadBudget, within, TIMED_OUT, pageState, currentStateLines, releaseObjects, renderSource, LABEL_MAX, URL_MAX, RESERVED, WORKING_TAB_GONE, WALK_SOURCE, CLICK_SOURCE, SCROLL_SOURCE, SETTLE_SOURCE, EDIT_SOURCE, SELECT_SOURCE, FOCUSED_SOURCE, safeUrl, cappedText, cappedUrl };

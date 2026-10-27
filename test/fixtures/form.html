@@ -1,0 +1,108 @@
+<!doctype html>
+<!-- Every field kind that the input actions reach, each pre-filled where it holds text, so a
+     type that replaces its content shows: text, email, number, and password inputs, a
+     textarea, a contenteditable region, a readonly field, a native <select> with a
+     disabled option, a disabled <select>, and a custom listbox in the select-only
+     combobox pattern that a click opens. The password's strength meter shares its
+     line, so a change summary carries the masked field. A search form submits on Enter
+     and prints what it got; a row of two fields and a button gives Tab a short order to
+     move through; a custom element holds a text field in its open shadow root; the key
+     log lists every keydown that the document sees; and a cross-site frame holds
+     frame-form.html. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Form fixture</title>
+</head>
+<body>
+  <main>
+    <h1>Form fixture</h1>
+    <p>
+      <input id="text" type="text" aria-label="Text field" value="old text">
+      <input id="email" type="email" aria-label="Email field" value="old@example.com">
+      <input id="number" type="number" aria-label="Number field" value="12">
+    </p>
+    <p><input id="password" type="password" aria-label="Password field" value="old secret"> <span id="strength">Strength: 10 characters</span></p>
+    <p><textarea id="notes" aria-label="Notes field">old notes</textarea></p>
+    <div id="editable" contenteditable="true" aria-label="Editable region">old editable</div>
+    <p><input id="readonly" type="text" aria-label="Readonly field" value="fixed" readonly></p>
+
+    <p>
+      <select id="size" aria-label="Size">
+        <option value="s">Small</option>
+        <option value="m">Medium</option>
+        <option value="l" disabled>Large</option>
+      </select>
+      <select id="locked" aria-label="Locked" disabled>
+        <option>Only</option>
+      </select>
+    </p>
+    <p id="size-log">Size changes: none</p>
+
+    <div id="fruit" role="combobox" tabindex="0" aria-label="Fruit" aria-expanded="false" aria-controls="fruit-list" aria-owns="fruit-list">Apple</div>
+    <ul id="fruit-list" role="listbox" aria-label="Fruit options" hidden>
+      <li role="option">Apple</li>
+      <li role="option">Banana</li>
+      <li role="option">Cherry</li>
+    </ul>
+
+    <form id="search-form">
+      <input id="search" type="search" name="q" aria-label="Search">
+      <button type="submit">Go</button>
+    </form>
+    <p id="submitted">Not submitted</p>
+
+    <p>
+      <input id="first" type="text" aria-label="First name">
+      <input id="last" type="text" aria-label="Last name">
+      <button id="next" type="button">Next</button>
+    </p>
+
+    <p><shadow-field id="host"></shadow-field></p>
+
+    <p id="key-log">Keys:</p>
+
+    <iframe id="frame" title="Cross-site form" width="400" height="120" src="__CROSS_SITE__/frame-form.html"></iframe>
+  </main>
+  <script>
+    customElements.define('shadow-field', class extends HTMLElement {
+      constructor() {
+        super();
+        this.attachShadow({ mode: 'open' }).innerHTML = '<input id="inner" type="text" aria-label="Shadow field" value="old shadow">';
+      }
+    });
+
+    const log = document.getElementById('key-log');
+    document.addEventListener('keydown', (event) => { log.textContent += ` ${event.key}`; });
+
+    const password = document.getElementById('password');
+    password.addEventListener('input', () => {
+      document.getElementById('strength').textContent = `Strength: ${password.value.length} characters`;
+    });
+
+    const size = document.getElementById('size');
+    size.addEventListener('change', () => {
+      document.getElementById('size-log').textContent = `Size changes: ${size.value}`;
+    });
+
+    const fruit = document.getElementById('fruit');
+    const list = document.getElementById('fruit-list');
+    function expand(open) {
+      list.hidden = !open;
+      fruit.setAttribute('aria-expanded', String(open));
+    }
+    fruit.addEventListener('click', () => expand(list.hidden));
+    for (const option of list.querySelectorAll('[role=option]')) {
+      option.addEventListener('click', () => {
+        fruit.textContent = option.textContent;
+        expand(false);
+      });
+    }
+
+    document.getElementById('search-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      document.getElementById('submitted').textContent = `Submitted: ${document.getElementById('search').value}`;
+    });
+  </script>
+</body>
+</html>

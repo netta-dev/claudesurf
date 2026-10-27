@@ -14,6 +14,10 @@ const FAKE_CHROME = path.join(__dirname, 'fakes', 'fake-chrome.js');
 
 const silentLog = { debug() {}, info() {}, warn() {}, error() {} };
 
+// The skip reason of a test that needs a file mode to deny it access, which root
+// bypasses; false for any other user.
+const modesIgnored = process.getuid && process.getuid() === 0 ? 'root passes file modes, which this test needs to deny access' : false;
+
 // A logger that keeps its lines per level, for tests that assert on diagnostics.
 function recordingLog() {
   const lines = { debug: [], info: [], warn: [], error: [] };
@@ -59,16 +63,84 @@ function isolatedPaths(t, prefix = 'claudesurf-test') {
   return { dir, profileDir: path.join(dir, 'profile'), record: path.join(dir, 'cs.browser.json') };
 }
 
-// In-process fake browser behind a Connection, with Sessions attached and auto-attach
-// enabled, as the daemon does after a launch. `log` is the daemon's one logger, which
-// a test replaces with recordingLog() to read the diagnostics back.
-function fakeSession({ log = silentLog } = {}) {
+// Temp directories that outlive the test that made them, removed when the process
+// exits.
+const leftovers = [];
+process.once('exit', () => {
+  for (const dir of leftovers) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// Writes an allowlist file in `dir` listing `hosts`, as the human writes one.
+function writeAllowlist(dir, hosts) {
+  const file = path.join(dir, 'allowed-hosts');
+  fs.writeFileSync(file, hosts.map((host) => `${host}\n`).join(''));
+  return file;
+}
+
+// Attaches the domain gate over an allowlist of `allow` to `conn` as the daemon
+// attaches it on a launch: before auto-attach, so every armed tab gets Fetch.enable.
+function attachGate(sessions, conn, { allow, dir, log }) {
+  const { Policy } = require('../server/policy');
+  const { Gate } = require('../server/gate');
+  const policyFile = writeAllowlist(dir, allow);
+  const policy = new Policy({ file: policyFile, log });
+  const gate = new Gate({ sessions, policy, log });
+  gate.attach(conn);
+  return { gate, policy, policyFile };
+}
+
+// Returns an in-process fake browser behind a Connection, with Sessions attached as
+// the daemon attaches them after a launch, and the handlers' context over it; the
+// caller enables auto-attach. `log` is the daemon's one logger, which a test replaces
+// with recordingLog() to read the diagnostics back. With `allow`, a list of hosts, the
+// domain gate attaches over an allowlist of them; without it the gate is null, and a
+// handler's pre-check passes every URL. Given the test `t`, settling's quiet window is
+// `quietMs` until the test ends, and null leaves the 500 ms default; without `t` the
+// window is left alone, for tests that don't settle.
+function fakeSession({ t, log = silentLog, allow, quietMs = 20 } = {}) {
+  if (t) {
+    const restore = setEnv({ CLAUDESURF_SETTLE_QUIET_MS: quietMs === null ? null : String(quietMs) });
+    t.after(restore);
+  }
   const { Sessions } = require('../server/sessions');
   const { fake, readable, writable } = FakeBrowser.inProcess();
   const conn = new Connection(readable, writable, log);
   const sessions = new Sessions(log);
   sessions.attach(conn);
-  return { fake, conn, sessions, log };
+  let gated = { gate: null, policy: null, policyFile: null };
+  if (allow) {
+    const dir = tmpDir('claudesurf-policy');
+    leftovers.push(dir);
+    gated = attachGate(sessions, conn, { allow, dir, log });
+  }
+  const { gate, policy, policyFile } = gated;
+  return { fake, conn, sessions, log, gate, policy, policyFile, context: { sessions, gate, policy, log } };
+}
+
+// Resolves with fakeSession()'s context over `options`, plus session s1 as `session`
+// and its working tab's registry record as `target`, once that tab has navigated to
+// `url`. `site` maps each URL to the fixture that the fake serves there.
+async function navigatedSession({ url, site, ...options }) {
+  const ctx = fakeSession(options);
+  await require('../server/browser').enableTargets(ctx.conn);
+  Object.assign(ctx.fake.site, site);
+  const session = await ctx.sessions.ensure('s1');
+  await require('../server/navigation').navigate(ctx.context, session, { url, name: 'n' });
+  return { ...ctx, session, target: ctx.sessions.target(session.workingTargetId) };
+}
+
+// Replaces the fake's handler for `method` with one that answers a call on a
+// page-opened tab with `answer` and passes any other call to the handler it replaced.
+function handleOpened(fake, method, answer) {
+  const original = fake.handlers.get(method);
+  fake.handle(method, (p, sid, f) => (fake.bySession(sid).openerId ? answer(p, sid, f) : original(p, sid, f)));
+}
+
+// Resolves with a page read's result with its head and body joined as `payload`, as
+// the response carries them when neither a dialog nor a refusal line comes between.
+async function readPayload(sessions, session, args) {
+  const result = await require('../server/read').readPage(sessions, session, args);
+  return { ...result, payload: result.body ? `${result.head}\n\n${result.body}` : result.head };
 }
 
 // The refs a page payload carries, keyed by the name beside them: control, landmark,
@@ -88,12 +160,13 @@ function refsIn(payload) {
   return refs;
 }
 
-// Every ref the markers of a payload carry, read by the rule read.js finds them with:
-// an unescaped bracket, which page text Turndown escaped never opens. A reader that
-// stripped the escapes and the quoted fields instead would drop a name that forged a
-// marker along with them.
+// Returns every ref that a payload's markers and links' trailing refs carry, each once
+// in the order it first appears, read by the daemon's own rule (render.js's
+// markedRefs): an unescaped bracket, which page text that Turndown escaped doesn't
+// open. A reader that stripped the escapes and the quoted fields instead would drop a
+// name that forged a marker along with them.
 function markedRefs(text) {
-  return [...text.matchAll(/(?<!\\)\[((?:f\d+)?e\d+)[ \]]/g)].map((match) => match[1]);
+  return [...require('../server/render').markedRefs(text)];
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
@@ -138,6 +211,9 @@ async function spawnDaemon({ env = {} } = {}) {
       ...process.env,
       CLAUDESURF_SOCKET: socketPath,
       CLAUDESURF_PROFILE_DIR: profile,
+      CLAUDESURF_POLICY_FILE: writeAllowlist(dir, ['fake.test', 'frame.test']),
+      CLAUDESURF_ACTION_LOG: path.join(dir, 'actions.jsonl'),
+      CLAUDESURF_SETTLE_QUIET_MS: '20',
       CLAUDESURF_BROWSER: FAKE_CHROME,
       DISPLAY: ':0',
       ...env,
@@ -181,9 +257,10 @@ function mockDaemon(socketPath, respond) {
   return { seen, listen: () => new Promise((r) => server.listen(socketPath, r)), close: () => server.close() };
 }
 
-// Spawns the real bridge against `socketPath`, sends one tools/call, and resolves
-// { response, stderr } with the JSON-RPC reply.
-function callBridge({ socketPath, name, args, env = {}, timeoutMs = 9000 }) {
+// Spawns the real bridge against `socketPath`, sends one JSON-RPC request — a
+// tools/call of `name` with `args` unless `method` and `params` say otherwise — and
+// resolves { response, stderr } with the reply.
+function callBridge({ socketPath, name, args, method = 'tools/call', params = { name, arguments: args }, env = {}, timeoutMs = 9000 }) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path.join(SERVER_DIR, 'server.js')], {
       env: { ...process.env, CLAUDESURF_SOCKET: socketPath, CLAUDE_CODE_SESSION_ID: 'test-session', ...env },
@@ -211,7 +288,7 @@ function callBridge({ socketPath, name, args, env = {}, timeoutMs = 9000 }) {
     child.stderr.on('data', (d) => { err += d; });
     child.on('error', (e) => finish(() => reject(e)));
     setTimeout(() => {
-      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }) + '\n');
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) + '\n');
     }, 150);
   });
 }
@@ -223,8 +300,10 @@ function liveBinary() {
 
 // Launches the real browser against a temp profile with Sessions attached; headless
 // unless asked otherwise. Own socket path, so the record lands in the temp
-// directory; the env is restored and the directory removed by close().
-async function liveBrowser({ headless = true } = {}) {
+// directory; the env is restored and the directory removed by close(). With `allow`,
+// a list of hosts, the domain gate attaches over an allowlist of them, which the
+// returned `policyFile` names; without it the handlers' context holds a null gate.
+async function liveBrowser({ headless = true, allow } = {}) {
   const browser = require('../server/browser');
   const { Sessions } = require('../server/sessions');
   const dir = tmpDir('claudesurf-live');
@@ -233,17 +312,22 @@ async function liveBrowser({ headless = true } = {}) {
   const { conn, child } = await browser.launch({ binary: liveBinary(), profileDir: path.join(dir, 'profile'), env, headless, log: silentLog });
   const sessions = new Sessions(silentLog);
   sessions.attach(conn);
+  const { gate, policy, policyFile } = allow ? attachGate(sessions, conn, { allow, dir, log: silentLog }) : {};
   await browser.enableTargets(conn);
   return {
-    conn, child, sessions, dir,
+    conn, child, sessions, dir, gate, policy, policyFile,
+    context: { sessions, gate: gate || null, policy: policy || null, log: silentLog },
     close: async () => {
       await conn.send('Browser.close').catch(() => {});
-      await waitFor(() => child.exitCode !== null || child.signalCode !== null, 5000);
-      if (child.exitCode === null) child.kill('SIGKILL');
+      const exited = () => child.exitCode !== null || child.signalCode !== null;
+      // A Chrome that outlives the wait is killed, so the teardown still restores the
+      // environment and removes the directory.
+      await waitFor(exited, 5000).catch(() => {});
+      if (!exited()) child.kill('SIGKILL');
       restore();
       fs.rmSync(dir, { recursive: true, force: true });
     },
   };
 }
 
-module.exports = { silentLog, recordingLog, tmpDir, tmpSocket, setEnv, withEnv, isolatedPaths, fakeSession, refsIn, markedRefs, sleep, waitFor, request, spawnDaemon, mockDaemon, callBridge, liveBinary, liveBrowser, FAKE_CHROME };
+module.exports = { silentLog, modesIgnored, recordingLog, tmpDir, tmpSocket, setEnv, withEnv, isolatedPaths, fakeSession, navigatedSession, handleOpened, readPayload, refsIn, markedRefs, sleep, waitFor, request, spawnDaemon, mockDaemon, callBridge, liveBinary, liveBrowser, FAKE_CHROME };

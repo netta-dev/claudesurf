@@ -6,9 +6,13 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const browser = require('../server/browser');
 const { Sessions, SESSION_PAGE, parseSessionPage } = require('../server/sessions');
-const { fakeSession, sleep, waitFor, isolatedPaths, silentLog, FAKE_CHROME } = require('./helpers');
+const { fakeSession, sleep, waitFor, isolatedPaths, silentLog, recordingLog, FAKE_CHROME } = require('./helpers');
 const { Connection, ProtocolError } = require('../server/cdp');
 const { FakeBrowser } = require('./fakes/fake-browser');
+const refusals = require('../server/refusals');
+const requests = require('../server/requests');
+const retained = require('../server/retained');
+const tabRecords = require('../server/tab-records');
 
 const { enableTargets } = browser;
 
@@ -102,19 +106,77 @@ test('a frame whose renderer is wedged fails every preparation command without a
   assert.ok(fake.callsTo('Runtime.runIfWaitingForDebugger').some((c) => c.sessionId === frame.sessionId), 'and released, so its load is not held');
 });
 
-test('the preparation commands are queued ahead of the release, so a target that answers nothing until then still attaches', async () => {
+test('the tab is attributed and numbered at attach, and its commands, arming first, are queued ahead of the release, so a target that answers nothing until then still attaches', async () => {
   const { fake, sessions } = await setup();
   const session = await sessions.ensure('s1');
+  const release = fake.handlers.get('Runtime.runIfWaitingForDebugger');
+  let atRelease = null;
+  fake.handle('Runtime.runIfWaitingForDebugger', (p, sid, f) => {
+    const t = fake.bySession(sid);
+    if (t && t.openerId) {
+      const record = sessions.target(t.targetId);
+      atRelease = { role: record.role, tab: session.tabIds.get(t.targetId), enabled: t.enabled };
+    }
+    return release(p, sid, f);
+  });
   // This tab answers Page.enable, the auto-attach, and the window lookup only once it
   // has been released, as a renderer paused on attach does: a handler that awaited one
   // of them first would wait for a document the pause holds back, and nothing below
   // would happen.
   const opened = fake.createTarget({ url: 'http://a.test/tab', windowId: 999, openerId: session.workingTargetId, holdUntilRelease: true });
-  await waitFor(() => session.opened.has(opened.targetId), 1000);
-  assert.strictEqual(sessions.target(opened.targetId).role, 'opened', 'the claim runs after the commands it queued were answered');
-  assert.strictEqual(sessions.target(opened.targetId).windowId, 999, 'and the window the lookup reported is recorded');
+  await waitFor(() => sessions.target(opened.targetId) && sessions.target(opened.targetId).windowId === 999, 1000);
+  assert.deepStrictEqual(atRelease, { role: 'opened', tab: 3, enabled: false }, 'attributed and numbered before any of its commands answered');
+  const sent = fake.calls.filter((c) => c.sessionId === opened.sessionId).map((c) => c.method);
+  assert.deepStrictEqual(sent.slice(0, sent.indexOf('Runtime.runIfWaitingForDebugger') + 1), [
+    'Network.enable', 'Network.setBypassServiceWorker', 'Page.setPrerenderingAllowed',
+    'Page.enable', 'Target.setAutoAttach', 'Emulation.setFocusEmulationEnabled', 'Runtime.runIfWaitingForDebugger',
+  ]);
+  assert.strictEqual(sessions.target(opened.targetId).role, 'opened');
   assert.ok(fake.targets.get(opened.targetId).enabled, 'Page.enable landed');
-  assert.ok(fake.callsTo('Target.setAutoAttach').some((c) => c.sessionId === opened.sessionId));
+  await waitFor(() => sessions.target(opened.targetId).armed);
+});
+
+test('a tab attributed at attach is armed and released though a waiter on its opener throws as the attribution wakes it, and a later throw in the handler is logged rather than left unhandled', async (t) => {
+  const log = recordingLog();
+  const ctx = fakeSession({ log });
+  t.after(() => ctx.conn.close());
+  await enableTargets(ctx.conn);
+  const { fake, sessions } = ctx;
+  const session = await sessions.ensure('s1');
+  const opener = session.workingTargetId;
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.off('unhandledRejection', onUnhandled));
+  // The predicate passes the check that waitUntil makes at once and throws on the next,
+  // the one that the attribution's wake-up runs.
+  let checks = 0;
+  sessions.waitUntil(opener, () => { if (checks++ > 0) throw new Error('a broken predicate'); return false; }, { timeout: 2_000 }).catch(() => {});
+  const woken = fake.createTarget({ url: 'http://a.test/woken', windowId: session.windowId, openerId: opener });
+  await fake.waitForCall('Runtime.runIfWaitingForDebugger', (c) => c.sessionId === woken.sessionId);
+  const sent = fake.calls.filter((c) => c.sessionId === woken.sessionId).map((c) => c.method);
+  assert.ok(sent.indexOf('Network.enable') >= 0 && sent.indexOf('Network.enable') < sent.indexOf('Runtime.runIfWaitingForDebugger'), `armed ahead of its release: ${sent}`);
+  // A throw after the handler's first await rejects the promise that it returned.
+  sessions.claim = () => { throw new Error('a broken claim'); };
+  const late = fake.createTarget({ url: 'http://a.test/late', windowId: session.windowId, openerId: opener });
+  await waitFor(() => log.lines.error.some((line) => line.includes('a broken claim')));
+  await sleep(20);
+  assert.ok(fake.targets.get(late.targetId).released);
+  assert.deepStrictEqual(unhandled.map(String), []);
+});
+
+test('a target whose attach step throws before its commands are queued is still released, so its navigation is not wedged', async (t) => {
+  const log = recordingLog();
+  const ctx = fakeSession({ log });
+  t.after(() => ctx.conn.close());
+  await enableTargets(ctx.conn);
+  const { fake, sessions } = ctx;
+  const session = await sessions.ensure('s1');
+  sessions.attribute = () => { throw new Error('a broken attribution'); };
+  const opened = fake.createTarget({ url: 'http://a.test/tab', windowId: session.windowId, openerId: session.workingTargetId });
+  await waitFor(() => log.lines.error.some((line) => line.includes('a broken attribution')));
+  await sleep(20);
+  assert.ok(fake.targets.get(opened.targetId).released);
 });
 
 test('a preparation command that fails leaves the target recorded and released, so its load is not held', async () => {
@@ -166,7 +228,7 @@ test('a page-opened target is attributed by opener in the session window and in 
   const inWindow = fake.createTarget({ url: 'http://a.test/tab', windowId: session.windowId, openerId: session.workingTargetId });
   const popup = fake.createTarget({ url: 'http://a.test/popup', windowId: 999, openerId: session.workingTargetId });
   const stray = fake.createTarget({ url: 'http://a.test/stray', windowId: 998 });
-  await waitFor(() => session.opened.size === 2);
+  await waitFor(() => session.opened.size === 2 && sessions.target(popup.targetId).windowId !== null);
   assert.strictEqual(sessions.target(inWindow.targetId).role, 'opened');
   assert.strictEqual(sessions.target(inWindow.targetId).sessionId, 's1');
   assert.strictEqual(sessions.target(popup.targetId).sessionId, 's1');
@@ -177,11 +239,20 @@ test('a page-opened target is attributed by opener in the session window and in 
   assert.strictEqual(session.workingTargetId, sessions.target(session.workingTargetId).targetId, 'the working tab is unchanged');
 });
 
-test('a page-opened target attached without a URL is attributed by opener on its first navigation, and its window is recorded when the reply lands', async () => {
+test('a page-opened target attached without a URL is attributed by opener at attach, before its first navigation, and its window is recorded when the reply lands', async () => {
   const { fake, sessions } = await setup();
   const session = await sessions.ensure('s1');
+  const release = fake.handlers.get('Runtime.runIfWaitingForDebugger');
+  let atRelease = null;
+  fake.handle('Runtime.runIfWaitingForDebugger', (p, sid, f) => {
+    const record = sessions.target(fake.bySession(sid).targetId);
+    if (record && record.openerId) atRelease = { role: record.role, url: record.url, generation: record.generation };
+    return release(p, sid, f);
+  });
   const popup = fake.createTarget({ url: '', lateUrl: 'http://a.test/pop', windowId: 999, openerId: session.workingTargetId, windowDelayMs: 60 });
   await waitFor(() => session.opened.has(popup.targetId));
+  await waitFor(() => atRelease !== null);
+  assert.deepStrictEqual(atRelease, { role: 'opened', url: '', generation: 0 }, 'attributed while the first document is still held back');
   assert.strictEqual(sessions.target(popup.targetId).role, 'opened');
   assert.strictEqual(sessions.target(popup.targetId).sessionId, 's1');
   assert.strictEqual(await sessions.windowOf(popup.targetId), 999);
@@ -223,12 +294,12 @@ test('identity page navigated away and working destroyed → the whole window is
   assert.deepStrictEqual(session.takeNotes(), ['session window was recreated']);
 });
 
-test('both destroyed → window recreated under its label; page-opened targets dropped', async () => {
+test('when both tabs are destroyed, the window is recreated under its label, and a popup left in another window is disowned', async () => {
   const { fake, sessions } = await setup();
   const session = await sessions.ensure('s1');
   await sessions.setLabel(session, 'my task', 'details');
-  const opened = fake.createTarget({ url: 'http://a.test/tab', windowId: session.windowId, openerId: session.workingTargetId });
-  await waitFor(() => session.opened.size === 1);
+  const opened = fake.createTarget({ url: 'http://a.test/tab', windowId: 4242, openerId: session.workingTargetId });
+  await waitFor(() => session.opened.size === 1 && sessions.target(opened.targetId).windowId === 4242);
   fake.destroyTarget(session.workingTargetId);
   fake.destroyTarget(session.identityTargetId);
   await waitFor(() => session.windowId === null);
@@ -464,7 +535,7 @@ test('Sessions.attach rebinds to the new connection across a relaunch', async (t
   }
 });
 
-test('an out-of-process frame is recorded as its own target: Page.enable and the release, no focus emulation or window lookup', async () => {
+test('an out-of-process frame is recorded as its own target: Page.enable, focus emulation, and the release, without a window lookup', async () => {
   const { fake, sessions } = await setup();
   const session = await sessions.ensure('s1');
   const working = fake.targets.get(session.workingTargetId);
@@ -475,7 +546,7 @@ test('an out-of-process frame is recorded as its own target: Page.enable and the
   assert.strictEqual(record.parentTargetId, working.targetId);
   assert.strictEqual(record.mainFrameId, frame.targetId, "an out-of-process frame's id is its target id");
   await fake.waitForCall('Runtime.runIfWaitingForDebugger', (c) => c.sessionId === frame.sessionId);
-  assert.ok(!fake.callsTo('Emulation.setFocusEmulationEnabled').some((c) => c.sessionId === frame.sessionId), 'no focus emulation');
+  assert.ok(fake.callsTo('Emulation.setFocusEmulationEnabled').some((c) => c.sessionId === frame.sessionId), 'focus emulation, since a frame takes keys');
   assert.ok(!fake.callsTo('Browser.getWindowForTarget').some((c) => c.params.targetId === frame.targetId), 'no window lookup');
   assert.strictEqual(session.workingTargetId, working.targetId, 'the frame claims no role');
   assert.strictEqual(record.role, null);
@@ -642,4 +713,386 @@ test('an error that is not a missing context is not retried', async () => {
   let attempts = 0;
   await assert.rejects(sessions.withWorld(t.targetId, null, () => { attempts++; throw new Error('page script failed'); }), /page script failed/);
   assert.strictEqual(attempts, 1);
+});
+
+test('ready resolves once Page.enable settles: with null for a tab not armed at attach, with arming\'s outcomes for one that was, and with null for a target that goes first', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  assert.strictEqual(await sessions.target(session.workingTargetId).ready, null, 'createTarget opened the working tab, which has no opener to arm it at attach');
+  const opened = fake.createTarget({ url: 'http://a.test/tab', openerId: session.workingTargetId });
+  await waitFor(() => sessions.target(opened.targetId));
+  const outcomes = await sessions.target(opened.targetId).ready;
+  assert.deepStrictEqual(outcomes.map((o) => [o.method, o.ok]), [
+    ['Network.enable', true], ['Network.setBypassServiceWorker', true], ['Page.setPrerenderingAllowed', true],
+  ]);
+  fake.handle('Page.enable', (p, sid) => {
+    if (fake.bySession(sid).url === 'http://a.test/rejects') throw { code: -32000, message: 'no' };
+    if (fake.bySession(sid).url === 'http://a.test/hangs') return new Promise(() => {});
+    return {};
+  });
+  const rejecting = fake.createTarget({ url: 'http://a.test/rejects', openerId: session.workingTargetId });
+  await waitFor(() => sessions.target(rejecting.targetId));
+  assert.strictEqual((await sessions.target(rejecting.targetId).ready).length, 3, 'a rejected Page.enable resolves it too');
+  const hanging = fake.createTarget({ url: 'http://a.test/hangs', openerId: session.workingTargetId });
+  await waitFor(() => sessions.target(hanging.targetId));
+  const ready = sessions.target(hanging.targetId).ready;
+  fake.destroyTarget(hanging.targetId);
+  assert.strictEqual(await ready, null, 'the destruction resolves it with no outcomes');
+});
+
+test('arming: Network.enable with zero buffers, the bypass, and prerendering off are queued before the release of a tab a session page opened, and awaited by repair for the working tab; Fetch.enable goes only under an interceptor', async () => {
+  for (const allow of [undefined, ['a.test']]) {
+    const ctx = fakeSession({ allow });
+    await enableTargets(ctx.conn);
+    const { fake, sessions } = ctx;
+    const session = await sessions.ensure('s1');
+    const working = sessions.target(session.workingTargetId);
+    const on = (target) => fake.calls.filter((c) => c.sessionId === fake.targets.get(target).sessionId).map((c) => c.method);
+    assert.ok(working.armed, 'repair armed the working tab before ensure returned');
+    assert.deepStrictEqual(fake.callsTo('Network.enable').find((c) => c.sessionId === working.cdpSessionId).params, { maxTotalBufferSize: 0, maxResourceBufferSize: 0 });
+    const opened = fake.createTarget({ url: 'http://a.test/tab', openerId: working.targetId, holdUntilRelease: true });
+    await waitFor(() => sessions.target(opened.targetId) && sessions.target(opened.targetId).armed);
+    const sent = on(opened.targetId);
+    const released = sent.indexOf('Runtime.runIfWaitingForDebugger');
+    for (const method of ['Network.enable', 'Network.setBypassServiceWorker', 'Page.setPrerenderingAllowed']) {
+      assert.ok(sent.indexOf(method) !== -1 && sent.indexOf(method) < released, `${method} queued before the release`);
+    }
+    for (const target of [working.targetId, opened.targetId]) {
+      const prerender = fake.callsTo('Page.setPrerenderingAllowed').filter((c) => c.sessionId === fake.targets.get(target).sessionId);
+      assert.deepStrictEqual(prerender.map((c) => c.params), [{ isAllowed: false }], 'prerendering is switched off');
+    }
+    assert.strictEqual(on(working.targetId).includes('Fetch.enable'), Boolean(allow), 'Fetch.enable on the working tab only under an interceptor');
+    assert.strictEqual(sent.includes('Fetch.enable'), Boolean(allow), 'and on the opened tab likewise');
+    if (allow) assert.ok(sent.indexOf('Fetch.enable') < released);
+    const stray = fake.createTarget({ url: 'http://a.test/stray' });
+    await waitFor(() => sessions.target(stray.targetId) && sessions.target(stray.targetId).windowId !== null);
+    assert.ok(!on(stray.targetId).includes('Network.enable'), 'a tab opened outside every session is never armed');
+    ctx.conn.close();
+  }
+});
+
+test("repair's wait for the arming that a repaired working tab's attach queued ends at the call's deadline", async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const identity = session.identityTargetId;
+  // The tab that the identity page opens never answers its Network.enable.
+  const enable = fake.handlers.get('Network.enable');
+  fake.handle('Network.enable', (p, sid, f) => (fake.bySession(sid).openerId === identity ? new Promise(() => {}) : enable(p, sid, f)));
+  fake.destroyTarget(session.workingTargetId);
+  await waitFor(() => session.workingTargetId === null);
+  const started = Date.now();
+  await assert.rejects(sessions.ensureWithNotes('s1', { deadline: started + 1_000 }), (e) => {
+    assert.deepStrictEqual(e.envelope, { outcome: 'error', message: 'the working tab could not be put under the domain gate; call again' });
+    return true;
+  });
+  const spent = Date.now() - started;
+  assert.ok(spent < 2_000, `the call spent ${spent} ms against its 1,000 ms deadline`);
+});
+
+test('a pushState moves a page target\'s URL and counts as its landing; a child frame\'s does neither, and a frame target keeps its own URL', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const working = fake.targets.get(session.workingTargetId);
+  fake.navigateTarget(working, 'http://a.test/');
+  const t = sessions.target(working.targetId);
+  await waitFor(() => t.url === 'http://a.test/');
+  const frame = await attachFrame(fake, sessions, working);
+  fake.navigateTarget(frame, 'http://frame.test/child');
+  await waitFor(() => sessions.target(frame.targetId).url === 'http://frame.test/child');
+  fake.emit('Page.navigatedWithinDocument', { frameId: 'child', url: 'http://a.test/child#x' }, t.cdpSessionId);
+  fake.emit('Page.navigatedWithinDocument', { frameId: frame.targetId, url: 'http://frame.test/moved' }, frame.sessionId);
+  fake.emit('Page.navigatedWithinDocument', { frameId: t.targetId, url: 'http://a.test/settings' }, t.cdpSessionId);
+  await waitFor(() => t.url === 'http://a.test/settings');
+  assert.strictEqual(t.sameDocument, 1, "the child frame's event isn't the page's landing");
+  assert.strictEqual(sessions.target(frame.targetId).url, 'http://frame.test/child');
+  assert.strictEqual(sessions.target(frame.targetId).sameDocument, 1, 'a frame target counts its own');
+});
+
+test('tab numbers count from 1 and survive a role claim; tab records go with their target, the window, and EOF, and aren\'t reused', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  assert.strictEqual(session.tabIds.get(session.workingTargetId), 1);
+  assert.strictEqual(session.tabIds.get(session.identityTargetId), 2, 'numbered when attributed by opener, and kept by its claim');
+  const opened = fake.createTarget({ url: 'http://a.test/tab', windowId: 4242, openerId: session.workingTargetId });
+  await waitFor(() => session.tabIds.get(opened.targetId) === 3);
+  fake.destroyTarget(opened.targetId);
+  await waitFor(() => !sessions.target(opened.targetId));
+  assert.ok(!session.tabIds.has(opened.targetId), 'a closed tab leaves the records');
+  fake.destroyTarget(session.workingTargetId);
+  fake.destroyTarget(session.identityTargetId);
+  await waitFor(() => session.windowId === null);
+  assert.strictEqual(session.tabIds.size, 0, 'the window state takes the rest');
+  await sessions.ensure('s1');
+  assert.deepStrictEqual([...session.tabIds.values()], [4, 5], 'a recreated window\'s tabs take new numbers');
+  fake.close();
+  await waitFor(() => session.windowId === null);
+  assert.strictEqual(session.tabIds.size, 0, 'and EOF takes them all');
+  assert.strictEqual(session.nextTab, 6, 'while the counter survives');
+});
+
+test('a refusal outlives its tab, and goes with the window state and on EOF unless a call is running', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const opened = fake.createTarget({ url: 'http://a.test/tab', windowId: 4242, openerId: session.workingTargetId });
+  await waitFor(() => session.tabIds.has(opened.targetId));
+  const refuse = (s, targetId) => refusals.record(s, { kind: 'navigation', how: 'stopped', url: 'http://b.test/', host: 'b.test', targetId, tab: s.tabIds.get(targetId) });
+  refuse(session, opened.targetId);
+  fake.destroyTarget(opened.targetId);
+  await waitFor(() => !sessions.target(opened.targetId));
+  assert.strictEqual(session.refusals.length, 1, 'kept past its tab');
+  session.marks = { seq: 0, nextTab: session.nextTab, workingTargetId: session.workingTargetId };
+  fake.destroyTarget(session.workingTargetId);
+  fake.destroyTarget(session.identityTargetId);
+  await waitFor(() => session.windowId === null);
+  assert.strictEqual(session.refusals.length, 1, 'a running call keeps the list through the window state\'s drop');
+  session.marks = null;
+  await sessions.ensure('s1');
+  assert.deepStrictEqual(session.refusals, [], 'the next window recreation takes it');
+  refuse(session, session.workingTargetId);
+  session.droppedRefusals = 2;
+  fake.close();
+  await waitFor(() => session.windowId === null);
+  assert.deepStrictEqual([session.refusals, session.droppedRefusals], [[], 0], 'and so does EOF');
+  assert.strictEqual(session.refusalCount, 2, 'while the counter survives, so a seq stays past every mark');
+
+  const during = await setup();
+  const running = await during.sessions.ensure('s1');
+  refuse(running, running.workingTargetId);
+  running.marks = { seq: 0, nextTab: running.nextTab, workingTargetId: running.workingTargetId };
+  during.fake.close();
+  await waitFor(() => running.windowId === null);
+  assert.strictEqual(running.refusals.length, 1, 'an EOF during a call keeps the list too');
+});
+
+test('the window state lasts while a session tab remains in the window, a tab whose window is still unknown included; the next call then recreates the window, disowning and disarming that tab', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const inWindow = fake.createTarget({ url: 'http://a.test/tab', windowId: session.windowId, openerId: session.workingTargetId });
+  // Its window lookup answers late, so the registry hasn't recorded its window yet.
+  const pending = fake.createTarget({ url: 'http://a.test/pending', windowId: 4242, openerId: session.workingTargetId, windowDelayMs: 500 });
+  await waitFor(() => sessions.target(inWindow.targetId) && sessions.target(inWindow.targetId).armed);
+  await waitFor(() => sessions.target(pending.targetId) && session.opened.has(pending.targetId));
+  fake.destroyTarget(inWindow.targetId);
+  fake.destroyTarget(session.workingTargetId);
+  fake.destroyTarget(session.identityTargetId);
+  await waitFor(() => session.identityTargetId === null);
+  assert.strictEqual(sessions.target(pending.targetId).windowId, null);
+  assert.ok(session.windowId !== null, 'the tab whose lookup is pending counts as in the window');
+  await waitFor(() => sessions.target(pending.targetId).windowId === 4242);
+  const before = fake.calls.length;
+  await sessions.ensure('s1');
+  assert.strictEqual(fake.callsTo('Target.createTarget').length, 2, 'no identity page to return through, so the window is recreated');
+  assert.strictEqual(sessions.target(pending.targetId).sessionId, null, 'and the tab left behind is disowned');
+  const undone = fake.calls.slice(before).filter((c) => c.sessionId === pending.sessionId).map((c) => c.method);
+  assert.deepStrictEqual(undone, ['Fetch.disable', 'Network.setBypassServiceWorker', 'Page.setPrerenderingAllowed', 'Network.disable'], 'and disarmed');
+});
+
+test("a session's tab that reaches the session page of its other role keeps the role it holds, its number, and its arming", async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const working = session.workingTargetId;
+  await waitFor(() => sessions.target(working).armed);
+  fake.navigateTarget(fake.targets.get(working), pageUrl('s1', 'identity'));
+  await waitFor(() => parseSessionPage(sessions.target(working).url) !== null);
+  const t = sessions.target(working);
+  assert.deepStrictEqual({ role: t.role, sessionId: t.sessionId, armed: t.armed }, { role: 'working', sessionId: 's1', armed: true });
+  assert.strictEqual(session.tabIds.get(working), 1);
+  const { notes } = await sessions.ensureWithNotes('s1');
+  assert.deepStrictEqual(notes, [], 'the next call has nothing to repair');
+  assert.strictEqual(session.workingTargetId, working);
+});
+
+test('repair returns to the most recent live earlier working tab with a note, skipping one that claim let go, before the identity page\'s working link', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const first = session.workingTargetId;
+  const open = async (name) => {
+    const target = fake.createTarget({ url: `http://a.test/${name}`, windowId: session.windowId, openerId: session.workingTargetId });
+    await waitFor(() => sessions.target(target.targetId) && sessions.target(target.targetId).armed);
+    return target.targetId;
+  };
+  const second = await open('second');
+  const third = await open('third');
+  const fourth = await open('fourth');
+  tabRecords.switchWorking(sessions, session, second);
+  tabRecords.switchWorking(sessions, session, third);
+  tabRecords.switchWorking(sessions, session, fourth);
+  assert.deepStrictEqual(session.earlierWorking, [first, second, third]);
+  assert.strictEqual(sessions.target(first).role, 'opened', 'the old working tab joins the opened tabs');
+  // The third tab goes back to the session page, where claim lets it go as a second
+  // working tab.
+  fake.navigateTarget(fake.targets.get(third), fake.targets.get(first).url);
+  await waitFor(() => sessions.target(third).sessionId === null);
+  fake.destroyTarget(fourth);
+  await waitFor(() => session.workingTargetId === null);
+  await sessions.ensure('s1');
+  assert.strictEqual(session.workingTargetId, second, 'the let-go entry is skipped, and of the two live ones the more recent is taken');
+  assert.deepStrictEqual(session.takeNotes(), ['the working tab closed; t3 is the working tab again']);
+  fake.destroyTarget(first);
+  fake.destroyTarget(second);
+  await waitFor(() => session.workingTargetId === null);
+  await sessions.ensure('s1');
+  assert.deepStrictEqual(session.takeNotes(), ['working tab was recreated'], 'an empty stack falls through to the identity page');
+});
+
+test("tab records list the working tab first and the rest by number, each tab or popup by the window the registry recorded, and latestIn finds the most recent live earlier working tab in the session's window", async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const first = session.workingTargetId;
+  const popup = fake.createTarget({ url: 'http://a.test/popup', windowId: 4242, openerId: first });
+  const tab = fake.createTarget({ url: 'http://a.test/tab', windowId: session.windowId, openerId: first, windowDelayMs: 100 });
+  const next = fake.createTarget({ url: 'http://a.test/next', windowId: session.windowId, openerId: first });
+  await waitFor(() => [popup, next].every((t) => sessions.target(t.targetId) && sessions.target(t.targetId).armed) && sessions.target(tab.targetId));
+  tabRecords.switchWorking(sessions, session, next.targetId);
+  assert.strictEqual(sessions.target(tab.targetId).windowId, null, 'its window lookup has not answered yet');
+  assert.deepStrictEqual(await tabRecords.tabs(sessions, session), [
+    { id: 't5', targetId: next.targetId, kind: 'working' },
+    { id: 't1', targetId: first, kind: 'tab' },
+    { id: 't2', targetId: session.identityTargetId, kind: 'identity' },
+    { id: 't3', targetId: popup.targetId, kind: 'popup' },
+    { id: 't4', targetId: tab.targetId, kind: 'tab' },
+  ]);
+  assert.strictEqual(await tabRecords.latestIn(sessions, session), first);
+  assert.deepStrictEqual(session.earlierWorking, [first], 'latestIn leaves the stack as it is');
+  tabRecords.switchWorking(sessions, session, popup.targetId);
+  tabRecords.switchWorking(sessions, session, first);
+  assert.deepStrictEqual(session.earlierWorking, [next.targetId, popup.targetId]);
+  assert.strictEqual(await tabRecords.latestIn(sessions, session), next.targetId, 'the more recent popup in another window is passed over');
+  tabRecords.switchWorking(sessions, session, tab.targetId);
+  assert.strictEqual(await tabRecords.latestIn(sessions, session), first, 'and of two tabs in the window, the more recent is found');
+});
+
+test('the Network events of a tab are kept per target, its counted requests capped at 1,000, and an image left uncounted', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const tab = fake.targets.get(session.workingTargetId);
+  const t = sessions.target(tab.targetId);
+  const started = [];
+  for (let i = 0; i < 1_005; i++) started.push(fake.networkRequest(tab, { type: 'XHR' }));
+  await waitFor(() => requests.busy(t).count === 1_000);
+  // The image takes the oldest request's place in the store and doesn't count.
+  fake.networkRequest(tab, { type: 'Image' });
+  await waitFor(() => requests.busy(t).count === 999);
+  started.at(-1).finish();
+  await waitFor(() => requests.busy(t).count === 998, 1000);
+  started.at(-2).finish(true);
+  await waitFor(() => requests.busy(t).count === 997, 1000, 'a failed request ends as a finished one does');
+});
+
+test("a frame's document request that the page's session carried ends when the frame attaches as a target of its own", async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const tab = fake.targets.get(session.workingTargetId);
+  const t = sessions.target(tab.targetId);
+  const frameId = `T${fake.nextTarget}`;
+  fake.emit('Network.requestWillBeSent', { requestId: 'frame-doc', type: 'Document', frameId, request: { url: 'http://frame.test/' } }, tab.sessionId);
+  await waitFor(() => requests.busy(t).count === 1);
+  const woken = sessions.waitUntil(t.targetId, (target) => requests.busy(target).count === 0, { timeout: 1000 });
+  const frame = fake.createTarget({ type: 'iframe', parent: tab, url: 'http://frame.test/' });
+  assert.strictEqual(frame.targetId, frameId);
+  assert.strictEqual(await woken, true, "the frame's attach ends it and wakes the page's waiters");
+});
+
+test('a waiter whose predicate throws fails with the throw, which is logged, and the waiters after it still run', async (t) => {
+  const log = recordingLog();
+  const ctx = fakeSession({ log });
+  t.after(() => ctx.conn.close());
+  await enableTargets(ctx.conn);
+  const { fake, sessions } = ctx;
+  const session = await sessions.ensure('s1');
+  const tab = fake.targets.get(session.workingTargetId);
+  const loads = sessions.target(tab.targetId).loads;
+  // The predicate passes the check that waitUntil makes at once and throws on the next.
+  let checks = 0;
+  const broken = sessions.waitUntil(tab.targetId, () => { if (checks++ > 0) throw new Error('a broken predicate'); return false; }, { timeout: 2_000 });
+  const after = sessions.waitUntil(tab.targetId, (target) => target.loads > loads, { timeout: 2_000 });
+  fake.emit('Page.loadEventFired', {}, tab.sessionId);
+  assert.strictEqual(await after, true, 'the waiter after the broken one ran on the same event');
+  await assert.rejects(broken, /a broken predicate/);
+  assert.ok(log.lines.warn.some((line) => line.includes('a broken predicate')), log.lines.warn.join('\n'));
+});
+
+test('DOMContentLoaded marks the document it fired in as loaded, and a back-forward cache restore counts as a load and as DOMContentLoaded', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const tab = fake.targets.get(session.workingTargetId);
+  const t = sessions.target(tab.targetId);
+  const before = { loads: t.loads, generation: t.generation };
+  fake.navigateTarget(tab, 'http://a.test/');
+  await waitFor(() => t.loads === before.loads + 1);
+  assert.strictEqual(t.loadedGeneration, before.generation + 1);
+  const woken = sessions.waitUntil(t.targetId, (target) => target.loadedGeneration === before.generation + 2, { timeout: 1000 });
+  fake.emit('Page.frameNavigated', { frame: { id: tab.targetId, url: 'http://a.test/back' }, type: 'BackForwardCacheRestore' }, tab.sessionId);
+  assert.strictEqual(await woken, true, "the restore wakes the tab's waiters");
+  assert.deepStrictEqual(
+    { loads: t.loads, generation: t.generation, loadedGeneration: t.loadedGeneration },
+    { loads: before.loads + 2, generation: before.generation + 2, loadedGeneration: before.generation + 2 },
+  );
+  fake.emit('Page.frameNavigated', { frame: { id: tab.targetId, url: 'http://a.test/next' }, type: 'Navigation' }, tab.sessionId);
+  await waitFor(() => t.generation === before.generation + 3);
+  assert.strictEqual(t.loadedGeneration, before.generation + 2, 'a plain commit waits for its own event');
+  fake.emit('Page.domContentEventFired', { timestamp: 1 }, tab.sessionId);
+  await waitFor(() => t.loadedGeneration === before.generation + 3);
+});
+
+test('a retained render goes with its tab, the window state, and EOF, and a render over the cap leaves a size marker in its place', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const render = (region) => ({ params: {}, overlayBlocks: [], region, linkLists: [], hiddenSection: '', header: {}, source: 'read', startedAt: Date.now() });
+  const keep = (targetId, region = 'Region.') => retained.keep(session, sessions.target(targetId), { ...render(region), generation: sessions.target(targetId).generation });
+  assert.strictEqual(keep(session.workingTargetId, 'x'.repeat(500_001)), false, 'past the cap the render is not kept');
+  assert.deepStrictEqual(retained.current(session, sessions.target(session.workingTargetId)), { tooLarge: true, generation: sessions.target(session.workingTargetId).generation, size: 500_001 });
+  const opened = fake.createTarget({ url: 'http://a.test/tab', windowId: fake.targets.get(session.workingTargetId).windowId, openerId: session.workingTargetId });
+  await waitFor(() => sessions.target(opened.targetId));
+  assert.strictEqual(keep(opened.targetId), true);
+  assert.strictEqual(keep(session.workingTargetId), true);
+  fake.destroyTarget(opened.targetId);
+  await waitFor(() => !sessions.target(opened.targetId));
+  assert.deepStrictEqual([...session.retained.keys()], [session.workingTargetId], 'a closed tab takes its render');
+  fake.destroyTarget(session.workingTargetId);
+  fake.destroyTarget(session.identityTargetId);
+  await waitFor(() => session.windowId === null);
+  assert.strictEqual(session.retained.size, 0, 'the window state takes the rest');
+  await sessions.ensure('s1');
+  keep(session.workingTargetId);
+  fake.close();
+  await waitFor(() => session.windowId === null);
+  assert.strictEqual(session.retained.size, 0, 'and so does EOF');
+});
+
+test("a tab's in-flight requests go when it is destroyed and when it is disarmed", async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const working = sessions.target(session.workingTargetId);
+  // The session lets go of a popup in a window of its own once the session's window has
+  // closed.
+  const opened = fake.createTarget({ url: 'http://a.test/tab', windowId: 4242, openerId: working.targetId });
+  await waitFor(() => sessions.target(opened.targetId) && sessions.target(opened.targetId).armed);
+  const t = sessions.target(opened.targetId);
+  fake.networkRequest(fake.targets.get(working.targetId), { type: 'Fetch' });
+  fake.networkRequest(opened, { type: 'Fetch' });
+  await waitFor(() => requests.busy(working).count === 1 && requests.busy(t).count === 1);
+  fake.destroyTarget(working.targetId);
+  await waitFor(() => !sessions.target(working.targetId));
+  assert.strictEqual(requests.busy(working).count, 0, 'destroyed');
+  fake.destroyTarget(session.identityTargetId);
+  await waitFor(() => t.sessionId === null);
+  assert.strictEqual(requests.busy(t).count, 0, 'disarmed');
+});
+
+test("a new document's commit ends the requests that its tab's earlier document left in flight, and keeps its own", async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const tab = fake.targets.get(session.workingTargetId);
+  const t = sessions.target(tab.targetId);
+  const send = (requestId, loaderId, type) => fake.emit('Network.requestWillBeSent', { requestId, loaderId, type, request: { url: 'http://a.test/x' } }, tab.sessionId);
+  send('old-1', 'L-old', 'Fetch');
+  send('old-2', 'L-old', 'Fetch');
+  fake.announce(tab, 'http://a.test/next');
+  // Chrome sends a document's own request under its loader id, as its request id too.
+  send(tab.loaderId, tab.loaderId, 'Document');
+  await waitFor(() => requests.busy(t).count === 3);
+  fake.commitDocument(tab, 'http://a.test/next');
+  await waitFor(() => t.url === 'http://a.test/next');
+  assert.strictEqual(requests.busy(t).count, 1);
 });

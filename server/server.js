@@ -11,6 +11,7 @@ const { daemonSocketPath, GRAPHICAL_VARS } = require('./paths');
 const { createLogger } = require('./diagnostics');
 const { validate, toolDefinitions } = require('./dispatch');
 const envelope = require('./envelope');
+const { version: VERSION } = require('./package.json');
 
 const log = createLogger('claudesurf mcp');
 const SOCK = daemonSocketPath();
@@ -141,7 +142,7 @@ async function handleMcpMessage(msg) {
         result: {
           protocolVersion: '2024-11-05',
           capabilities: { tools: {} },
-          serverInfo: { name: 'claudesurf', version: '2.0.0' },
+          serverInfo: { name: 'claudesurf', version: VERSION },
         },
       });
       break;

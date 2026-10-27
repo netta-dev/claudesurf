@@ -93,6 +93,14 @@ test('the request carries session id, tool, action, args, and the graphical envi
   });
 });
 
+test('initialize reports the version that package.json carries', async (t) => {
+  const { version } = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'server', 'package.json'), 'utf8'));
+  const socketPath = tmpSocket();
+  t.after(() => fs.rmSync(path.dirname(socketPath), { recursive: true, force: true }));
+  const { response } = await callBridge({ socketPath, method: 'initialize', params: {} });
+  assert.deepStrictEqual(response.result.serverInfo, { name: 'claudesurf', version });
+});
+
 test('a daemon that does not answer in time renders as error', async () => {
   await withMock(() => undefined, async (socketPath) => {
     const started = Date.now();

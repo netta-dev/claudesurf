@@ -1,0 +1,36 @@
+<!doctype html>
+<!-- Every way a page leaves for another site: a link, a redirect, tabs that it opens at once
+     and later, and, inside a cross-site frame, a tab and a top-level navigation. The
+     destination is `to` + /other, the cross-site base by default; ?frame=1 is the
+     frame's own copy. The image's response never ends. -->
+<meta charset="utf-8">
+<title>Leave</title>
+<h1 id="heading">Leave</h1>
+<p><a id="link" href="#">Go to the other site</a></p>
+<p><a id="redirect" href="#">Go through a redirect</a></p>
+<p><a id="blank" target="_blank" href="#">Open the other site in a new tab</a></p>
+<p><a id="blank-noopener" target="_blank" rel="noopener" href="#">Open it without an opener</a></p>
+<p><button id="open">Open it with window.open</button></p>
+<p><button id="open-later">Open it with window.open in 3 s</button></p>
+<p><button id="top">Send the top page there</button></p>
+<img src="/busy.json" alt="" width="1" height="1">
+<iframe id="frame" title="Cross-site frame" width="400" height="300"></iframe>
+<script>
+  const params = new URLSearchParams(location.search);
+  const to = params.get('to') || '__CROSS_SITE__';
+  const destination = `${to}/other`;
+  document.getElementById('link').href = destination;
+  document.getElementById('redirect').href = `/redir?to=${encodeURIComponent(destination)}`;
+  document.getElementById('blank').href = destination;
+  document.getElementById('blank-noopener').href = destination;
+  document.getElementById('open').onclick = () => { window.open(destination); };
+  document.getElementById('open-later').onclick = () => { setTimeout(() => window.open(destination), 3000); };
+  document.getElementById('top').onclick = () => { top.location.href = destination; };
+  const frame = document.getElementById('frame');
+  if (params.has('frame')) {
+    document.getElementById('heading').textContent = 'Leave, from the frame';
+    frame.remove();
+  } else {
+    frame.src = `__CROSS_SITE__/leave.html?frame=1&to=${encodeURIComponent(to)}`;
+  }
+</script>

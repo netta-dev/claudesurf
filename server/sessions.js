@@ -1,30 +1,52 @@
 // Per-session state and the target registry. A Session owns one Chrome window with an
-// identity tab and a working tab; every handler reaches its targets through this
-// registry, which also tracks each target's window, document generation, isolated
-// worlds, navigation, load, and download counts, and dismissed dialogs.
+// identity tab and a working tab, and holds the tabs that its pages opened; every handler
+// reaches its targets through this registry, which also tracks each target's window,
+// document generation, isolated worlds, navigation, load, and download counts,
+// dismissed dialogs, and domain-gate arming.
 //
 // An out-of-process child frame attaches as its own target and is recorded like a
 // page, with `type: 'iframe'`, the parent target whose protocol session delivered its
 // attach, and a frame number taken from its root page's counter, which never
 // reassigns one.
 //
-// Lifecycle: `attach(conn)` after every launch; `ensure(sessionId)` before every
-// action, which creates or repairs the window; target destruction marks the session
-// so the next `ensure` repairs it; pipe EOF drops every window and target while
-// labels survive.
+// A page target whose opener is a session's tab, or a frame under one, is that
+// session's from its attach: attributed with the role `opened`, numbered, and armed
+// under the domain gate before Chrome lets its first request go. Any other tab stays
+// the human's until a claim by its session-page URL. A tab that leaves its session is
+// disarmed.
+//
+// Lifecycle: `attach(conn)` after every launch; `ensureWithNotes(sessionId)` creates or
+// repairs the window and arms the working tab before every action but `policy`; the
+// window's state is dropped once the working tab is gone and none of the session's tabs
+// remains in its window, and the next repair recreates it; pipe EOF drops every window
+// and target while labels survive.
 
 const path = require('path');
 const { pathToFileURL } = require('url');
 const { ProtocolError, TimeoutError } = require('./cdp');
+const envelope = require('./envelope');
+const { fail, within, TIMED_OUT } = require('./action-support');
+const arming = require('./arming');
+const tabRecords = require('./tab-records');
+const requests = require('./requests');
+const retained = require('./retained');
+const refusals = require('./refusals');
+const { isWeb } = require('./policy');
+const { mainFrame, isMainFrame } = require('./frames');
 
 const SESSION_PAGE = pathToFileURL(path.join(__dirname, 'static', 'session.html')).href;
 const WINDOW_TIMEOUT_MS = 5_000;
 const CTRL_MODIFIER = 2;
 const MAX_DIALOGS = 20;
 const CROSS_DOCUMENT = new Set(['differentDocument', 'historyDifferentDocument', 'reload', 'reloadBypassingCache', 'restore', 'restoreWithPost']);
+const UNGATED = 'the working tab could not be put under the domain gate; call again';
 
 class TargetGoneError extends Error {
-  constructor(targetId) { super(`target ${targetId} is gone`); this.name = 'TargetGoneError'; }
+  constructor(targetId) {
+    super(`target ${targetId} is gone`);
+    this.name = 'TargetGoneError';
+    this.targetId = targetId;
+  }
 }
 
 class Session {
@@ -41,8 +63,27 @@ class Session {
     this.notes = [];
     // targetId → { generation, ids: Map<backendNodeId, frameId | null> }
     this.refs = new Map();
-    // page-opened targets attributed to this session by opener
+    // The session's tabs other than its working and identity tabs: those that its pages
+    // opened, attributed by opener, and the earlier working tabs that a switch left.
     this.opened = new Set();
+    // tab-records.js's: each tab's number, the next one to assign, which a window
+    // recreation leaves alone, and the stack of earlier working tabs, most recent last.
+    this.tabIds = new Map();
+    this.nextTab = 1;
+    this.earlierWorking = [];
+    // The target that the session's last page read covered.
+    this.refsTarget = null;
+    // retained.js's store: each tab's retained render, by target id.
+    this.retained = new Map();
+    // The domain gate's refusals not yet reported, kept by refusals.js: the list, the
+    // counter that stamps each entry's seq, the entries dropped from a full list, and
+    // the running call's marks ({ seq, nextTab, workingTargetId, newTab }), null
+    // between calls. The list is dropped with the window's state unless a call is
+    // running, since that call's response may still report a refusal that it led to.
+    this.refusals = [];
+    this.refusalCount = 0;
+    this.droppedRefusals = 0;
+    this.marks = null;
     this.chain = Promise.resolve();
   }
 
@@ -80,6 +121,8 @@ class Sessions {
     this.sessions = new Map();
     this.targets = new Map();
     this.roleWaiters = new Map();
+    // The domain gate once it has attached; arming sends Fetch.enable only while set.
+    this.interceptor = null;
   }
 
   get count() { return this.sessions.size; }
@@ -92,10 +135,19 @@ class Sessions {
     conn.on('Page.frameNavigated', (p, sid) => this.onFrameNavigated(p, sid));
     conn.on('Page.frameStartedNavigating', (p, sid) => this.onNavigationStarted(p, sid));
     conn.on('Page.loadEventFired', (p, sid) => this.onLoad(sid));
-    conn.on('Page.navigatedWithinDocument', (p, sid) => this.onSameDocument(sid));
-    conn.on('Page.downloadWillBegin', (p, sid) => this.onDownload(sid));
+    conn.on('Page.domContentEventFired', (p, sid) => this.onContentLoaded(sid));
+    conn.on('Page.navigatedWithinDocument', (p, sid) => this.onSameDocument(p, sid));
+    conn.on('Page.downloadWillBegin', (p, sid) => this.onDownload(p, sid));
+    conn.on('Network.loadingFailed', (p, sid) => this.onRequestFailed(p, sid));
     conn.on('Page.javascriptDialogOpening', (p, sid) => this.onDialog(p, sid));
     conn.onClose(() => this.dropAll());
+    requests.attachRequests(conn, this);
+  }
+
+  // Returns the session, or undefined for an id that a call hasn't used yet; unlike
+  // get, it doesn't create one.
+  peek(sessionId) {
+    return this.sessions.get(sessionId);
   }
 
   get(sessionId) {
@@ -128,39 +180,26 @@ class Sessions {
     });
   }
 
+  // Gives the session a working tab under the domain gate: the window, the working tab,
+  // or the identity tab put back as needed, or an earlier working tab given the role
+  // back, and the working tab armed when it isn't.
   async repair(session, deadline) {
-    const working = session.workingTargetId && this.targets.get(session.workingTargetId);
-    if (working) {
-      if (!session.identityFailed || session.identityTargetId !== null) {
-        session.identityFailed = false;
-        return;
+    await this.repairWindow(session, deadline);
+    await this.armWorking(session, deadline);
+  }
+
+  // Closes a tab that the daemon gave up on, marking it `closing` until its destruction
+  // arrives. Resolves with whether Chrome took the command by `opts.deadline`; never
+  // rejects. A rejected close clears the mark on a tab still registered.
+  closeTab(t, opts = {}) {
+    t.closing = true;
+    return this.conn.send('Target.closeTarget', { targetId: t.targetId }, opts).then(() => true, (e) => {
+      if (this.targets.get(t.targetId) === t) {
+        t.closing = false;
+        this.log.warn(`closing ${t.targetId}: ${e.message}`);
       }
-      // The identity tab gets one retry. The working tab is usable either way, so a
-      // second failure, or a working tab that has left the session page and taken the
-      // link with it, leaves the identity tab absent, as when the human closes it.
-      let reopened = false;
-      if (parseSessionPage(working.url)) {
-        try {
-          await this.openIdentityTab(session, working.targetId, deadline);
-          reopened = true;
-        } catch (e) {
-          this.log.warn(`session ${session.id.slice(0, 8)}: reopening the identity tab: ${e.message}`);
-        }
-      }
-      session.identityFailed = false;
-      session.notes.push(reopened ? 'identity tab was recreated' : 'identity tab could not be recreated; it returns with the next window');
-      return;
-    }
-    const identity = session.identityTargetId && this.targets.get(session.identityTargetId);
-    const page = identity && parseSessionPage(identity.url);
-    if (identity && page && page.role === 'identity' && page.session === session.id) {
-      await this.openWorkingTab(session, identity, deadline);
-      session.notes.push('working tab was recreated');
-    } else {
-      const had = session.startedAt !== null;
-      await this.createWindow(session, deadline);
-      if (had) session.notes.push(session.label ? 'session window was recreated under its retained name' : 'session window was recreated');
-    }
+      return false;
+    });
   }
 
   // Stores the label and re-renders the identity page if present.
@@ -260,10 +299,10 @@ class Sessions {
     return world;
   }
 
-  // A target's main frame id equals its target id until its first frameNavigated
-  // records the frame.
+  // Returns the frame id that a world is kept under: `frameId`, or the main frame's for
+  // null.
   frameKey(t, frameId) {
-    return frameId || t.mainFrameId || t.targetId;
+    return frameId || mainFrame(t);
   }
 
   // Runtime.callFunctionOn with arguments passed as values, returning the result by
@@ -282,10 +321,12 @@ class Sessions {
     return r.result ? r.result.value : undefined;
   }
 
-  // Resolves true once `predicate(target)` holds, checked now and after every event
-  // the registry counts on the target (navigation start, load, download, a target
-  // attributed to its session), false after `timeout` ms or at `deadline`; rejects
-  // with TargetGoneError when the target is destroyed or the pipe closes.
+  // Resolves true once `predicate(target)` holds, checked now and on every notify of
+  // the target: each navigation, load, download, and counted request event, a refusal
+  // of its navigation, and each tab that it opened as it is attributed or checked. Resolves
+  // false after `timeout` ms or at `deadline`; rejects with TargetGoneError when the
+  // target is destroyed or the pipe closes, and with the throw of a predicate that
+  // throws on a notify.
   waitUntil(targetId, predicate, { timeout = 10_000, deadline } = {}) {
     const t = this.targets.get(targetId);
     if (!t) return Promise.reject(new TargetGoneError(targetId));
@@ -316,17 +357,43 @@ class Sessions {
     return dialogs;
   }
 
+  // Runs every waiter's predicate on the target and resolves the waiters whose predicate
+  // holds. A predicate that throws can't say whether it holds, so its waiter rejects
+  // with the throw, which is logged, and the waiters after it still run.
+  notify(t) {
+    for (const w of [...t.waiters]) {
+      let holds;
+      try {
+        holds = w.predicate(t);
+      } catch (e) {
+        this.log.warn(`a wait on ${t.targetId} failed: ${e.stack || e.message}`);
+        t.waiters.delete(w);
+        clearTimeout(w.timer);
+        w.reject(e);
+        continue;
+      }
+      if (holds) { t.waiters.delete(w); clearTimeout(w.timer); w.resolve(true); }
+    }
+  }
+
+  // Returns the target whose protocol session is `cdpSessionId`, or null.
+  byCdpSession(cdpSessionId) {
+    for (const t of this.targets.values()) if (t.cdpSessionId === cdpSessionId) return t;
+    return null;
+  }
+
+  // Returns { deadline } for a window step: WINDOW_TIMEOUT_MS from now, cut to
+  // `deadline` when one is given.
+  windowBudget(deadline) {
+    const limit = deadline === undefined ? Date.now() + WINDOW_TIMEOUT_MS : Math.min(deadline, Date.now() + WINDOW_TIMEOUT_MS);
+    return { deadline: limit };
+  }
+
   // Pipe EOF: every window and target is gone; labels survive.
   dropAll() {
-    for (const t of this.targets.values()) this.failWaiters(t);
+    for (const t of this.targets.values()) this.forget(t);
     this.targets.clear();
-    for (const session of this.sessions.values()) {
-      session.windowId = null;
-      session.identityTargetId = null;
-      session.workingTargetId = null;
-      session.refs.clear();
-      session.opened.clear();
-    }
+    for (const session of this.sessions.values()) this.dropWindowState(session);
     for (const [key, waiters] of this.roleWaiters) {
       for (const w of waiters) { clearTimeout(w.timer); w.reject(new Error('browser connection closed')); }
       this.roleWaiters.delete(key);
@@ -338,14 +405,70 @@ class Sessions {
     return `${SESSION_PAGE}#${params}`;
   }
 
-  windowBudget(deadline) {
-    const limit = deadline === undefined ? Date.now() + WINDOW_TIMEOUT_MS : Math.min(deadline, Date.now() + WINDOW_TIMEOUT_MS);
-    return { deadline: limit };
+  async repairWindow(session, deadline) {
+    const working = session.workingTargetId && this.targets.get(session.workingTargetId);
+    if (working) {
+      if (!session.identityFailed || session.identityTargetId !== null) {
+        session.identityFailed = false;
+        return;
+      }
+      // The identity tab gets one retry. The working tab is usable either way, so a
+      // second failure, or a working tab that has left the session page and taken the
+      // link with it, leaves the identity tab absent, as when the human closes it.
+      let reopened = false;
+      if (parseSessionPage(working.url)) {
+        try {
+          await this.openIdentityTab(session, working.targetId, deadline);
+          reopened = true;
+        } catch (e) {
+          this.log.warn(`session ${session.id.slice(0, 8)}: reopening the identity tab: ${e.message}`);
+        }
+      }
+      session.identityFailed = false;
+      session.notes.push(reopened ? 'identity tab was recreated' : 'identity tab could not be recreated; it returns with the next window');
+      return;
+    }
+    const earlier = tabRecords.earlier(this, session);
+    if (earlier) {
+      tabRecords.switchWorking(this, session, earlier);
+      session.notes.push(`the working tab closed; ${tabRecords.tabId(session, earlier)} is the working tab again`);
+      return;
+    }
+    const identity = session.identityTargetId && this.targets.get(session.identityTargetId);
+    const page = identity && parseSessionPage(identity.url);
+    if (identity && page && page.role === 'identity' && page.session === session.id) {
+      await this.openWorkingTab(session, identity, deadline);
+      session.notes.push('working tab was recreated');
+    } else {
+      const had = session.startedAt !== null;
+      await this.createWindow(session, deadline);
+      if (had) session.notes.push(session.label ? 'session window was recreated under its retained name' : 'session window was recreated');
+    }
+  }
+
+  // Arms the working tab when it isn't armed: an arming queued at its attach is waited
+  // for first, until the deadline, since it runs under its commands' own timeouts.
+  // Fails the call when the arming fails or that wait runs out, leaving the flag down
+  // so the next call tries again.
+  async armWorking(session, deadline) {
+    const t = this.targets.get(session.workingTargetId);
+    if (!t || t.armed) return;
+    if (t.arming) {
+      const settled = deadline === undefined ? await t.arming : await within(t.arming, deadline);
+      if (settled === TIMED_OUT) fail(envelope.error(UNGATED));
+    }
+    if (t.armed) return;
+    const failed = arming.failure(await arming.arm(this, t, { deadline }));
+    if (failed && this.targets.get(t.targetId) !== t) throw new TargetGoneError(t.targetId);
+    if (failed) {
+      this.log.warn(`session ${session.id.slice(0, 8)}: arming the working tab: ${failed.error.message}`);
+      fail(envelope.error(UNGATED));
+    }
   }
 
   async createWindow(session, deadline) {
     const opts = this.windowBudget(deadline);
-    this.disown(session);
+    this.dropWindowState(session);
     session.identityFailed = false;
     const startedAt = session.startedAt || new Date().toISOString();
     const working = this.waitForRole(session, 'working', opts);
@@ -398,17 +521,40 @@ class Sessions {
     this.log.info(`session ${session.id.slice(0, 8)}: working tab recreated in window ${windowId}`);
   }
 
-  // Drops every target the session owned before a window is recreated: an identity tab
-  // that was navigated away stays open but unowned; page-opened targets likewise.
+  // Drops the session's window state: every tab that it still holds is disowned, and its
+  // tab records, last-read target, retained renders, and refusals go with them. The
+  // refusals stay while a call runs, since its response may still report one that it led
+  // to. The label, the counters, and the queue survive, so a number or a seq is never
+  // reused.
+  dropWindowState(session) {
+    this.disown(session);
+    session.windowId = null;
+    tabRecords.clear(session);
+    session.refsTarget = null;
+    retained.dropAll(session);
+    if (!session.marks) refusals.takeRest(session);
+  }
+
+  // Drops every target that the session owned: an identity tab that was navigated away
+  // stays open but unowned and disarmed, and so do page-opened targets.
   disown(session) {
     for (const id of [session.identityTargetId, session.workingTargetId, ...session.opened]) {
       const t = id && this.targets.get(id);
-      if (t) { t.role = null; t.sessionId = null; }
+      if (t) this.letGo(t);
     }
     session.identityTargetId = null;
     session.workingTargetId = null;
-    session.opened.clear();
     session.refs.clear();
+  }
+
+  // Takes a tab out of its session, which leaves it a tab of the human's own: without a
+  // role or a number, and disarmed.
+  letGo(t) {
+    const session = t.sessionId && this.sessions.get(t.sessionId);
+    if (session) tabRecords.release(session, t.targetId);
+    t.role = null;
+    t.sessionId = null;
+    arming.disarm(this, t);
   }
 
   // Resolves with the target id claimed for the role; TimeoutError at the deadline.
@@ -431,113 +577,148 @@ class Sessions {
     return promise;
   }
 
-  // Claims a target for a session role when its URL is that session's page, else
-  // attributes it to the session owning its opener.
+  // Claims a target for a session role when its URL is that session's page. A tab that
+  // a page opened keeps its number as it takes the role.
   claim(t) {
     const page = parseSessionPage(t.url);
-    if (page) {
-      const session = this.get(page.session);
-      if (t.role === 'opened' && t.sessionId) this.get(t.sessionId).opened.delete(t.targetId);
-      const field = `${page.role}TargetId`;
-      if (session[field] && session[field] !== t.targetId && this.targets.has(session[field])) {
-        // A second tab of the same role (the human duplicated one): leave it unowned.
-        return;
-      }
-      t.role = page.role;
-      t.sessionId = session.id;
-      session[field] = t.targetId;
-      if (session.windowId === null) session.windowId = t.windowId;
-      const key = `${session.id}:${page.role}`;
-      const waiters = this.roleWaiters.get(key);
-      if (waiters) {
-        this.roleWaiters.delete(key);
-        for (const w of waiters) { clearTimeout(w.timer); w.resolve(t.targetId); }
-      }
+    if (!page) return;
+    const session = this.get(page.session);
+    const field = `${page.role}TargetId`;
+    if (session[field] && session[field] !== t.targetId && this.targets.has(session[field])) {
+      // Leave a second tab of the same role unowned (the human duplicated one).
+      if (t.sessionId) this.letGo(t);
       return;
     }
-    if (t.role !== null) return;
-    const opener = t.openerId && this.targets.get(t.openerId);
-    if (opener && opener.sessionId) {
-      t.role = 'opened';
-      t.sessionId = opener.sessionId;
-      this.get(opener.sessionId).opened.add(t.targetId);
-      this.notify(opener);
+    if (t.sessionId && t.sessionId !== session.id) this.letGo(t);
+    t.role = page.role;
+    t.sessionId = session.id;
+    if (page.role === 'working') t.everWorking = true;
+    session[field] = t.targetId;
+    tabRecords.addClaimed(session, t);
+    if (session.windowId === null) session.windowId = t.windowId;
+    const key = `${session.id}:${page.role}`;
+    const waiters = this.roleWaiters.get(key);
+    if (waiters) {
+      this.roleWaiters.delete(key);
+      for (const w of waiters) { clearTimeout(w.timer); w.resolve(t.targetId); }
     }
+  }
+
+  // Attributes a page target to the session of `opener`, the root page of the tab or
+  // frame that opened it.
+  attribute(t, opener) {
+    const session = this.get(opener.sessionId);
+    t.role = 'opened';
+    t.sessionId = session.id;
+    t.openerPage = opener.targetId;
+    tabRecords.addOpened(session, t);
+  }
+
+  // Returns the page target, in a session, that opened this one: its opener's root
+  // page, which a frame that opened it reaches through its parent chain; or null when
+  // there is none.
+  sessionOpener(t) {
+    const opener = t.openerId && this.targets.get(t.openerId);
+    const page = opener && this.rootPage(opener);
+    return page && page.sessionId ? page : null;
   }
 
   // `deliveredOn` is the protocol session the event arrived on: the parent target's
   // for an out-of-process child frame under flatten, and none for a page target.
   async onAttached({ sessionId: cdpSessionId, targetInfo, waitingForDebugger }, deliveredOn) {
-    const { targetId, type } = targetInfo;
+    const { targetId } = targetInfo;
     const opts = { sessionId: cdpSessionId };
-    let released = false;
-    const release = () => {
-      if (released || !waitingForDebugger) return;
-      released = true;
-      this.conn.send('Runtime.runIfWaitingForDebugger', {}, opts).catch(() => {});
-    };
-    const t = {
-      targetId, cdpSessionId, type, url: targetInfo.url || '', openerId: targetInfo.openerId || null,
-      windowId: null, generation: 0, role: null, sessionId: null, worlds: new Map(), mainFrameId: null,
-      loads: 0, navigations: 0, downloads: 0, sameDocument: 0, waiters: new Set(), dialogs: [],
-    };
+    let queued;
+    // The release goes out whatever the steps before it throw: a tab left paused
+    // wedges its navigation.
+    try {
+      queued = this.queueAttach(targetInfo, cdpSessionId, deliveredOn, opts);
+    } finally {
+      if (waitingForDebugger) this.conn.send('Runtime.runIfWaitingForDebugger', {}, opts).catch(() => {});
+    }
+    if (!queued) return;
+    const { t, page, opener, armed, window, enabled, attaching, focused } = queued;
+    // Every command is settled from here on, before anything is awaited: a wedged
+    // renderer makes several of them time out, and a rejection left without a handler
+    // would take the daemon down as an unhandled rejection. Only Page.enable's answer
+    // gates the frame-tree read and the claim.
+    const prepared = Promise.allSettled([window, attaching, focused]);
+    const settled = Promise.allSettled([enabled, armed]).then(([, outcomes]) => outcomes.value || null);
+    // This resolves ahead of the rule below, which may close the tab.
+    settled.then((outcomes) => t.resolveReady(outcomes));
+    const succeeded = (step, what) => step.then(() => true, (e) => {
+      this.log.warn(`${what} ${targetId}: ${e.message}`);
+      return false;
+    });
+    let claimable = await succeeded(enabled, 'preparing target');
+    // A tab attached before its first navigation needs its URL for the role claim, and
+    // a paused tab's first commit may come before Page.enable answers, without a
+    // frameNavigated. A frame's own URL is in its parent's frame tree, and an ad frame
+    // that never commits would hold this command for its whole timeout.
+    if (claimable && page && (!t.url || opener)) {
+      claimable = await succeeded(this.readFrameTree(t, opts), 'reading the frame tree of');
+    }
+    const [windowed, ...others] = await prepared;
+    if (windowed.status === 'fulfilled' && windowed.value) t.windowId = windowed.value.windowId;
+    for (const outcome of [windowed, ...others]) {
+      if (outcome.status === 'rejected') this.log.warn(`preparing target ${targetId}: ${outcome.reason.message}`);
+    }
+    if (claimable && page && this.targets.get(targetId) === t) this.claim(t);
+    if (armed) arming.onRejections(this, t, await settled);
+  }
+
+  // Records an attached target and queues its commands, which go ahead of its release
+  // on its protocol session. Returns null for a target left unrecorded: one that is
+  // neither a page nor a frame whose parent chain reaches a page, and so belongs to
+  // neither a session nor a read. Otherwise returns the target, whether it is a page,
+  // the session tab that opened it or null, and the commands' promises.
+  queueAttach(targetInfo, cdpSessionId, deliveredOn, opts) {
+    const { targetId, type } = targetInfo;
+    const t = targetRecord(targetInfo, cdpSessionId);
     if (type === 'page') {
       t.nextFrameNumber = 1;
     } else if (type === 'iframe') {
       const parent = this.byCdpSession(deliveredOn);
       const root = parent && this.rootPage(parent);
-      // A frame whose parent chain reaches no page target belongs to no session and
-      // no read; it is released and left unrecorded.
-      if (!root) { release(); return; }
+      if (!root) return null;
       t.parentTargetId = parent.targetId;
       t.frameNumber = root.nextFrameNumber++;
       // Chrome numbers an out-of-process frame's own frame with its target id.
       t.mainFrameId = targetId;
+      if (requests.endFrame(parent, targetId)) this.notify(parent);
     } else {
-      release();
-      return;
+      return null;
     }
     this.targets.set(targetId, t);
-    try {
-      // The preparation commands are queued ahead of the release on the target's
-      // session; awaiting them first would deadlock on a tab whose first document has
-      // not committed (a noopener link target), where Page.enable answers only after
-      // the commit the pause holds back.
-      const page = type === 'page';
-      const window = page ? this.conn.send('Browser.getWindowForTarget', { targetId }) : null;
-      const enabled = this.conn.send('Page.enable', {}, opts);
-      // Out-of-process child frames surface through this per-target call only; the
-      // browser-level one reaches page targets alone.
-      const attaching = this.conn.send('Target.setAutoAttach', {
-        autoAttach: true, waitForDebuggerOnStart: true, flatten: true, filter: [{ type: 'iframe' }],
-      }, opts);
-      // Focus emulation lifts an input stall on a tab that is not its window's active
-      // one. Frames take scripted clicks, which never stall, so they go without.
-      const focused = page ? this.conn.send('Emulation.setFocusEmulationEnabled', { enabled: true }, opts) : null;
-      release();
-      // Every queued command is settled together: a wedged renderer makes several of
-      // them time out, and a rejection left unawaited while another is reported would
-      // take the daemon down as an unhandled rejection.
-      const queued = await Promise.allSettled([window, enabled, attaching, focused]);
-      if (queued[0].status === 'fulfilled' && queued[0].value) t.windowId = queued[0].value.windowId;
-      const failed = queued.find((outcome) => outcome.status === 'rejected');
-      if (failed) throw failed.reason;
-      if (!t.url && page) {
-        // Attached before its first navigation; the frameNavigated may have preceded
-        // Page.enable, and a page target's role claim needs the URL. A frame's own
-        // URL is in its parent's frame tree, and an ad frame that never commits would
-        // hold this command for its whole timeout.
-        const { frameTree } = await this.conn.send('Page.getFrameTree', {}, opts);
-        t.mainFrameId = frameTree.frame.id;
-        t.url = frameTree.frame.url + (frameTree.frame.urlFragment || '');
-      }
-      if (page && this.targets.get(targetId) === t) this.claim(t);
-    } catch (e) {
-      this.log.warn(`preparing target ${targetId}: ${e.message}`);
-    } finally {
-      // A target left paused stalls its page load.
-      release();
-    }
+    const page = type === 'page';
+    // The tab belongs to its opener's session before its commands are queued: its first
+    // request can be refused, and the tab closed, before any of them answers.
+    const opener = page ? this.sessionOpener(t) : null;
+    if (opener) this.attribute(t, opener);
+    // Chrome runs a protocol session's commands in order, so a queued Fetch.enable
+    // already gates the first request. Awaiting them before the release would deadlock
+    // on a tab whose first document has not committed (a noopener link target), where
+    // Page.enable answers only after the commit that the pause holds back.
+    const armed = opener ? arming.arm(this, t) : null;
+    const window = page ? this.conn.send('Browser.getWindowForTarget', { targetId }) : null;
+    const enabled = this.conn.send('Page.enable', {}, opts);
+    // Out-of-process child frames surface through this per-target call only; the
+    // browser-level one reaches page targets alone.
+    const attaching = this.conn.send('Target.setAutoAttach', {
+      autoAttach: true, waitForDebuggerOnStart: true, flatten: true, filter: [{ type: 'iframe' }],
+    }, opts);
+    // Focus emulation lifts an input stall on a tab that is not its window's active
+    // one, and on a frame inside it, which takes keys and scripted input.
+    const focused = this.conn.send('Emulation.setFocusEmulationEnabled', { enabled: true }, opts);
+    if (opener) this.notify(opener);
+    return { t, page, opener, armed, window, enabled, attaching, focused };
+  }
+
+  async readFrameTree(t, opts) {
+    const { frameTree: { frame } } = await this.conn.send('Page.getFrameTree', {}, opts);
+    if (!t.mainFrameId) t.mainFrameId = frame.id;
+    if (!t.url) t.url = frame.url + (frame.urlFragment || '');
+    if (isWeb(frame.url)) t.committedWeb = true;
   }
 
   onDestroyed(targetId) {
@@ -551,23 +732,34 @@ class Sessions {
     // A frame target claims no role, so the session that read it is its root page's.
     const owner = t.type === 'iframe' ? this.rootPage(t) : t;
     this.targets.delete(targetId);
-    this.failWaiters(t);
+    this.forget(t);
     if (!owner || !owner.sessionId) return;
     const session = this.get(owner.sessionId);
     session.refs.delete(targetId);
     if (t.type === 'iframe') return;
+    retained.drop(session, t);
     if (t.role === 'working') session.workingTargetId = null;
     if (t.role === 'identity') session.identityTargetId = null;
-    if (t.role === 'opened') session.opened.delete(targetId);
-    if (session.workingTargetId === null && session.identityTargetId === null) {
-      // The window is gone; its state goes with it and the label stays.
-      this.disown(session);
-      session.windowId = null;
+    tabRecords.remove(session, targetId);
+    if (session.workingTargetId === null && !this.holdsWindow(session)) {
+      // The window is gone, or the human closed the working tab and none of the
+      // session's tabs is left in it to return through; the state is dropped and the
+      // label stays.
+      this.dropWindowState(session);
       this.log.info(`session ${session.id.slice(0, 8)}: window closed`);
     }
   }
 
-  onFrameNavigated({ frame }, cdpSessionId) {
+  // Returns whether one of the session's tabs is still in its window, by the window that
+  // the registry last recorded for each tab, since this runs synchronously.
+  holdsWindow(session) {
+    return [session.identityTargetId, ...session.opened].some((id) => {
+      const t = id && this.targets.get(id);
+      return Boolean(t) && tabRecords.inWindow(session, t.windowId);
+    });
+  }
+
+  onFrameNavigated({ frame, type }, cdpSessionId) {
     const t = this.byCdpSession(cdpSessionId);
     if (!t) return;
     // An out-of-process frame's own frame carries the parentId of the frame it sits
@@ -577,20 +769,55 @@ class Sessions {
     t.mainFrameId = frame.id;
     t.url = frame.url + (frame.urlFragment || '');
     t.generation += 1;
+    t.navigationsAtCommit = t.navigations;
+    t.pendingLoader = null;
     t.worlds.clear();
+    if (t.type !== 'page') return;
+    requests.commit(t, frame.loaderId);
+    // A back-forward cache restore fires neither DOMContentLoaded nor load, so its
+    // commit counts as both.
+    if (type === 'BackForwardCacheRestore') {
+      t.loads += 1;
+      t.loadedGeneration = t.generation;
+    }
+    this.notify(t);
+    // The backstop judges the commit while a tab that a page opened still counts as
+    // new, so a refused first web page closes it.
+    if (this.interceptor) {
+      try {
+        this.interceptor.onCommitted(t);
+      } catch (e) {
+        this.log.warn(`judging the commit of ${t.targetId}: ${e.stack || e.message}`);
+      }
+    }
+    if (isWeb(frame.url)) t.committedWeb = true;
     // A tab opened from the session page attaches with an empty URL, so its role
     // claim lands here, on its first document.
-    if (t.type === 'page' && (t.role === null || t.role === 'opened')) this.claim(t);
+    if (t.role === null || t.role === 'opened') this.claim(t);
   }
 
-  onNavigationStarted({ frameId, navigationType }, cdpSessionId) {
+  onNavigationStarted({ frameId, navigationType, loaderId }, cdpSessionId) {
     const t = this.byCdpSession(cdpSessionId);
     if (!t) return;
-    const main = frameId === t.mainFrameId || frameId === t.targetId;
-    if (main && CROSS_DOCUMENT.has(navigationType)) {
+    if (isMainFrame(t, frameId) && CROSS_DOCUMENT.has(navigationType)) {
       t.navigations += 1;
+      t.pendingLoader = loaderId || null;
       this.notify(t);
     }
+  }
+
+  // Counts the target's latest navigation as stopped when Chrome ends it without a
+  // commit: for a 204 or 205 answer, a window.stop(), a URL handed to another
+  // application, a download, or a request that the gate failed, its document request fails
+  // with ERR_ABORTED, under the navigation's loader id. A network error fails that
+  // request too, before Chrome commits its error page under the same id, so only
+  // ERR_ABORTED counts.
+  onRequestFailed({ requestId, errorText }, cdpSessionId) {
+    const t = this.byCdpSession(cdpSessionId);
+    if (!t || requestId !== t.pendingLoader || errorText !== 'net::ERR_ABORTED') return;
+    t.pendingLoader = null;
+    t.navigationsStopped = t.navigations;
+    this.notify(t);
   }
 
   onLoad(cdpSessionId) {
@@ -600,27 +827,38 @@ class Sessions {
     this.notify(t);
   }
 
-  // A fragment change or pushState: the URL changes, the document and its refs stay.
-  onSameDocument(cdpSessionId) {
+  onContentLoaded(cdpSessionId) {
     const t = this.byCdpSession(cdpSessionId);
     if (!t) return;
+    t.loadedGeneration = t.generation;
+    this.notify(t);
+  }
+
+  // Records a fragment change or pushState of the target's own main frame: the URL
+  // changes, the document and its refs stay. A page target follows its URL; a frame
+  // target keeps the URL that its commit recorded. A child frame's event arrives on its
+  // page's session too, where a navigation wait would take it for the page landing, so
+  // it is skipped.
+  onSameDocument({ frameId, url }, cdpSessionId) {
+    const t = this.byCdpSession(cdpSessionId);
+    if (!t || !isMainFrame(t, frameId)) return;
+    if (t.type === 'page') t.url = url;
     t.sameDocument += 1;
     this.notify(t);
   }
 
-  // Under download denial Chrome still fires this for a click on a file link, after
-  // the navigation start that the click wait counts and instead of a load event.
-  onDownload(cdpSessionId) {
+  // Counts a download of the target's main frame, which navigate's download wait
+  // reads. Under download denial Chrome still fires this: for a navigation to a file,
+  // once it has failed the navigation's document request (onRequestFailed), and for an
+  // <a download> link or a blob URL, which don't start a navigation and can fire it
+  // while the page's own navigation is under way, so a download doesn't stop a
+  // navigation. A same-process child frame's download arrives on its page's session
+  // under the child's frame id, so only the target's main frame counts.
+  onDownload({ frameId }, cdpSessionId) {
     const t = this.byCdpSession(cdpSessionId);
-    if (!t) return;
+    if (!t || !isMainFrame(t, frameId)) return;
     t.downloads += 1;
     this.notify(t);
-  }
-
-  notify(t) {
-    for (const w of [...t.waiters]) {
-      if (w.predicate(t)) { t.waiters.delete(w); clearTimeout(w.timer); w.resolve(true); }
-    }
   }
 
   onDialog({ type, message }, cdpSessionId) {
@@ -645,14 +883,13 @@ class Sessions {
     return current && current.type === 'page' ? current : null;
   }
 
-  byCdpSession(cdpSessionId) {
-    for (const t of this.targets.values()) if (t.cdpSessionId === cdpSessionId) return t;
-    return null;
-  }
-
-  failWaiters(t) {
+  // Fails the waiters of a target that left the registry, resolves its `ready` with
+  // null, and drops its in-flight requests.
+  forget(t) {
     for (const w of t.waiters) { clearTimeout(w.timer); w.reject(new TargetGoneError(t.targetId)); }
     t.waiters.clear();
+    t.resolveReady(null);
+    requests.drop(t);
   }
 
   async pageElement(targetId, elementId, opts) {
@@ -673,8 +910,9 @@ class Sessions {
     }
   }
 
-  // The one main-world call: the session page's own render function, with the label
-  // passed as arguments rather than interpolated.
+  // Calls the session page's own render function, with the label passed as arguments
+  // rather than interpolated. The daemon's main-world calls are this, pageElement, and
+  // the scripted click on the link that pageElement finds, all on the session page.
   async render(targetId, label, opts = {}) {
     try {
       const { result } = await this.send(targetId, 'Runtime.evaluate', { expression: 'window' }, opts);
@@ -687,6 +925,42 @@ class Sessions {
       this.log.warn(`rendering label on ${targetId}: ${e.message}`);
     }
   }
+}
+
+// Returns a new target's record. Beside the counts and worlds that the handlers read, it
+// holds what a navigation's verdict is judged from:
+//   - loadedGeneration: the generation whose own DOMContentLoaded fired, null before
+//     the first, so the current document has loaded while it equals `generation`;
+//   - navigationsAtCommit: `navigations` as the current document committed;
+//   - pendingLoader: the loader id of the main frame's latest cross-document
+//     navigation, until a commit;
+//   - navigationsStopped: `navigations` as Chrome last dropped the tab's latest
+//     navigation without a commit (onRequestFailed), as it drops a refused one; the
+//     drop ends the navigations started by then.
+// It also carries the domain gate's state:
+//   - closing: the daemon has sent Target.closeTarget (closeTab);
+//   - armingSent, armed, arming, armingEpoch: arming.js's, whether its commands went
+//     out, whether every one but the prerendering switch succeeded, the latest
+//     arming's outcomes, and its epoch;
+//   - openerPage: the session's page target that opened the tab, a frame's root page
+//     when a frame opened it;
+//   - committedWeb: an http(s) document has committed, from frameNavigated or the
+//     attach handler's frame-tree read;
+//   - everWorking: it has been a working tab;
+//   - ready: a promise that never rejects, resolved once Page.enable and, for a tab
+//     armed at attach, the arming commands have settled, with arming's outcomes or
+//     null, and with null when the target disappears first.
+function targetRecord(targetInfo, cdpSessionId) {
+  const { targetId, type } = targetInfo;
+  const t = {
+    targetId, cdpSessionId, type, url: targetInfo.url || '', openerId: targetInfo.openerId || null,
+    windowId: null, generation: 0, role: null, sessionId: null, worlds: new Map(), mainFrameId: null,
+    loads: 0, loadedGeneration: null, navigations: 0, navigationsAtCommit: 0, pendingLoader: null, navigationsStopped: 0, downloads: 0, sameDocument: 0, waiters: new Set(), dialogs: [],
+    closing: false, armingSent: false, armed: false, arming: null, armingEpoch: 0,
+    openerPage: null, committedWeb: false, everWorking: false,
+  };
+  t.ready = new Promise((resolve) => { t.resolveReady = resolve; });
+  return t;
 }
 
 // Milliseconds to wait: `timeout`, cut to what remains before `deadline` (ms epoch).

@@ -1,6 +1,6 @@
 {
   "name": "claudesurf-mcp",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "MCP server driving a dedicated Chrome over the DevTools protocol for Claude Code",
   "main": "server.js",
   "engines": {

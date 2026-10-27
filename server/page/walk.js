@@ -1,4 +1,4 @@
-// Runs in the browser, in the page's isolated world; sent as source by read.js.
+// Runs in the browser, in the page's isolated world; sent as source by region.js.
 // Never require() this file.
 //
 // Collects the interactive elements of the document, descending open shadow roots,

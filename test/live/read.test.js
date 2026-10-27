@@ -6,18 +6,19 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const read = require('../../server/read');
 const input = require('../../server/input');
+const navigation = require('../../server/navigation');
 const { OutcomeError, WALK_SOURCE, LABEL_MAX } = require('../../server/action-support');
-const { liveBinary, liveBrowser, markedRefs, refsIn, waitFor } = require('../helpers');
+const { liveBinary, liveBrowser, markedRefs, readPayload, refsIn, waitFor } = require('../helpers');
 const { serve } = require('../fixtures/serve');
 
 const skip = liveBinary() ? false : 'no Chrome binary found';
 
-let live, site, sessions, session;
+let live, site, sessions, context, session;
 before(async () => {
   if (skip) return;
   live = await liveBrowser();
   site = await serve();
-  sessions = live.sessions;
+  ({ sessions, context } = live);
   session = await sessions.ensure('live-read');
 });
 after(async () => {
@@ -27,12 +28,12 @@ after(async () => {
 });
 
 async function open(page) {
-  await input.navigate(sessions, session, { url: `${site.base}/${page}`, name: 'live read' });
+  await navigation.navigate(context, session, { url: `${site.base}/${page}`, name: 'live read' });
 }
 
 // Reads the page and returns the payload plus a name → ref map.
 async function readAll({ hidden = true, maxChars = 40000, ...rest } = {}) {
-  const { payload } = await read.readPage(sessions, session, { maxChars, offset: 0, hidden, ...rest });
+  const { payload } = await readPayload(sessions, session, { maxChars, offset: 0, hidden, ...rest });
   return { payload, refs: refsIn(payload) };
 }
 
@@ -100,7 +101,7 @@ test('hidden content is skipped and counted; hidden=true lists it, masking a sec
   assert.ok(fromDefault.includes(id('Transparent')), 'a control the tree keeps is clickable from any read');
   assert.ok(!fromDefault.includes(id('Display none')), 'one Chrome pruned from the tree needs the hidden read');
   assert.ok(refIds().includes(id('Display none')), 'which put it in the set');
-  const clicked = await outcome(input.click(sessions, session, all.refs['Display none'], {}));
+  const clicked = await outcome(input.click(context, session, { ref: all.refs['Display none'] }));
   assert.ok(clicked.ok, `and a scripted click reaches it: ${JSON.stringify(clicked.fail)}`);
 });
 
@@ -187,7 +188,7 @@ test('a scope ref the document no longer holds is an error', { skip }, async () 
   const { refs } = await readAll({ hidden: false });
   const ref = refs.Email;
   await sessions.callInWorld(session.workingTargetId, 'function () { document.getElementById("email").remove(); }');
-  const { fail } = await outcome(read.readPage(sessions, session, { scope: ref, maxChars: 40000, offset: 0 }));
+  const { fail } = await outcome(readPayload(sessions, session, { scope: ref, maxChars: 40000, offset: 0 }));
   assert.strictEqual(fail.outcome, 'error');
   assert.match(fail.message, new RegExp(`^${ref} is not in this document any more`));
 });
@@ -270,11 +271,11 @@ test('links=index leaves the ref in the prose and lists each URL once, with ever
 });
 
 test('a JSON response fences as one block, and a PDF says there is nothing to read', { skip }, async () => {
-  await input.navigate(sessions, session, { url: `${site.base}/data.json`, name: 'live read' });
+  await navigation.navigate(context, session, { url: `${site.base}/data.json`, name: 'live read' });
   const json = await readAll({ hidden: false });
   assert.match(json.payload, /\n```\n\{\n {2}"items": \[\n/, 'the JSON arrives unescaped, in a fence');
   assert.match(json.payload, /"name": "beta"/);
-  await input.navigate(sessions, session, { url: `${site.base}/page.pdf`, name: 'live read' });
+  await navigation.navigate(context, session, { url: `${site.base}/page.pdf`, name: 'live read' });
   const pdf = await readAll({ hidden: false });
   assert.ok(pdf.payload.endsWith('(no readable text; use screenshot)'), pdf.payload);
 });
@@ -303,9 +304,9 @@ test('a scripted click on an f-ref lands in the frame, and a trusted one is refu
   assert.ok(frame, 'the cross-site child attached as a target of its own');
   const inFrame = (expression) => sessions.callInWorld(frame.targetId, `function () { return ${expression}; }`);
   assert.strictEqual(await inFrame('document.getElementById("log").textContent'), 'nothing yet');
-  await input.click(sessions, session, refs['Child button'], {});
+  await input.click(context, session, { ref: refs['Child button'] });
   assert.strictEqual(await inFrame('document.getElementById("log").textContent'), 'child clicked');
-  const refused = await outcome(input.click(sessions, session, refs['Child button'], { trusted: true }));
+  const refused = await outcome(input.click(context, session, { ref: refs['Child button'], trusted: true }));
   assert.strictEqual(refused.fail.outcome, 'error');
   assert.match(refused.fail.message, /inside a cross-site frame, where trusted clicks are not supported yet/);
 });
@@ -318,10 +319,10 @@ test('a bare ref in a same-process frame takes a scripted click and a trusted on
     return document.querySelector('iframe[title="Same-site child"]').contentDocument.getElementById('log').textContent;
   }`);
   assert.strictEqual(await childLog(), 'nothing yet');
-  const scripted = await outcome(input.click(sessions, session, refs['From aria-label'], {}));
+  const scripted = await outcome(input.click(context, session, { ref: refs['From aria-label'] }));
   assert.ok(scripted.ok, `a same-process frame is clicked by a bare ref: ${JSON.stringify(scripted.fail)}`);
   assert.strictEqual(await childLog(), 'scripted click');
-  const trusted = await outcome(input.click(sessions, session, refs['From aria-label'], { trusted: true }));
+  const trusted = await outcome(input.click(context, session, { ref: refs['From aria-label'], trusted: true }));
   assert.ok(trusted.ok, `and the trusted path reaches it: ${JSON.stringify(trusted.fail)}`);
   assert.strictEqual(await childLog(), 'trusted click', 'the real mouse events landed on the button inside the frame');
 });
@@ -329,7 +330,7 @@ test('a bare ref in a same-process frame takes a scripted click and a trusted on
 test('a dialog raised inside a frame is dismissed and queued for the next payload', { skip }, async () => {
   await open('frames.html');
   const { refs } = await readAll({ hidden: false });
-  await input.click(sessions, session, refs['Child alert'], {});
+  await input.click(context, session, { ref: refs['Child alert'] });
   // Chrome delivers javascriptDialogOpening on the page target's session whichever
   // frame raised it, so the working tab's queue is where it lands and the frames'
   // stay empty; the daemon drains both, so either routing works.
@@ -343,7 +344,7 @@ test('navigating the parent makes an f-ref stale, and scope on a frame ref reads
   await open('frames.html');
   const first = await readAll({ hidden: false });
   const frameRef = first.payload.match(new RegExp(`\\[(e\\d+) frame ${site.crossBase}/nested\\.html cross-site\\]`))[1];
-  const scoped = await read.readPage(sessions, session, { scope: frameRef, maxChars: 40000, offset: 0 });
+  const scoped = await readPayload(sessions, session, { scope: frameRef, maxChars: 40000, offset: 0 });
   assert.match(scoped.payload, /^URL: http:\/\/127\.0\.0\.1:\d+\/frames\.html/, 'the state lines stay the tab\'s');
   assert.match(scoped.payload, /\n# Nested child\n/);
   assert.match(
@@ -354,11 +355,11 @@ test('navigating the parent makes an f-ref stale, and scope on a frame ref reads
   assert.ok(!scoped.payload.includes("The page's own prose"), 'and nothing of the page around it');
   assert.match(scoped.payload.split('\n')[2], new RegExp(`^Scope: ${frameRef} \\(omitted: `), 'with the page counted as omitted');
   const sameSite = first.payload.match(new RegExp(`\\[(e\\d+) frame ${site.base}/labels\\.html\\]`))[1];
-  const same = await read.readPage(sessions, session, { scope: sameSite, maxChars: 40000, offset: 0 });
+  const same = await readPayload(sessions, session, { scope: sameSite, maxChars: 40000, offset: 0 });
   assert.match(same.payload, /\[e\d+ button "From aria-label"\]/, 'a same-process frame reads by its ref too, with bare refs');
   assert.ok(!same.payload.includes("The page's own prose"), 'and nothing of the page around it');
   await open('frames.html');
-  const stale = await outcome(input.click(sessions, session, first.refs['Child button'], {}));
+  const stale = await outcome(input.click(context, session, { ref: first.refs['Child button'] }));
   assert.strictEqual(stale.fail.outcome, 'stale_ref');
   // The parent's navigation destroyed the frame target, and its number is never
   // reassigned, so the ref names a frame that is gone rather than one that moved on.
@@ -379,7 +380,7 @@ test('a bare ref of a same-process frame that navigated on its own is an error, 
   await waitFor(async () => await childTitle() === 'Other');
   // The page's own generation never moved, so the set still answers for it; the node
   // the ref names belongs to a document the renderer has discarded.
-  const { fail } = await outcome(input.click(sessions, session, refs['From aria-label'], {}));
+  const { fail } = await outcome(input.click(context, session, { ref: refs['From aria-label'] }));
   assert.strictEqual(fail.outcome, 'error');
   assert.match(fail.message, /no longer resolves to an element \(it was removed from the page\)/);
 });
@@ -421,12 +422,12 @@ test('a click judges hidden and disabled the way the read did, element for eleme
   await open('labels.html');
   const { refs } = await readAll({ hidden: true });
   for (const label of ['Display none', 'Aria hidden', 'Transparent', 'Zero height']) {
-    const trusted = await outcome(input.click(sessions, session, refs[label], { trusted: true }));
+    const trusted = await outcome(input.click(context, session, { ref: refs[label], trusted: true }));
     assert.match(trusted.fail.message, /is hidden; a trusted click/, label);
-    const scripted = await outcome(input.click(sessions, session, refs[label], {}));
+    const scripted = await outcome(input.click(context, session, { ref: refs[label] }));
     assert.ok(scripted.ok, `${label}: a scripted click is attempted`);
   }
-  const disabled = await outcome(input.click(sessions, session, refs['Disabled control'], {}));
+  const disabled = await outcome(input.click(context, session, { ref: refs['Disabled control'] }));
   assert.match(disabled.fail.message, /is disabled/);
 });
 
@@ -456,40 +457,41 @@ test('the walk restricted to hidden elements returns those alone, no page text, 
 test('a scripted click delivers to a handler as a scripted event; trusted delivers a trusted one', { skip }, async () => {
   await open('actions.html');
   const { refs } = await readAll();
-  const scripted = await input.click(sessions, session, refs['Handler button'], {});
-  assert.match(scripted.payload, /Navigated: no$/);
+  const scripted = await input.click(context, session, { ref: refs['Handler button'] });
+  assert.match(scripted.head, /\nNavigated: no\nChanged: 1 line added, 1 removed$/);
+  assert.match(scripted.body, /^@@\n/, 'the hunks are the body');
   assert.strictEqual(await logText(), 'handled scripted');
-  await input.click(sessions, session, refs['Trusted only'], {});
+  await input.click(context, session, { ref: refs['Trusted only'] });
   assert.strictEqual(await logText(), 'handled scripted', 'a scripted click does not satisfy an isTrusted check');
-  await input.click(sessions, session, refs['Trusted only'], { trusted: true });
+  await input.click(context, session, { ref: refs['Trusted only'], trusted: true });
   assert.strictEqual(await logText(), 'trusted only fired');
 });
 
 test('a trusted click reaches an element below the fold: the page scrolls and the hit test lands', { skip }, async () => {
   await open('labels.html');
   const { refs } = await readAll();
-  const r = await input.click(sessions, session, refs['Offscreen link'], { trusted: true });
-  assert.match(r.payload, /^URL: http:\/\/127\.0\.0\.1:\d+\/other\n/);
-  assert.match(r.payload, /Navigated: yes/);
+  const r = await input.click(context, session, { ref: refs['Offscreen link'], trusted: true });
+  assert.match(r.head, /^URL: http:\/\/127\.0\.0\.1:\d+\/other\n/);
+  assert.match(r.head, /Navigated: yes/);
 });
 
 test('a trusted click is refused when covered; a scripted one reaches through; a disabled ref is refused', { skip }, async () => {
   await open('actions.html');
   const { refs } = await readAll();
-  const covered = await outcome(input.click(sessions, session, refs['Covered button'], { trusted: true }));
+  const covered = await outcome(input.click(context, session, { ref: refs['Covered button'], trusted: true }));
   assert.match(covered.fail.message, /covered by another element/);
-  await input.click(sessions, session, refs['Covered button'], {});
+  await input.click(context, session, { ref: refs['Covered button'] });
   assert.strictEqual(await logText(), 'covered clicked');
-  const disabled = await outcome(input.click(sessions, session, refs['Disabled button'], {}));
+  const disabled = await outcome(input.click(context, session, { ref: refs['Disabled button'] }));
   assert.match(disabled.fail.message, /is disabled/);
 });
 
 test('a link click reports Navigated: yes with the new URL, and the old refs go stale', { skip }, async () => {
   await open('actions.html');
   const { refs } = await readAll();
-  const r = await input.click(sessions, session, refs['Same tab link'], {});
-  assert.strictEqual(r.payload, `URL: ${site.base}/other\nTitle: Other\nNavigated: yes`);
-  const stale = await outcome(input.click(sessions, session, refs['Handler button'], {}));
+  const r = await input.click(context, session, { ref: refs['Same tab link'] });
+  assert.strictEqual(r.head, `URL: ${site.base}/other\nTitle: Other\nNavigated: yes`);
+  const stale = await outcome(input.click(context, session, { ref: refs['Handler button'] }));
   assert.strictEqual(stale.fail.outcome, 'stale_ref');
 });
 
@@ -497,8 +499,8 @@ test('a target=_blank click reports Opened: a new tab, attributed to the session
   await open('actions.html');
   const { refs } = await readAll();
   const before = session.opened.size;
-  const r = await input.click(sessions, session, refs['New tab link'], {});
-  assert.strictEqual(r.payload, `URL: ${site.base}/actions.html\nTitle: Actions fixture\nNavigated: no\nOpened: a new tab (not the working tab)`);
+  const r = await input.click(context, session, { ref: refs['New tab link'] });
+  assert.match(r.head, new RegExp(`^URL: ${site.base}/actions\\.html\nTitle: Actions fixture\nNavigated: no\nOpened: t\\d+, a new tab \\(not the working tab\\)\nChanged: nothing$`));
   assert.strictEqual(session.opened.size, before + 1);
   for (const id of session.opened) await live.conn.send('Target.closeTarget', { targetId: id });
 });
@@ -506,19 +508,19 @@ test('a target=_blank click reports Opened: a new tab, attributed to the session
 test('a trusted click reaches a shadow host whose painted content is in its shadow tree', { skip }, async () => {
   await open('actions.html');
   const { refs } = await readAll();
-  await input.click(sessions, session, refs['Shadow host button'], { trusted: true });
+  await input.click(context, session, { ref: refs['Shadow host button'], trusted: true });
   assert.strictEqual(await logText(), 'shadow host trusted');
 });
 
 test('navigate to a denied download is an error that leaves the page; a fragment navigate returns promptly with the new URL', { skip }, async () => {
   await open('actions.html');
   let started = Date.now();
-  const download = await outcome(input.navigate(sessions, session, { url: `${site.base}/download`, name: 'live read' }));
+  const download = await outcome(navigation.navigate(context, session, { url: `${site.base}/download`, name: 'live read' }));
   assert.match(download.fail.message, /was a download, which is denied; the page is unchanged/);
   assert.ok(Date.now() - started < 2000, `the download event ended the wait (${Date.now() - started} ms)`);
   started = Date.now();
-  const fragment = await input.navigate(sessions, session, { url: `${site.base}/actions.html#part`, name: 'live read' });
-  assert.strictEqual(fragment.payload, `URL: ${site.base}/actions.html#part\nTitle: Actions fixture`);
+  const fragment = await navigation.navigate(context, session, { url: `${site.base}/actions.html#part`, name: 'live read' });
+  assert.strictEqual(fragment.head, `URL: ${site.base}/actions.html#part\nTitle: Actions fixture\nNavigated: no\nChanged: not tracked (read the page first)`);
   assert.ok(Date.now() - started < 2000, `the same-document event ended the wait (${Date.now() - started} ms)`);
 });
 
@@ -526,47 +528,49 @@ test('a download link is denied and reads as an unchanged click, without waiting
   await open('actions.html');
   const { refs } = await readAll();
   const started = Date.now();
-  const r = await input.click(sessions, session, refs['Download link'], {});
-  // Page.downloadWillBegin fires under deny (about 15 ms after the click) and ends the wait.
-  assert.ok(Date.now() - started < 300, `the download event ended the wait (${Date.now() - started} ms)`);
-  assert.strictEqual(r.payload, `URL: ${site.base}/actions.html\nTitle: Actions fixture\nNavigated: no`);
+  const r = await input.click(context, session, { ref: refs['Download link'] });
+  // Under deny, Chrome fails the link's document request with net::ERR_ABORTED, which
+  // ends the wait, and fires Page.downloadWillBegin a few ms later; the quiet window
+  // and the change summary still follow.
+  assert.ok(Date.now() - started < 2000, `the failed document request ended the wait (${Date.now() - started} ms)`);
+  assert.strictEqual(r.head, `URL: ${site.base}/actions.html\nTitle: Actions fixture\nNavigated: no\nChanged: nothing`);
 });
 
 test('pushState keeps refs valid; a ref from an earlier read of the same document still clicks', { skip }, async () => {
   await open('actions.html');
   const first = await readAll();
-  await input.click(sessions, session, first.refs['Push state'], {});
+  await input.click(context, session, { ref: first.refs['Push state'] });
   assert.strictEqual(await logText(), 'pushed');
   await readAll();
-  const r = await input.click(sessions, session, first.refs['Handler button'], {});
-  assert.match(r.payload, /^URL: .*\/actions\.html\?pushed=1\n/);
+  const r = await input.click(context, session, { ref: first.refs['Handler button'] });
+  assert.match(r.head, /^URL: .*\/actions\.html\?pushed=1\n/);
   assert.strictEqual(await logText(), 'handled scripted');
 });
 
 test('a ref cut by max_chars still clicks', { skip }, async () => {
   await open('actions.html');
-  const cut = await read.readPage(sessions, session, { maxChars: 30, offset: 0, hidden: false });
+  const cut = await readPayload(sessions, session, { maxChars: 30, offset: 0, hidden: false });
   assert.ok(!cut.payload.includes('Handler button'), 'the markers were cut');
   assert.match(cut.payload, /Pass offset=\d+ for the next part/);
   // The cut read merged every id its tree found, so a control it never delivered is
   // clickable without paging to it.
   const whole = await readAll({ hidden: false });
-  const r = await input.click(sessions, session, whole.refs['Handler button'], {});
-  assert.match(r.payload, /Navigated: no$/);
+  const r = await input.click(context, session, { ref: whole.refs['Handler button'] });
+  assert.match(r.head, /\nNavigated: no\nChanged: /);
   assert.strictEqual(await logText(), 'handled scripted');
 });
 
 test('dialog text lands in the payload via takeDialogs; beforeunload is accepted on navigate', { skip }, async () => {
   await open('actions.html');
   const { refs } = await readAll();
-  await input.click(sessions, session, refs['Alert button'], {});
+  await input.click(context, session, { ref: refs['Alert button'] });
   assert.deepStrictEqual(sessions.takeDialogs(session.workingTargetId), [{ type: 'alert', message: 'Alert text from the page' }]);
-  await input.click(sessions, session, refs['Arm beforeunload'], {});
+  await input.click(context, session, { ref: refs['Arm beforeunload'] });
   assert.strictEqual(await logText(), 'armed');
   // A beforeunload prompt fires only after a user gesture, which this trusted click supplies.
-  await input.click(sessions, session, refs['Arm beforeunload'], { trusted: true });
-  const r = await input.navigate(sessions, session, { url: `${site.base}/other`, name: 'live read' });
-  assert.strictEqual(r.payload, `URL: ${site.base}/other\nTitle: Other`);
+  await input.click(context, session, { ref: refs['Arm beforeunload'], trusted: true });
+  const r = await navigation.navigate(context, session, { url: `${site.base}/other`, name: 'live read' });
+  assert.strictEqual(r.head, `URL: ${site.base}/other\nTitle: Other\nNavigated: yes`);
   const dialogs = sessions.takeDialogs(session.workingTargetId);
   assert.ok(dialogs.every((d) => d.type === 'beforeunload'), JSON.stringify(dialogs));
 });
@@ -574,14 +578,14 @@ test('dialog text lands in the payload via takeDialogs; beforeunload is accepted
 test('a slow form post starts within the wait and reports Navigated: yes once loaded', { skip }, async () => {
   await open('actions.html');
   const { refs } = await readAll();
-  const r = await input.click(sessions, session, refs['Slow submit'], {});
-  assert.strictEqual(r.payload, `URL: ${site.base}/slow\nTitle: Slow\nNavigated: yes`);
+  const r = await input.click(context, session, { ref: refs['Slow submit'] });
+  assert.strictEqual(r.head, `URL: ${site.base}/slow\nTitle: Slow\nNavigated: yes`);
 });
 
 test('scroll moves a scrollable container on a fixture whose window does not scroll', { skip }, async () => {
   await open('container.html');
-  const r = await input.scroll(sessions, session, 'down', 700, {});
-  assert.match(r.payload, /\nScroll: 700 of \d+ \(viewport \d+\)$/);
+  const r = await input.scroll(context, session, { direction: 'down', amount: 700 });
+  assert.match(r.head, /\nScroll: 700 of \d+ \(viewport \d+\)\nNavigated: no\nChanged: not tracked \(read the page first\)$/);
   const info = await read.pageInfo(sessions, session, {});
-  assert.match(info.payload, /\nScroll: 700 of /);
+  assert.match(info.head, /\nScroll: 700 of /);
 });

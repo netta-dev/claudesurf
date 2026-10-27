@@ -1,0 +1,36 @@
+<!doctype html>
+<!-- Rewrites a text node in <main> every 100 ms for as long as the page is open. With
+     ?quiet=1 the page stays still, and with ?attributes=1 it rewrites that paragraph's
+     attributes instead, as an animation that restyles every frame does. In each, the
+     button starts a fetch of /busy.json, whose response never ends. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Busy</title>
+</head>
+<body>
+  <main>
+    <h1>Busy</h1>
+    <p id="tick">Tick 0</p>
+    <p><button id="fetch-busy">Fetch busy</button></p>
+  </main>
+  <script>
+    const mode = new URLSearchParams(location.search);
+    const tick = document.getElementById('tick');
+    let count = 0;
+    if (mode.has('attributes')) {
+      setInterval(() => {
+        count += 1;
+        tick.dataset.frame = String(count);
+        tick.style.opacity = count % 2 ? '0.5' : '1';
+      }, 100);
+    } else if (!mode.has('quiet')) {
+      setInterval(() => { count += 1; tick.firstChild.data = `Tick ${count}`; }, 100);
+    }
+    // The page keeps the body read pending so Chrome holds the request open.
+    document.getElementById('fetch-busy').onclick = () => {
+      window.busy = fetch('/busy.json').then((response) => response.text());
+    };
+  </script>
+</body>
+</html>

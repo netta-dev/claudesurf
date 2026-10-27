@@ -1,0 +1,49 @@
+<!doctype html>
+<!-- Shows placeholders until /delay answers 1.5 s later, then fills them in: one in the
+     light DOM and one inside a custom element's open shadow root. The custom element
+     attaches its shadow root as the parser creates it, so the root exists before
+     DOMContentLoaded. The Reload button puts the placeholders back and fills them again
+     from a second request. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Skeleton</title>
+  <script>
+    customElements.define('x-card', class extends HTMLElement {
+      constructor() {
+        super();
+        this.attachShadow({ mode: 'open' }).innerHTML = '<p>Card loading…</p>';
+      }
+
+      show(text) {
+        this.shadowRoot.querySelector('p').textContent = text;
+      }
+    });
+  </script>
+</head>
+<body>
+  <main>
+    <h1>Skeleton</h1>
+    <p id="status">Loading…</p>
+    <x-card id="card"></x-card>
+    <p><button id="reload">Reload</button></p>
+  </main>
+  <script>
+    const status = document.getElementById('status');
+    const card = document.getElementById('card');
+
+    function fill(light, shadow) {
+      status.textContent = 'Loading…';
+      card.show('Card loading…');
+      // The body is read as it would be by a page filling in its content.
+      return fetch('/delay?ms=1500').then((response) => response.text()).then(() => {
+        status.textContent = light;
+        card.show(shadow);
+      });
+    }
+
+    fill('Loaded content: alpha', 'Shadow content: beta');
+    document.getElementById('reload').onclick = () => fill('Reloaded content: gamma', 'Shadow content: delta');
+  </script>
+</body>
+</html>

@@ -24,11 +24,12 @@ const fs = require('fs');
 const path = require('path');
 const { liveBinary, liveBrowser } = require('../../helpers');
 const { serve } = require('../serve');
-const input = require('../../../server/input');
+const navigation = require('../../../server/navigation');
 
 const PAGES = [
   { name: 'render', path: 'render.html' },
   { name: 'frames', path: 'frames.html' },
+  { name: 'menu', path: 'menu.html?open=menu,aria-modal' },
   { name: 'wikipedia', url: 'https://en.wikipedia.org/wiki/Web_browser', condense: true },
 ];
 const FIXTURE_BASE = 'http://fixture.test';
@@ -90,7 +91,7 @@ function serialize(nodes, base) {
   try {
     const session = await live.sessions.ensure('record-ax');
     for (const page of pages) {
-      await input.navigate(live.sessions, session, { url: page.url || `${site.base}/${page.path}`, name: 'record' });
+      await navigation.navigate(live.context, session, { url: page.url || `${site.base}/${page.path}`, name: 'record' });
       const { nodes } = await live.sessions.send(session.workingTargetId, 'Accessibility.getFullAXTree', {});
       const trimmed = page.condense ? condense(nodes.map(trim)) : nodes.map(trim);
       const file = path.join(__dirname, `${page.name}.json`);

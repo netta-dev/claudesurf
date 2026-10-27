@@ -1,0 +1,113 @@
+<!doctype html>
+<!-- Overlays outside <main>. The app root holds a header with a menubar and a main with
+     too little prose for Readability to find an article, a status with text, and an
+     empty status. Each Open button appends its overlay to the end of <body>, outside
+     the app root: a menu of buttons, a dialog that sets aria-hidden on the app root as
+     modal libraries do, a native <dialog> opened with showModal(), and an aria-modal
+     dialog that holds a menu. The open parameter opens overlays on load, by the names
+     menu, hidden, modal, and aria-modal, separated by commas. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Menu fixture</title>
+  <style>
+    .overlay { border: 1px solid #555; padding: 12px; margin: 12px; max-width: 360px; background: #fff; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <div role="menubar">
+        <button role="menuitem">File</button>
+        <button role="menuitem">Edit</button>
+      </div>
+    </header>
+    <main>
+      <h1>Menu fixture</h1>
+      <p>Each button opens an overlay.</p>
+      <p>
+        <button id="open-menu">Open menu</button>
+        <button id="open-hidden">Open hidden-root dialog</button>
+        <button id="open-modal">Open modal dialog</button>
+        <button id="open-aria">Open aria-modal dialog</button>
+      </p>
+      <div role="status">3 items in your cart</div>
+      <div role="status"></div>
+    </main>
+  </div>
+  <script>
+    const app = document.getElementById('app');
+
+    // Appends the markup's one element to the end of <body>, unless an element with
+    // its id is there already.
+    function append(markup) {
+      const template = document.createElement('template');
+      template.innerHTML = markup.trim();
+      const element = template.content.firstElementChild;
+      if (document.getElementById(element.id)) return null;
+      document.body.append(element);
+      return element;
+    }
+
+    const OPENERS = {
+      menu() {
+        append(`<div id="page-menu" class="overlay" role="menu" aria-label="Page menu">
+          <button role="menuitem">Rename</button>
+          <button role="menuitem">Duplicate</button>
+          <button role="menuitem">Delete</button>
+        </div>`);
+      },
+      hidden() {
+        const dialog = append(`<div id="hidden-dialog" class="overlay" role="dialog" aria-label="Hidden root dialog">
+          <p>The app behind this dialog is hidden.</p>
+          <button class="cancel">Cancel</button>
+          <button>Confirm</button>
+        </div>`);
+        if (!dialog) return;
+        app.setAttribute('aria-hidden', 'true');
+        dialog.querySelector('.cancel').onclick = () => {
+          dialog.remove();
+          app.removeAttribute('aria-hidden');
+        };
+      },
+      modal() {
+        const dialog = append(`<dialog id="modal-dialog" aria-label="Native modal dialog">
+          <p>This dialog was opened with showModal.</p>
+          <button class="cancel">Cancel</button>
+          <button>Delete</button>
+        </dialog>`);
+        if (!dialog) return;
+        dialog.showModal();
+        dialog.querySelector('.cancel').onclick = () => {
+          dialog.close();
+          dialog.remove();
+        };
+      },
+      'aria-modal'() {
+        const dialog = append(`<div id="aria-dialog" class="overlay" role="dialog" aria-modal="true" aria-label="Aria modal dialog">
+          <p>This dialog leaves the page in the tree.</p>
+          <div role="menu" aria-label="Dialog actions">
+            <button role="menuitem">Archive</button>
+            <button role="menuitem">Restore</button>
+          </div>
+          <button class="close">Close</button>
+        </div>`);
+        if (!dialog) return;
+        dialog.querySelector('.close').onclick = () => dialog.remove();
+      },
+    };
+
+    document.getElementById('open-menu').onclick = OPENERS.menu;
+    document.getElementById('open-hidden').onclick = OPENERS.hidden;
+    document.getElementById('open-modal').onclick = OPENERS.modal;
+    document.getElementById('open-aria').onclick = OPENERS['aria-modal'];
+
+    document.addEventListener('DOMContentLoaded', () => {
+      const names = (new URLSearchParams(location.search).get('open') || '').split(',');
+      for (const name of names) {
+        if (Object.hasOwn(OPENERS, name)) OPENERS[name]();
+      }
+    });
+  </script>
+</body>
+</html>

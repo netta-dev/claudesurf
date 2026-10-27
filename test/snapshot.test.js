@@ -4,28 +4,17 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { Snapshot, resolveScope, omissions, BODY, NOTHING } = require('../server/snapshot');
+const { Snapshot, resolveScope, omissions, blockOverlays, BODY, NOTHING } = require('../server/snapshot');
 const { LABEL_MAX } = require('../server/action-support');
 const { enableTargets } = require('../server/browser');
 const { fakeSession } = require('./helpers');
+const { node } = require('./fixtures/ax/nodes');
 
 const render = require('./fixtures/ax/render.json');
 const frames = require('./fixtures/ax/frames.json');
 const wikipedia = require('./fixtures/ax/wikipedia.json');
-
-// One node in the protocol's shape; `id` doubles as the DOM node behind it.
-function node(id, role, { name = '', properties = {}, children = [] } = {}) {
-  const built = {
-    nodeId: String(id),
-    role: { type: 'role', value: role },
-    name: { type: 'computedString', value: name },
-    backendDOMNodeId: id,
-  };
-  const entries = Object.entries(properties);
-  if (entries.length) built.properties = entries.map(([key, value]) => ({ name: key, value: { type: 'value', value } }));
-  if (children.length) built.childIds = children.map(String);
-  return built;
-}
+// The tree recorded from menu.html?open=menu,aria-modal.
+const menu = require('./fixtures/ax/menu.json');
 
 // The same node with its DOM node taken away, as Chrome reports one that has none.
 function ghost(built) {
@@ -71,7 +60,7 @@ test('every state word appears in the order a marker prints them', () => {
   assert.deepStrictEqual(controls.get('Partly').state, ['mixed', 'collapsed']);
 });
 
-test('the five roles phase 1 reached without an ARIA role are controls, and so is a contenteditable region', () => {
+test('the five Blink-internal control roles are controls, and so is a contenteditable region', () => {
   const controls = byName(new Snapshot(render));
   assert.strictEqual(controls.get('Details summary').role, 'DisclosureTriangle');
   assert.strictEqual(controls.get('When').role, 'Date');
@@ -87,13 +76,18 @@ test('a control inside another folds into it, and a combobox lists its options a
   assert.ok(!names.some((name) => name.startsWith('Show date picker')), "the date input's picker button folds in");
   assert.ok(!names.some((name) => /^(Month|Day|Year|Hour|Minute)\b/.test(name)), 'its spinbuttons fold in');
   assert.ok(!names.includes('one'), 'an option is not a control of its own');
-  assert.deepStrictEqual(byName(snapshot).get('Chooser').options, { names: ['one', 'two', 'three'], more: 0 });
+  const listed = (control) => ({ names: control.options.kept.map((o) => o.name), total: control.options.total });
+  const chooser = byName(snapshot).get('Chooser');
+  assert.deepStrictEqual(listed(chooser), { names: ['one', 'two', 'three'], total: 3 });
   const several = byName(snapshot).get('Several');
   assert.strictEqual(several.role, 'listbox', 'Chrome exposes a multiple select as a listbox');
-  assert.deepStrictEqual(several.options, { names: ['red', 'green', 'blue'], more: 0 }, 'whose options are its value list too');
+  assert.deepStrictEqual(listed(several), { names: ['red', 'green', 'blue'], total: 3 }, 'whose options are its value list too');
+  for (const control of [chooser, several]) {
+    assert.ok(control.options.kept.every((o) => Number.isInteger(o.backendId)), 'every kept option carries the DOM node behind it');
+  }
 });
 
-test('a long option list is cut at twelve with the rest counted, and a long name at the cap', () => {
+test('a long option list is kept whole with its count, the marker\'s cut left to the render, and a long name is cut at the cap', () => {
   const options = Array.from({ length: 15 }, (unused, i) => node(10 + i, 'option', { name: `option ${i}` }));
   const snapshot = new Snapshot([
     node(1, 'RootWebArea', { children: [2, 3] }),
@@ -102,11 +96,24 @@ test('a long option list is cut at twelve with the rest counted, and a long name
     node(3, 'link', { name: 'After' }),
   ]);
   const combobox = snapshot.controls[0];
-  assert.strictEqual(combobox.options.names.length, 12);
-  assert.strictEqual(combobox.options.more, 3);
+  assert.deepStrictEqual(combobox.options.kept.map((o) => o.name), options.map((o) => o.name.value));
+  assert.strictEqual(combobox.options.total, 15);
   assert.strictEqual(combobox.name.length, LABEL_MAX);
   assert.ok(combobox.name.startsWith('long long'), 'leading whitespace is collapsed away');
   assert.ok(combobox.name.endsWith('…'), 'and a cut name says it was cut');
+});
+
+test('a long select keeps 500 of its options with the DOM node behind each, and counts every one for its marker', () => {
+  const options = Array.from({ length: 600 }, (unused, i) => node(10 + i, 'option', { name: `option ${i}` }));
+  const snapshot = new Snapshot([
+    node(1, 'RootWebArea', { children: [2] }),
+    node(2, 'combobox', { name: 'Country', children: options.map((o) => Number(o.nodeId)) }),
+    ...options,
+  ]);
+  const { total, kept } = snapshot.controls[0].options;
+  assert.strictEqual(total, 600, 'the marker counts every option past the ones it lists');
+  assert.strictEqual(kept.length, 500, 'a read scoped to the select lists up to 500');
+  assert.deepStrictEqual(kept, options.slice(0, 500).map((o) => ({ name: nameOf(o), backendId: o.backendDOMNodeId })), 'each with the DOM node a click on it resolves');
 });
 
 test('a cap steps back off a surrogate pair rather than cutting it in half', () => {
@@ -128,7 +135,7 @@ test('a bracket or a backslash in a name or an option name is escaped, so page t
     node(5, 'link', { name: 'a\\] \\[e7 button "x"\\] b' }),
   ]);
   assert.strictEqual(snapshot.controls[0].name, 'x\\] \\[Sign out\\](/logout)\\[e7\\] y');
-  assert.deepStrictEqual(snapshot.controls[1].options.names, ['closer\\] \\[e7\\] more'], 'an option name renders unquoted in a value list');
+  assert.deepStrictEqual(snapshot.controls[1].options.kept.map((o) => o.name), ['closer\\] \\[e7\\] more'], 'an option name renders unquoted in a value list');
   assert.strictEqual(
     snapshot.controls[2].name,
     'a\\\\\\] \\\\\\[e7 button "x"\\\\\\] b',
@@ -152,7 +159,7 @@ test('the whitespace of a name is collapsed, so a marker carrying one stays on i
     recorded.controls.filter((control) => control.name.startsWith('first')).map((control) => [control.role, control.name]),
     [['link', 'first second']],
   );
-  assert.deepStrictEqual(byName(recorded).get('Two-line option').options.names, ['first second', 'second']);
+  assert.deepStrictEqual(byName(recorded).get('Two-line option').options.kept.map((o) => o.name), ['first second', 'second']);
 });
 
 test('a name is stripped of the NUL that delimits a frame placeholder, so a page cannot forge one', () => {
@@ -225,6 +232,84 @@ test('the iframe nodes of a tree are collected, and their subtrees stop at them'
     assert.deepStrictEqual([...snapshot.subtree(iframe.nodeId)], [iframe.nodeId], "a parent's tree holds no node of the frame");
   }
   assert.deepStrictEqual(new Snapshot(render).iframes, [], 'a page without frames has none');
+});
+
+test('the overlays of a tree are its dialogs and menus and the alerts and statuses that say something, outermost only', () => {
+  const recorded = (id) => menu.find((n) => n.nodeId === id);
+  // The recording holds each shape that the list leaves out, so the list below can't
+  // pass because the recording lacks one.
+  assert.strictEqual(recorded('10').role.value, 'menubar');
+  assert.strictEqual(recorded('30').role.value, 'menu');
+  assert.ok(recorded('28').childIds.includes('30'), 'the "Dialog actions" menu sits inside the dialog');
+  assert.deepStrictEqual([recorded('22').role.value, nameOf(recorded('22')), recorded('22').childIds], ['status', '', undefined], 'one status is empty');
+  const snapshot = new Snapshot(menu);
+  assert.deepStrictEqual(snapshot.overlays, [
+    { nodeId: '21', backendId: 21, role: 'status', name: '', modal: false },
+    { nodeId: '24', backendId: 24, role: 'menu', name: 'Page menu', modal: false },
+    { nodeId: '28', backendId: 28, role: 'dialog', name: 'Aria modal dialog', modal: true },
+  ], 'in tree order: the status by the text under it, the menu and the dialog at the end of the body; '
+    + 'the empty status, the menubar, and the menu inside the dialog are left out');
+
+  const announcements = new Snapshot([
+    node(1, 'RootWebArea', { children: [2, 3, 5] }),
+    node(2, 'alert', { name: 'Payment failed' }),
+    node(3, 'alert', { children: [4] }),
+    node(4, 'StaticText', { name: '  ' }),
+    node(5, 'status'),
+  ]);
+  assert.deepStrictEqual(
+    announcements.overlays.map((o) => [o.role, o.name]),
+    [['alert', 'Payment failed']],
+    'an alert named by its attributes says something; one with blank text under it and a status with nothing under it wait for a message',
+  );
+});
+
+test('a read picks a dialog wherever it sits, and an alert, a status, or a menu only outside its root under a rooted chain', () => {
+  const snapshot = new Snapshot([
+    node(1, 'RootWebArea', { children: [2, 3, 7, 10, 8, 9] }),
+    node(2, 'banner'),
+    node(3, 'main', { children: [4, 5, 6] }),
+    node(4, 'dialog', { name: 'Confirm' }),
+    node(5, 'alert', { name: 'Card declined' }),
+    node(6, 'status', { name: 'Saved' }),
+    node(7, 'alert', { name: 'Session expiring' }),
+    node(10, 'status', { name: 'Offline' }),
+    node(8, 'menu', { name: 'Actions' }),
+    ghost(node(9, 'dialog', { name: 'No DOM node' })),
+  ]);
+  const picked = (root, chain) => blockOverlays(snapshot, root, chain).map((o) => o.name);
+  assert.deepStrictEqual(
+    picked('3', 'main'),
+    ['Confirm', 'Session expiring', 'Offline', 'Actions'],
+    'the dialog inside main and the alert, the status, and the menu outside it; the alert and the status inside main stay where they read, '
+      + 'and a dialog with no DOM node behind it has nothing to render',
+  );
+  for (const chain of ['article', 'ref']) assert.deepStrictEqual(picked('3', chain), ['Confirm', 'Session expiring', 'Offline', 'Actions'], chain);
+  assert.deepStrictEqual(picked(null, 'all'), ['Confirm'], 'under all, dialogs alone');
+  assert.deepStrictEqual(picked(null, 'auto'), ['Confirm'], 'and under auto, whose root the page script chooses');
+  assert.deepStrictEqual(picked('3', 'forced-article'), ['Confirm'], 'and under forced-article, whatever the root');
+
+  const recorded = new Snapshot(menu);
+  const main = landmarkNamed(recorded, 'main', '');
+  assert.deepStrictEqual(blockOverlays(recorded, main.nodeId, 'main').map((o) => o.backendId), [24, 28], 'the status inside main stays in place');
+  assert.deepStrictEqual(blockOverlays(recorded, main.nodeId, 'all').map((o) => o.backendId), [28]);
+});
+
+test('an overlay that holds the scope root is left out, since the read renders the part of it that the scope names', () => {
+  const snapshot = new Snapshot([
+    node(1, 'RootWebArea', { children: [2, 5, 8] }),
+    node(2, 'dialog', { name: 'Settings', children: [3] }),
+    node(3, 'group', { name: 'Advanced', children: [4] }),
+    node(4, 'button', { name: 'Reset' }),
+    node(5, 'status', { name: 'Uploading', children: [6] }),
+    node(6, 'group', { name: 'Files', children: [7] }),
+    node(7, 'button', { name: 'Cancel' }),
+    node(8, 'alertdialog', { name: 'Unsaved changes' }),
+  ]);
+  const picked = (root) => blockOverlays(snapshot, root, 'ref').map((o) => o.name);
+  assert.deepStrictEqual(picked('3'), ['Uploading', 'Unsaved changes'], 'a root inside the dialog');
+  assert.deepStrictEqual(picked('6'), ['Settings', 'Unsaved changes'], 'a root inside the status');
+  assert.deepStrictEqual(picked('2'), ['Uploading', 'Unsaved changes'], 'and a root that is the dialog');
 });
 
 test('the scope chain takes the first main landmark, else an article, else hands the choice to the page script', () => {

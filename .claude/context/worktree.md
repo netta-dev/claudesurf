@@ -10,4 +10,4 @@ None
 `npm --prefix server ci --ignore-scripts`
 
 ## Runtime notes
-The daemon owns one Chrome per profile directory and listens on one Unix socket (`server/daemon.js`). Both paths are overridable, so a worktree daemon runs its own browser without stopping the main checkout's: `CLAUDESURF_SOCKET=/tmp/cs-<tag>.sock CLAUDESURF_PROFILE_DIR=/tmp/cs-profile-<tag> node server/daemon.js`, with the session's MCP entry pointed at the worktree `server.js` under the same `CLAUDESURF_SOCKET`. Never start a daemon on the default socket or profile from a worktree. Tests create their own temp sockets and profiles.
+A worktree daemon runs with its own socket, profile, allowlist, and action log, as README.md's "Running a second daemon by hand" shows, with a per-worktree tag in each path; `server/paths.js` holds the four overrides. Point the session's MCP entry at the worktree `server.js` under the same `CLAUDESURF_SOCKET`. Never start a daemon on the default socket, profile, allowlist, or log from a worktree. Tests create their own temp sockets, profiles, allowlists, and logs.

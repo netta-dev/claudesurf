@@ -16,6 +16,31 @@ test('success carries the payload and only the optional fields that were given',
   );
 });
 
+test('needs_confirmation carries the payload and a message that says whether the call acted and leaves out the host', () => {
+  const payload = 'URL: https://docs.example/\nTitle: Docs\nBlocked: [t1] evil.example — navigation to https://evil.example/x';
+  const acted = envelope.needsConfirmation(payload, { notes: ['n'], acted: true });
+  assert.deepStrictEqual(Object.keys(acted), ['outcome', 'message', 'payload', 'notes']);
+  assert.strictEqual(acted.outcome, 'needs_confirmation');
+  assert.strictEqual(acted.message, 'The action ran, and a navigation it led to was stopped at the domain gate. Ask the human about the host on the Blocked: line, then call policy with allow_once or allow_always. Check the result lines before repeating the action: a form it submitted may already have been processed.');
+  const before = envelope.needsConfirmation(payload, { acted: false });
+  assert.deepStrictEqual(before, {
+    outcome: 'needs_confirmation',
+    message: "The navigation was not started: its host needs the human's approval. Ask her about the host on the Blocked: line, then call policy with allow_once or allow_always and retry.",
+    payload,
+  });
+  for (const env of [acted, before]) assert.ok(!env.message.includes('evil.example'), 'the host stays in the payload');
+});
+
+test('unsettled carries the payload and its optional fields, and is not an error outcome', () => {
+  assert.deepStrictEqual(envelope.unsettled('p'), { outcome: 'unsettled', payload: 'p' });
+  assert.deepStrictEqual(
+    envelope.unsettled('p', { notes: ['n'], images: [{ data: 'd', mimeType: 'image/png' }] }),
+    { outcome: 'unsettled', payload: 'p', notes: ['n'], images: [{ data: 'd', mimeType: 'image/png' }] },
+  );
+  assert.ok(!envelope.ERROR_OUTCOMES.includes('unsettled'), 'so the bridge does not mark it isError');
+  assert.ok(!envelope.ERROR_OUTCOMES.includes('needs_confirmation'));
+});
+
 test('failure constructors set outcome and message', () => {
   assert.deepStrictEqual(envelope.error('bad'), { outcome: 'error', message: 'bad' });
   assert.deepStrictEqual(envelope.setupError('no display'), { outcome: 'setup_error', message: 'no display' });

@@ -10,6 +10,8 @@
 const envelope = require('./envelope');
 const { fail, stateLines, codePointBoundary, releaseObjects, renderSource, safeUrl, LABEL_MAX, URL_MAX, RESERVED } = require('./action-support');
 const { isMissingContext } = require('./sessions');
+const { OPTION_OWNERS } = require('./snapshot');
+const { REF_SOURCE } = require('./dispatch');
 
 const CALL = 'function (options, descriptors, ...nodes) { return claudesurfRender(options, descriptors, ...nodes); }';
 // A unit releases the remote objects it resolved under this group, named per unit
@@ -21,9 +23,12 @@ const OBJECT_GROUP = 'claudesurf-read-';
 // collects every match before it calls the replacer, so the outer pass is done matching
 // by the time the inner one resets lastIndex.
 const PLACEHOLDER = /[ \t\n]*\u0000frame:([^\u0000]*)\u0000[ \t\n]*/g;
-// What the page script leaves where a frame's own render goes; read.js looks for it to
-// tell a frame the render placed from one it dropped.
+// What the page script leaves where a frame's own render goes; placedFrames looks for
+// it to tell a frame that the render placed from one that it dropped.
 const placeholder = (ref) => `\u0000frame:${ref}\u0000`;
+// The ref inside a marker or a link's trailing ref, in dispatch.js's grammar. A
+// backslash ahead of the bracket is page text that Turndown escaped, not a marker.
+const MARKED_REF = new RegExp(`(?<!\\\\)\\[(${REF_SOURCE})[ \\]]`, 'g');
 // How much of a frame's own render is inlined, per frame and per read, so an embed
 // above the fold cannot displace the page's own content.
 const FRAME_CHARS = 8_000;
@@ -35,11 +40,15 @@ const READ_FRAME_CHARS = 16_000;
 // naming it in the log. Returns the page script's answer plus `frames`, the iframe
 // nodes joined to the frames they hold. `landmarks` asks for landmark boundaries where
 // the chain cannot: a frame a ref scope reads whole, whose whole document renders.
-// The remote objects are released in a finally, so the objects don't outlive the read.
-async function renderUnit(sessions, unit, { chain, fallback, links, landmarks = false, deadline }) {
+// `picked`, the page unit's overlays that render as blocks, are cut from what renders;
+// `overlay`, { role }, renders an overlay's own block, rooted at it, and has the page
+// script skip a root that is hidden, gone, or a screen-reader announcement.
+// `objectGroup` names the group that holds the remote objects; a finally releases it,
+// so the objects don't outlive the read. The release ends by `requestDeadline`, the
+// request's deadline, which comes after a frame unit's own `deadline`.
+async function renderUnit(sessions, unit, { chain, fallback, links, landmarks = false, deadline, requestDeadline = deadline, picked = [], overlay = null, objectGroup = `${OBJECT_GROUP}${unit.index}` }) {
   const { targetId } = unit.target;
-  const descriptors = describe(unit, chain);
-  const objectGroup = `${OBJECT_GROUP}${unit.index}`;
+  const descriptors = describe(unit, chain, picked);
   const opts = { deadline };
   return sessions.withWorld(targetId, unit.frameId, async (contextId, world) => {
     if (!world.injected) {
@@ -66,14 +75,14 @@ async function renderUnit(sessions, unit, { chain, fallback, links, landmarks = 
       if (unit.frameId !== null && descriptors.length > 0 && nodes.every((node) => node === null)) {
         throw new Error('its document changed while it was being read');
       }
-      const options = { chain, fallback, links, landmarks, labelMax: LABEL_MAX, urlMax: URL_MAX };
+      const options = { chain, fallback, links, landmarks, overlay, labelMax: LABEL_MAX, urlMax: URL_MAX };
       const result = await sessions.callFunction(targetId, {
         executionContextId: contextId, functionDeclaration: CALL, args: [options, descriptors, ...nodes],
       }, opts);
       sessions.log.debug(`${unit.label}: ${descriptors.length} nodes resolved in ${resolved - started} ms, rendered in ${Date.now() - resolved} ms`);
       return { ...result, frames };
     } finally {
-      await releaseObjects(sessions, targetId, objectGroup);
+      await releaseObjects(sessions, targetId, objectGroup, requestDeadline);
     }
   }, opts);
 }
@@ -84,16 +93,22 @@ function thrownText({ exception, text }) {
   return (exception && (exception.description || exception.value)) || text;
 }
 
-// The nodes the page script places markers for: the scope root, then every control,
-// group, landmark, and iframe of the unit's tree inside it. A named region is both a
-// landmark and a group and takes one descriptor, the group's, since a group's marker
-// renders under every scope where a landmark's renders under `all` alone.
+// Returns the descriptors of the nodes that the page script places markers for: the
+// scope root, then every control, group, landmark, and iframe of the unit's tree
+// inside it. A named region is both a landmark and a group and takes one descriptor,
+// the group's, since a group's marker renders under every scope where a landmark's
+// renders under `all` alone.
 //
 // An article is extracted from the whole document, so under that chain every node of
 // the unit is described whatever the root is: a control Readability keeps from outside
 // the root would otherwise render bare. The root is described either way, since the
-// page script renders it when Readability finds nothing.
-function describe(unit, chain) {
+// page script renders it when Readability fails to find an article. A root that is a
+// combobox or a listbox is described as the control it is, marked as the root, with
+// every option that the tree kept, and renders as its marker.
+//
+// Each overlay in `picked` gets an `overlay` descriptor whatever the root, so the clone
+// walk can leave it out of the region wherever it sits.
+function describe(unit, chain, picked = []) {
   const { snapshot, rootBackendId, prefix } = unit;
   const root = rootBackendId === null ? null : snapshot.node(rootBackendId);
   const inScope = root && chain !== 'forced-article' ? snapshot.subtree(root.nodeId) : null;
@@ -102,18 +117,38 @@ function describe(unit, chain) {
   const within = (entry) => entry.backendId !== undefined && (!inScope || inScope.has(entry.nodeId));
   const ref = (backendId) => `${prefix}e${backendId}`;
   const descriptors = [];
-  if (root) descriptors.push({ ref: ref(rootBackendId), backendId: rootBackendId, kind: 'root' });
-  for (const c of snapshot.controls.filter(within)) {
-    descriptors.push({
-      ref: ref(c.backendId), backendId: c.backendId, kind: 'control', role: c.role, name: c.name,
-      state: c.state, range: c.range, options: c.options,
-    });
+  if (root) {
+    const listed = snapshot.controls.find((c) => c.backendId === rootBackendId && OPTION_OWNERS.has(c.role));
+    descriptors.push(listed ? { ...controlDescriptor(listed, ref, true), root: true } : { ref: ref(rootBackendId), backendId: rootBackendId, kind: 'root' });
   }
+  for (const o of picked) descriptors.push({ ref: ref(o.backendId), backendId: o.backendId, kind: 'overlay', role: o.role, name: o.name });
+  for (const c of snapshot.controls.filter(within)) descriptors.push(controlDescriptor(c, ref, false));
   for (const g of snapshot.groups.filter(within)) descriptors.push({ ref: ref(g.backendId), backendId: g.backendId, kind: 'group', role: g.role, name: g.name });
   for (const l of snapshot.landmarks.filter(within)) descriptors.push({ ref: ref(l.backendId), backendId: l.backendId, kind: 'landmark', role: l.role, name: l.name });
   for (const f of snapshot.iframes.filter(within)) descriptors.push({ ref: ref(f.backendId), backendId: f.backendId, kind: 'iframe' });
   const seen = new Set();
   return descriptors.filter((d) => !seen.has(d.ref) && seen.add(d.ref));
+}
+
+// The number of options that a marker in the prose lists before it counts the rest.
+const MAX_OPTIONS = 12;
+
+// Returns a control's descriptor. Its options carry their refs, with the unit's
+// prefix: the first MAX_OPTIONS for a marker in the prose, every kept one for a root,
+// and in `more` how many the list leaves out.
+function controlDescriptor(c, ref, whole) {
+  const descriptor = {
+    ref: ref(c.backendId), backendId: c.backendId, kind: 'control', role: c.role, name: c.name,
+    state: c.state, range: c.range,
+  };
+  if (c.options) {
+    const listed = whole ? c.options.kept : c.options.kept.slice(0, MAX_OPTIONS);
+    descriptor.options = {
+      names: listed.map((o) => ({ name: o.name, ref: o.backendId === undefined ? null : ref(o.backendId) })),
+      more: c.options.total - listed.length,
+    };
+  }
+  return descriptor;
 }
 
 // One DOM.resolveNode per descriptor, pipelined into the unit's world. A node the tree
@@ -157,24 +192,26 @@ function placedFrames({ markdown, refs }, inlined = false) {
   return new Set(placed.filter((ref) => emitted.has(ref)));
 }
 
-// Each frame placeholder replaced by its unit's markdown between boundary markers, or
-// by a one-line marker saying why the frame was not read. `frames` maps a ref to
+// Replaces each frame placeholder with its unit's markdown between boundary markers, or
+// with a one-line marker saying why the frame was not read. `frames` maps a ref to
 // { url, cross, markdown } or { url, cross, reason }; a ref with no entry is a frame
 // the read never reached.
 //
 // A block stands on blank lines of its own. The match consumes the placeholder's own
 // surrounding whitespace, so the blank lines a block brings are the only ones this
 // touches and a run inside the page's own fenced text survives.
-function inlineFrames(markdown, frames) {
-  let budget = READ_FRAME_CHARS;
+//
+// `budget`, { chars }, is the read's frame-text budget, which every call of one read
+// draws down in turn.
+function inlineFrames(markdown, frames, budget = frameBudget()) {
   const expand = (text) => text.replace(PLACEHOLDER, (match, ref) => {
     const frame = frames.get(ref) || { reason: 'not readable' };
     const open = `[${ref} frame${frame.url ? ` ${markerUrl(frame.url)}` : ''}`;
     if (frame.markdown === undefined) return `\n\n${open} (${frame.reason})]\n\n`;
     // Only the frame's own text counts against the budget; the frames inside it
     // are expanded after the cut and count for themselves.
-    const kept = cutToLine(frame.markdown, Math.min(FRAME_CHARS, budget));
-    budget -= kept.length;
+    const kept = cutToLine(frame.markdown, Math.min(FRAME_CHARS, budget.chars));
+    budget.chars -= kept.length;
     const left = frame.markdown.length - kept.length;
     const cut = left > 0 ? `\n(frame content cut: ${left} more characters; scope=${ref} reads it whole)` : '';
     return `\n\n${open}${frame.cross ? ' cross-site' : ''}]\n${expand(kept).trim()}${cut}\n[/frame]\n\n`;
@@ -184,8 +221,40 @@ function inlineFrames(markdown, frames) {
   return expand(markdown).replaceAll('\u0000', '').trim();
 }
 
-// The URL in a frame marker comes from the page, so it follows the link rule of
-// decision 3.1: a data: URL and one too long to navigate render as their length.
+// Returns a read's frame-text budget, which inlineFrames draws on.
+function frameBudget() {
+  return { chars: READ_FRAME_CHARS };
+}
+
+// Returns an overlay block: its marker, which names the role, the accessible name, and
+// whether the tree marks it modal, then what it rendered, then a closing marker named
+// by the role. The name is the tree's, capped and escaped as a marker's name is, and
+// quoted.
+function overlayBlock({ ref, role, name, modal }, content) {
+  return `${overlayMarker({ ref, role, name, modal })}\n${content}\n[/${role}]`;
+}
+
+// Returns the block of an overlay whose render failed.
+function unreadableOverlay({ ref, role }) {
+  return `[${ref} ${role} (not readable)]`;
+}
+
+function overlayMarker({ ref, role, name, modal }) {
+  return `[${ref} ${overlayTitle(role, name)}${modalMark(modal)}]`;
+}
+
+// Returns an overlay's role and its name, quoted, as its marker and the Overlays: line
+// print them.
+function overlayTitle(role, name) {
+  return `${role}${name ? ` ${JSON.stringify(name)}` : ''}`;
+}
+
+function modalMark(modal) {
+  return modal ? ' (modal)' : '';
+}
+
+// Returns the URL for a frame marker. It comes from the page, so it follows a link's
+// rule: a data: URL and one too long to navigate render as their length.
 function markerUrl(url) {
   const text = url.replace(RESERVED, '').replace(/\s+/g, ' ').trim();
   if (/^data:/i.test(text) || text.length > URL_MAX) return omitted(text.length);
@@ -217,6 +286,11 @@ function indexed(url) {
 
 function omitted(length) {
   return `(url omitted: ${String(length).replace(/\B(?=(\d{3})+(?!\d))/g, ',')} chars)`;
+}
+
+// Returns the refs that the markers and the links' trailing refs in `text` carry.
+function markedRefs(text) {
+  return new Set([...text.matchAll(MARKED_REF)].map((match) => match[1]));
 }
 
 // The blank-line-delimited blocks of a render holding `needle`, case-insensitively,
@@ -263,12 +337,17 @@ function nextPart(end) {
   return ` Pass offset=${end} for the next part.`;
 }
 
-// The lines before the region, in this order; they are never cut, so a small budget
-// still returns the whole header.
-function header(state, { truncation, scope, omissions, hidden, hiddenListed, links, find, article }) {
+// Returns the lines before the region, in this order; they are never cut, so a small
+// budget still returns the whole header. `settled`, `paged`, and `since` are whole
+// lines; `overlays` is { blocks, more }, the blocks that rendered ahead of the region
+// and the refs of the overlays left out.
+function header(state, { truncation, settled, paged, since, scope, omissions, overlays, hidden, hiddenListed, links, find, article }) {
   const lines = [stateLines(state.url, state.title)];
   if (truncation) lines.push(truncation);
+  for (const line of [settled, paged, since]) if (line) lines.push(line);
   lines.push(scopeLine(scope, omissions));
+  const listed = overlays && overlaysLine(overlays);
+  if (listed) lines.push(listed);
   if (hidden) lines.push(`Hidden: ${count(hidden, 'control')} on the page (${hiddenNote(hiddenListed, find)})`);
   // A find read pages by block and takes no offset, so the one it would name is of no
   // use to the agent; the count still says how many URLs are in the blocks it kept.
@@ -276,6 +355,17 @@ function header(state, { truncation, scope, omissions, hidden, hiddenListed, lin
   if (find) lines.push(`Find: ${JSON.stringify(find.needle)} — ${count(find.count, 'block')}`);
   if (article) lines.push(article.found ? `Article: ${JSON.stringify(article.title)}${byline(article.byline)}` : 'Article: none found');
   return lines.join('\n');
+}
+
+// Returns the line listing the overlays that a read put ahead of its region, each by
+// its role, its name, its ref, and whether it is modal, and the refs of those left
+// unrendered past the block or call cap, so scope= reads any of them.
+function overlaysLine({ blocks, more }) {
+  const refs = more.map((ref) => `[${ref}]`).join(', ');
+  if (!blocks.length) return more.length ? `Overlays: not rendered: ${refs}` : null;
+  const items = blocks.map(({ ref, role, name, modal }) => `${overlayTitle(role, name)} [${ref}]${modalMark(modal)}`);
+  if (more.length) items.push(`… and ${more.length} more: ${refs}`);
+  return `Overlays: ${items.join(', ')} (above the page)`;
 }
 
 // Where the hidden controls are: at the end of this region, or a read away. A find read
@@ -342,4 +432,4 @@ function cutToLine(text, limit) {
   return text.slice(0, lineEnd > 0 ? lineEnd : codePointBoundary(text, limit));
 }
 
-module.exports = { renderUnit, placedFrames, inlineFrames, linksIndex, findBlocks, slice, header, placeholder };
+module.exports = { renderUnit, placedFrames, inlineFrames, frameBudget, overlayBlock, unreadableOverlay, linksIndex, findBlocks, slice, header, cutToLine, placeholder, markedRefs };

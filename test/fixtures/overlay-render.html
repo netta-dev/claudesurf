@@ -1,0 +1,62 @@
+<!doctype html>
+<!-- An article long enough for Readability, with a dialog after its first paragraph,
+     and the popup and announcer shapes that a render places or leaves out: a combobox whose
+     listbox the accessibility tree places under it through aria-owns, a custom
+     listbox, a multiple select, a select of forty options, a status faded to opacity 0,
+     a 1×1 clipped route announcer, and a visible alert after <main>. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Overlay render</title>
+</head>
+<body>
+  <main>
+    <article>
+      <h1>A short history of lighthouses</h1>
+      <p>People have marked dangerous coasts with fire for as long as ships have sailed past them. The earliest beacons were open fires on hilltops, tended by watchmen who burned wood, coal, or pitch through the night. A fire on a hill could be seen for several miles in clear weather, but rain, fog, and wind made it unreliable.</p>
+      <div role="dialog" aria-label="Inline dialog" id="inline-dialog">
+        <p>Inline dialog text.</p>
+        <button>Inline OK</button>
+      </div>
+      <p>The Pharos of Alexandria, finished in the third century before the common era, was the most famous of the ancient towers. Writers of the time described a structure well over a hundred metres tall, with a fire at its summit and a mirror that some accounts say threw the light far out to sea. It stood for more than a thousand years before earthquakes brought it down.</p>
+      <p>Through the Middle Ages, monasteries and port towns kept lights of their own, often little more than a lantern in a church tower. Merchants paid dues to the keepers, and a ship that reached harbour safely was expected to contribute to the cost of the light that had guided it. The arrangement was patchy, and many coasts stayed dark.</p>
+      <p>The eighteenth century brought towers built on rocks in open water, where the danger was greatest and the building hardest. Engineers learned to dovetail granite blocks so that the sea could not prise them apart, and the same method is still visible in towers that have stood for two centuries. Oil lamps with reflectors replaced coal fires, giving a steadier light.</p>
+      <p>The Fresnel lens, introduced in the 1820s, changed lighthouses more than any invention before it. A set of glass prisms arranged in rings bent the light of a single lamp into a narrow, intense beam, visible from twenty miles or more. Lenses were graded by order, from the large first-order lenses on major coasts to small ones for harbour entrances.</p>
+      <p>Each light was given a character of its own, a pattern of flashes and eclipses that let a navigator tell one tower from the next. Charts listed the characters, and a sailor who counted the seconds between flashes could fix a position at night. Fog signals, from bells to sirens to diaphragm horns, did the same work when the light could not be seen.</p>
+      <p>Keepers lived at the stations with their families, trimming wicks, polishing lenses, and winding the clockwork that turned the optic. Electrification and automation in the twentieth century made the keepers unnecessary, and most stations were unmanned by its end. Many towers now serve as museums, while satellite navigation has taken over much of the work the lights once did.</p>
+    </article>
+
+    <!-- Chrome ignores aria-owns on a text field, so an <input role="combobox"> leaves
+         the listbox where the markup puts it; this combobox is a div, in the
+         select-only pattern. -->
+    <div role="combobox" tabindex="0" aria-label="Sort" aria-expanded="true" aria-owns="sort-list" aria-controls="sort-list">Newest</div>
+    <ul role="listbox" id="sort-list" aria-label="Sort options">
+      <li role="option" id="sort-newest">Newest</li>
+      <li role="option" id="sort-oldest">Oldest</li>
+      <li role="option" id="sort-price">Price</li>
+    </ul>
+
+    <div role="listbox" aria-label="Colour" tabindex="0">
+      <div role="option">Red</div>
+      <div role="option">Green</div>
+      <div role="option">Blue</div>
+    </div>
+
+    <p>
+      <select multiple aria-label="Toppings">
+        <option>Cheese</option>
+        <option>Olives</option>
+        <option>Peppers</option>
+      </select>
+      <select id="size" aria-label="Size"></select>
+    </p>
+    <script>
+      for (let i = 1; i <= 40; i += 1) document.getElementById('size').add(new Option(`Size ${i}`));
+    </script>
+
+    <div role="status" style="opacity: 0">Saved quietly</div>
+    <div role="alert" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap">Navigated to Overlay render</div>
+  </main>
+  <div role="alert">Visible alert text</div>
+</body>
+</html>

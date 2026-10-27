@@ -1,0 +1,22 @@
+<!doctype html>
+<!-- Opens a same-site popup window of itself, ?child=1, which closes itself when its
+     button is clicked. -->
+<meta charset="utf-8">
+<title>Popup opener</title>
+<h1 id="heading">Popup opener</h1>
+<p><button id="open">Open the popup</button></p>
+<p><button id="close" hidden>Close this popup</button></p>
+<script>
+  if (new URLSearchParams(location.search).has('child')) {
+    document.title = 'Popup';
+    document.getElementById('heading').textContent = 'Popup';
+    document.getElementById('open').hidden = true;
+    const close = document.getElementById('close');
+    close.hidden = false;
+    close.onclick = () => window.close();
+  } else {
+    document.getElementById('open').onclick = () => {
+      window.open('/popup.html?child=1', 'popup', 'popup,width=480,height=360');
+    };
+  }
+</script>

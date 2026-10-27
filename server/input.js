@@ -1,121 +1,69 @@
-// The claudesurf_act actions: navigate, click (scripted by default, real pointer
-// events on request), and scroll. Same contract as read.js: { payload } back, an
-// OutcomeError for a non-success outcome.
+// The claudesurf_act actions on the working tab's document: click (scripted by
+// default, real pointer events on request), scroll, type, press, and select. Each takes
+// the handler context, the caller's Session, its arguments, and the request deadline,
+// and ends with act-result.js's finishAction, returning its { head, body, outcome,
+// blocked }; an OutcomeError carries a non-success outcome from before the action
+// acted. Only the trusted click uses coordinates: type and select reach their element
+// by script in its frame's world, and keys go on the page target's session, which
+// Chrome routes to whatever holds focus, a frame's field included.
 
 const envelope = require('./envelope');
-const { ProtocolError } = require('./cdp');
-const { isMissingContext } = require('./sessions');
-const { REF } = require('./dispatch');
-const { fail, stateLines, workingTarget, requireHttp, pageState, releaseObjects, CLICK_SOURCE, SCROLL_SOURCE } = require('./action-support');
+const { ProtocolError, ConnectionClosedError } = require('./cdp');
+const { refUnit, resolveNode, removed } = require('./refs');
+const { parseKeys, keyEvents } = require('./keys');
+const { beforeAction, finishAction, acting } = require('./act-result');
+const { readFocus, focusMoved, focusLine, focusedFrame } = require('./focus');
+const {
+  fail, workingTarget, requireHttp, releaseObjects, CLICK_SOURCE, SCROLL_SOURCE, EDIT_SOURCE, SELECT_SOURCE,
+} = require('./action-support');
 
-const NAVIGATE_LOAD_MS = 25_000;
-// How long after an aborted navigate the denied-download event may still arrive.
-const DOWNLOAD_EVENT_MS = 300;
-// After a click: how long a navigation may take to start, and then to load.
-const NAVIGATION_START_MS = 300;
-const NAVIGATION_LOAD_MS = 10_000;
-// A load wait stops this far before the request deadline, so the page state that
-// follows it still has time to be read.
-const LOAD_MARGIN_MS = 2_000;
-// A click releases the remote object handles it takes under this group when it ends.
-const OBJECT_GROUP = 'claudesurf-click';
+// The object group of a click's remote handles, and the one that type, select, and
+// press's focus read share.
+const CLICK_GROUP = 'claudesurf-click';
+const INPUT_GROUP = 'claudesurf-input';
+const INCOMPLETE = 'Input: incomplete (the page stopped answering)';
+const LOST_FOCUS = 'Input: incomplete (the field lost focus; click it, then type again)';
+// The Control+a press that type sends ahead of its text. typeInto adds the selectAll
+// editing command to the `a` key's down event, since the command updates a rich-text
+// editor's own selection model as a script selection might not.
+const [SELECT_ALL] = parseKeys('Control+a');
+// The input types that an error message may name: the browser's fixed set of those that
+// aren't text fields.
+const OTHER_INPUT_TYPES = new Set(['button', 'checkbox', 'color', 'date', 'datetime-local', 'file', 'hidden', 'image', 'month', 'radio', 'range', 'reset', 'submit', 'time', 'week']);
 
-function loadBudget(limit, deadline) {
-  if (deadline === undefined) return limit;
-  return Math.max(1, Math.min(limit, deadline - LOAD_MARGIN_MS - Date.now()));
-}
-
-async function navigate(sessions, session, { url, name, description, deadline }) {
-  await sessions.setLabel(session, name, description);
-  const t = workingTarget(sessions, session);
-  const opts = { deadline };
-  const before = { loads: t.loads, downloads: t.downloads, sameDocument: t.sameDocument };
-  const r = await sessions.send(t.targetId, 'Page.navigate', { url }, opts);
-  const downloaded = () => t.downloads > before.downloads;
-  const denied = () => fail(envelope.error(`Navigation to ${url} was a download, which is denied; the page is unchanged`));
-  if (r.errorText) {
-    // A denied download answers ERR_ABORTED, with Page.downloadWillBegin just before or after.
-    if (r.errorText === 'net::ERR_ABORTED' && await sessions.waitUntil(t.targetId, downloaded, { timeout: DOWNLOAD_EVENT_MS, deadline })) denied();
-    fail(envelope.error(`Navigation to ${url} failed: ${r.errorText}`));
-  }
-  const budget = loadBudget(NAVIGATE_LOAD_MS, deadline);
-  // A load, a same-document change (fragment), or a denied download each end the wait.
-  const settled = () => t.loads > before.loads || t.sameDocument > before.sameDocument || downloaded();
-  if (!await sessions.waitUntil(t.targetId, settled, { timeout: budget })) {
-    const within = budget > 1 ? `within ${(budget / 1000).toFixed(1)} s` : 'before the request deadline passed';
-    fail(envelope.error(`Navigation to ${url} started but the page did not finish loading ${within}`));
-  }
-  if (t.loads === before.loads && t.sameDocument === before.sameDocument) denied();
-  const info = await pageState(sessions, t, opts);
-  return { payload: stateLines(info.url, info.title) };
-}
-
-// The frame number and the backend id a ref names (dispatch.js's grammar), or null
-// when it is no ref at all.
-function parseRef(ref) {
-  const match = REF.exec(ref);
-  return match ? { frame: match[1] === undefined ? null : Number(match[1]), id: Number(match[2]) } : null;
-}
-
-// The target, frame, and id a ref names, under phase 1's generation rules widened to
-// frames: a frame target that is gone or has moved on is stale, a frame number never
-// assigned and a ref never read are errors. `frameId` is the frame of that target the
-// id was read in, null for its own main frame.
-function refUnit(sessions, session, t, ref) {
-  const parsed = parseRef(ref);
-  if (!parsed) fail(envelope.error(`${ref} is not a ref; refs look like e42, or f1e42 inside a frame`));
-  const { frame, id } = parsed;
-  const unread = () => fail(envelope.error(`${ref} was not returned by a read of this document`));
-  let target = t;
-  if (frame !== null) {
-    // The page's own generation answers first: Chrome destroys a page's frame targets
-    // after its frameNavigated, so between the two the frame target still stands, at
-    // the generation the read left it, for a document the page has moved off.
-    const page = session.refs.get(t.targetId);
-    if (page && page.generation !== t.generation) {
-      fail(envelope.staleRef(ref, 'the frame it was read in is gone; read the page again'));
+// Clicks the element that `ref` names, by script, or with mouse events when `trusted`.
+// The click runs on the session of the target that the ref was read in — a frame's own
+// for an f-ref — while the navigation wait, settling, and the state lines stay the page
+// target's, so a navigation confined to a frame reads as Navigated: no. A ref that was
+// read in a frame has that frame's document settle too.
+async function click(ctx, session, { ref, trusted }, deadline) {
+  const { sessions } = ctx;
+  const refuse = (located) => {
+    if (trusted && located.frame !== null) {
+      fail(envelope.error(`${ref} is inside a cross-site frame, where trusted clicks are not supported yet; click it without trusted=true`));
     }
-    target = sessions.frameTarget(t.targetId, frame);
-    if (!target) {
-      // Numbering starts at 1, so anything outside 1..the counter was never a frame of
-      // this page and reads as a ref no read returned.
-      if (frame > 0 && frame < t.nextFrameNumber) fail(envelope.staleRef(ref, 'the frame it was read in is gone; read the page again'));
-      unread();
-    }
-  }
-  const set = session.refs.get(target.targetId);
-  if (!set) unread();
-  if (set.generation !== target.generation) {
-    const what = frame === null ? 'the document' : "the frame's document";
-    fail(envelope.staleRef(ref, `${what} changed since it was read; read the page again`));
-  }
-  if (!set.ids.has(id)) unread();
-  return { target, frame, frameId: set.ids.get(id), id };
+  };
+  return onElement(ctx, session, ref, deadline, { group: CLICK_GROUP, refuse }, async ({ t, located, on, objectId, opts }) => {
+    const run = () => sessions.callFunction(on, {
+      objectId, functionDeclaration: CLICK_SOURCE, args: [trusted ? 'prepare' : 'scripted'], userGesture: true,
+    }, opts);
+    // The trusted path's script only scrolls; its first mouse event acts.
+    const { state } = trusted ? await run() : await acting(run);
+    if (state === 'detached') fail(removed(ref));
+    if (state === 'disabled') fail(envelope.error(`${ref} is disabled; clicking it would change nothing`));
+    if (!trusted) return [];
+    if (state === 'hidden') fail(envelope.error(`${ref} is hidden; a trusted click needs a visible element`));
+    return trustedClick(sessions, t, located, objectId, ref, opts);
+  });
 }
 
-// Resolves the node a ref names into the isolated world of the frame it was read in,
-// which is the only world it resolves in. A frame that navigated on its own leaves no
-// generation behind, so the world it discarded is found here and recreated once.
-function resolveNode(sessions, located, ref, opts) {
-  const { target, frameId, id } = located;
-  return sessions.withWorld(target.targetId, frameId, async (contextId) => {
-    try {
-      const { object } = await sessions.send(target.targetId, 'DOM.resolveNode', { backendNodeId: id, executionContextId: contextId, objectGroup: OBJECT_GROUP }, opts);
-      if (!object.objectId) fail(envelope.error(`${ref} no longer resolves to an element`));
-      return object.objectId;
-    } catch (e) {
-      // A missing context is withWorld's retry signal and is rethrown; a missing element fails the click here.
-      if (isMissingContext(e)) throw e;
-      if (e instanceof ProtocolError) fail(envelope.error(`${ref} no longer resolves to an element (it was removed from the page)`));
-      throw e;
-    }
-  }, opts);
-}
-
-// Content quads and mouse events are in viewport coordinates; the hit test takes
-// document coordinates, so the scroll offset is added for it. A same-process frame is
-// laid out in its parent's renderer, so its quads are the page's coordinates already;
-// `located` is only needed for the world its node lives in.
+// Clicks the element at its centre with mouse events, once a hit test there reaches
+// it, and resolves with the head lines that finishAction prints: an empty list, or the
+// incomplete-input line when a mouse event after the first failed. Content quads and
+// mouse events are in viewport coordinates; the hit test takes document coordinates,
+// so the scroll offset is added for it. A same-process frame is laid out in its
+// parent's renderer, so its quads are the page's coordinates already; `located` is
+// only needed for the world that its node lives in.
 async function trustedClick(sessions, t, located, objectId, ref, opts) {
   const { quads } = await sessions.send(t.targetId, 'DOM.getContentQuads', { objectId }, opts);
   if (!quads || quads.length === 0) fail(envelope.error(`${ref} is hidden and has no position to click; a trusted click needs a visible element`));
@@ -136,7 +84,7 @@ async function trustedClick(sessions, t, located, objectId, ref, opts) {
   // from another one. A hit outside the element's frame resolves there too, and the
   // comparison below reports it as the covering element it is.
   const contextId = await sessions.world(t.targetId, located.frameId, opts);
-  const { object } = await sessions.send(t.targetId, 'DOM.resolveNode', { backendNodeId: hit.backendNodeId, executionContextId: contextId, objectGroup: OBJECT_GROUP }, opts);
+  const { object } = await sessions.send(t.targetId, 'DOM.resolveNode', { backendNodeId: hit.backendNodeId, executionContextId: contextId, objectGroup: CLICK_GROUP }, opts);
   // The hit node reaches the element when one is inside the other, shadow roots
   // included: a host's painted content lives in its shadow tree.
   const reaches = await sessions.callFunction(t.targetId, {
@@ -145,74 +93,154 @@ async function trustedClick(sessions, t, located, objectId, ref, opts) {
     args: [{ objectId: object.objectId }],
   }, opts);
   if (!reaches) fail(envelope.error(`${ref} is covered by another element at its centre; a trusted click cannot reach it`));
-  for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
-    await sessions.send(t.targetId, 'Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 }, opts);
-  }
+  const [first, ...rest] = ['mouseMoved', 'mousePressed', 'mouseReleased'];
+  const event = (type) => sessions.send(t.targetId, 'Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 }, opts);
+  return sendInput(sessions, () => event(first), async () => {
+    for (const type of rest) await event(type);
+    return [];
+  }, `a trusted click on ${ref}`);
 }
 
-// Waits for a main-frame navigation the click started and reports it, plus any
-// target the page opened meanwhile. A denied download starts a navigation that
-// never loads; its event ends the wait and it reads as no navigation.
-async function afterClick(sessions, session, t, before, opts) {
-  const { deadline } = opts;
-  const changed = () => t.navigations > before.navigations || t.downloads > before.downloads || session.opened.size > before.opened;
-  await sessions.waitUntil(t.targetId, changed, { timeout: NAVIGATION_START_MS, deadline });
-  let navigated = 'no';
-  if (t.navigations > before.navigations) {
-    const settled = () => t.loads > before.loads || t.downloads > before.downloads;
-    await sessions.waitUntil(t.targetId, settled, { timeout: loadBudget(NAVIGATION_LOAD_MS, deadline) });
-    if (t.loads > before.loads) navigated = 'yes';
-    else if (t.downloads === before.downloads) navigated = 'started (the new page has not finished loading)';
-  }
-  const lines = [];
-  lines.push(`Navigated: ${navigated}`);
-  for (const id of session.opened) {
-    if (before.openedIds.has(id)) continue;
-    const windowId = await sessions.windowOf(id, opts).catch(() => null);
-    const popup = windowId !== null && windowId !== session.windowId;
-    lines.push(`Opened: ${popup ? 'a popup window' : 'a new tab'} (not the working tab)`);
-  }
-  return lines;
+async function scroll({ sessions }, session, { direction, amount }, deadline) {
+  const t = workingTarget(sessions, session);
+  requireHttp(t);
+  const opts = { deadline };
+  const before = beforeAction(sessions, session, t);
+  // The world is made outside acting(): the page scrolls only once the scroll script
+  // runs.
+  const info = await sessions.withWorld(t.targetId, null, (executionContextId) => acting(() => (
+    sessions.callFunction(t.targetId, { executionContextId, functionDeclaration: SCROLL_SOURCE, args: [direction, amount] }, opts)
+  )), opts);
+  const lines = [`Scroll: ${info.scrollY} of ${info.pageHeight} (viewport ${info.viewportHeight})`];
+  return finishAction(sessions, session, t, before, { deadline, lines });
 }
 
-// The click runs on the session of the target the ref was read in — a frame's own for
-// an f-ref — while the navigation wait and the state lines stay the page target's, so
-// a navigation confined to a frame reads as Navigated: no.
-async function click(sessions, session, ref, { trusted, deadline }) {
+// Replaces a text field's content with `text`: the field is focused by script in its
+// frame's world, everything in it is selected by the select-all key event, and the text
+// is inserted with Input.insertText on the page target's session, which Chrome routes to
+// the focused frame. The field is checked between the two, so a page that moved focus
+// on the key event doesn't get the text in another field, and when the selection falls
+// short of the field's value, the page script selects the value instead.
+async function type(ctx, session, { ref, text }, deadline) {
+  const { sessions } = ctx;
+  return onElement(ctx, session, ref, deadline, { group: INPUT_GROUP }, async ({ t, on, objectId, opts }) => {
+    const edit = (step) => sessions.callFunction(on, { objectId, functionDeclaration: EDIT_SOURCE, args: [step] }, opts);
+    refuseEdit(ref, await edit('focus'));
+    return typeInto(sessions, t, edit, text, ref, opts);
+  });
+}
+
+// Sends the select-all and the text, and resolves with the head lines that
+// finishAction prints: an empty list, or the line saying where the input stopped.
+function typeInto(sessions, t, edit, text, ref, opts) {
+  const key = (event) => sessions.send(t.targetId, 'Input.dispatchKeyEvent', event, opts);
+  const [first, ...rest] = keyEvents(SELECT_ALL).map((event) => (event.key === 'a' && event.type !== 'keyUp' ? { ...event, commands: ['selectAll'] } : event));
+  return sendInput(sessions, () => key(first), async () => {
+    for (const event of rest) await key(event);
+    const { state } = await edit('select');
+    if (state === 'focus-lost') return [LOST_FOCUS];
+    await sessions.send(t.targetId, 'Input.insertText', { text }, opts);
+    return [];
+  }, `typing into ${ref}`);
+}
+
+function refuseEdit(ref, { state, type: kind }) {
+  if (state === 'ok') return;
+  if (state === 'detached') fail(removed(ref));
+  if (state === 'disabled') fail(envelope.error(`${ref} is disabled; typing into it would change nothing`));
+  if (state === 'readonly') fail(envelope.error(`${ref} is read-only; typing into it would change nothing`));
+  if (state === 'no-focus') fail(envelope.error(`${ref} did not take focus; click it first, then type again`));
+  if (kind === 'select-one' || kind === 'select-multiple') fail(envelope.error(`${ref} is a select, not a text field; choose its option with select`));
+  if (OTHER_INPUT_TYPES.has(kind)) fail(envelope.error(`${ref} is an input of type ${kind}, not a text field; click it instead`));
+  fail(envelope.error(`${ref} is not a text field; type fills a text input, a textarea, or an editable region, and click reaches anything else`));
+}
+
+// Chooses an option of a native <select> by script in the element's frame's world;
+// the page script dispatches input and change. A message leaves out the option's
+// text, which is the page's.
+async function select(ctx, session, { ref, option }, deadline) {
+  const { sessions } = ctx;
+  return onElement(ctx, session, ref, deadline, { group: INPUT_GROUP }, async ({ on, objectId, opts }) => {
+    const { state } = await acting(() => sessions.callFunction(on, { objectId, functionDeclaration: SELECT_SOURCE, args: [option] }, opts));
+    if (state === 'detached') fail(removed(ref));
+    if (state === 'not-select') fail(envelope.error(`${ref} is not a native select; click the control to open it, then click the option's ref`));
+    if (state === 'disabled') fail(envelope.error(`${ref} is disabled; choosing an option would change nothing`));
+    if (state === 'option-disabled') fail(envelope.error(`the option of ${ref} with that label or value is disabled`));
+    if (state === 'no-match') fail(envelope.error(`no option of ${ref} has that label or value; read the page with scope=${ref} for every option`));
+    return [];
+  });
+}
+
+// Sends key presses to whatever holds focus in the working tab, and reports where they
+// went and, when the call stayed on its document, where focus went, since the markdown
+// and the diff both leave focus out. When an <iframe> holds focus, the keys reach the
+// frame's own focused element, and the frame's document settles too.
+async function press({ sessions }, session, { keys }, deadline) {
+  const t = workingTarget(sessions, session);
+  requireHttp(t);
+  const opts = { deadline };
+  const presses = parseKeys(keys);
+  const focus = await readFocus(sessions, t, INPUT_GROUP, opts);
+  const frame = focusedFrame(sessions, session, t, focus);
+  const before = beforeAction(sessions, session, t);
+  const lines = [() => focusLine('Keys to:', session, t, focus)];
+  const events = presses.flatMap(keyEvents);
+  const key = (event) => sessions.send(t.targetId, 'Input.dispatchKeyEvent', event, opts);
+  lines.push(...await sendInput(sessions, () => key(events[0]), async () => {
+    for (const event of events.slice(1)) await key(event);
+    return [];
+  }, `pressing ${presses.length} keys`));
+  const focusNow = () => focusMoved(sessions, session, t, focus, INPUT_GROUP, opts);
+  return finishAction(sessions, session, t, before, { deadline, frame, lines, focusNow });
+}
+
+// Runs an action on the element that `ref` names in the working tab and ends it with
+// finishAction. `refuse(located)`, when given, can fail the call before the ref
+// resolves. Once the node has resolved under `group`, beforeAction takes the call's
+// marks, so what `act` starts, the page's focus handlers included, is the call's own.
+// `act({ t, located, on, objectId, opts })`, where `on` is the id of the target that the
+// ref was read in, resolves with the head lines that print after the state lines.
+async function onElement({ sessions }, session, ref, deadline, { group, refuse = null }, act) {
   const t = workingTarget(sessions, session);
   requireHttp(t);
   const opts = { deadline };
   const located = refUnit(sessions, session, t, ref);
-  if (trusted && located.frame !== null) {
-    fail(envelope.error(`${ref} is inside a cross-site frame, where trusted clicks are not supported yet; click it without trusted=true`));
-  }
+  if (refuse) refuse(located);
   const on = located.target.targetId;
+  let before;
+  let lines;
   try {
-    const objectId = await resolveNode(sessions, located, ref, opts);
-    const before = { navigations: t.navigations, loads: t.loads, downloads: t.downloads, opened: session.opened.size, openedIds: new Set(session.opened) };
-    const { state } = await sessions.callFunction(on, {
-      objectId, functionDeclaration: CLICK_SOURCE, args: [trusted ? 'prepare' : 'scripted'], userGesture: true,
-    }, opts);
-    if (state === 'detached') fail(envelope.error(`${ref} no longer resolves to an element (it was removed from the page)`));
-    if (state === 'disabled') fail(envelope.error(`${ref} is disabled; clicking it would change nothing`));
-    if (trusted) {
-      if (state === 'hidden') fail(envelope.error(`${ref} is hidden; a trusted click needs a visible element`));
-      await trustedClick(sessions, t, located, objectId, ref, opts);
-    }
-    const lines = await afterClick(sessions, session, t, before, opts);
-    const info = await pageState(sessions, t, opts);
-    return { payload: [stateLines(info.url, info.title), ...lines].join('\n') };
+    const objectId = await resolveNode(sessions, located, ref, group, opts);
+    before = beforeAction(sessions, session, t);
+    lines = await act({ t, located, on, objectId, opts });
   } finally {
-    // A navigation the click started has already discarded the handles.
-    await releaseObjects(sessions, on, OBJECT_GROUP);
+    // A navigation that the action started has already discarded the handles; the summary
+    // renders after the release, under the read's own groups.
+    await releaseObjects(sessions, on, group, deadline);
+  }
+  return finishAction(sessions, session, t, before, { deadline, frame: touchedFrame(t, located, ref), lines });
+}
+
+// Sends an input's events: `first`, after which the input counts as having acted,
+// under acting(), then `rest`, and resolves with the head lines that `rest` resolves with.
+// A failure of `rest` other than a closed pipe resolves with the incomplete-input line
+// instead, and the journal says what stopped, as `what` names it.
+async function sendInput(sessions, first, rest, what) {
+  await acting(first);
+  try {
+    return await rest();
+  } catch (e) {
+    if (e instanceof ConnectionClosedError) throw e;
+    sessions.log.info(`${what} stopped: ${e.message}`);
+    return [INCOMPLETE];
   }
 }
 
-async function scroll(sessions, session, direction, amount, { deadline }) {
-  const t = workingTarget(sessions, session);
-  requireHttp(t);
-  const info = await sessions.callInWorld(t.targetId, SCROLL_SOURCE, [direction, amount], { deadline });
-  return { payload: `${stateLines(info.url, info.title)}\nScroll: ${info.scrollY} of ${info.pageHeight} (viewport ${info.viewportHeight})` };
+// Returns the child frame that an action on `located` touched, which settling watches
+// too, or null for the page's own document.
+function touchedFrame(t, located, ref) {
+  const inFrame = located.target !== t || located.frameId !== null;
+  return inFrame ? { target: located.target, frameId: located.frameId, label: `the frame holding ${ref}` } : null;
 }
 
-module.exports = { navigate, click, scroll, refUnit };
+module.exports = { click, scroll, type, press, select };

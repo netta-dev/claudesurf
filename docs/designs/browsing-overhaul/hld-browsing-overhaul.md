@@ -1,7 +1,7 @@
 # browsing-overhaul
 
 **Last reviewed**: 2026-09-10
-**Status**: Phase 3 LLD committed
+**Status**: Phase 3 complete
 **Companions**: [use cases](../use-cases-browsing-overhaul.md) · [future](../future-claudesurf.md)
 
 ## Overview
@@ -54,7 +54,7 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
 > Read the page target only and report frames as omitted — simpler and honest, and it blinds the tool to embedded logins and challenges. A ref map held by claudesurf and keyed by snapshot — was the original design when an extension held it; with the extension gone the browser's own identifier is simpler and survives more. Address elements by role and name, as WebDriver BiDi and Playwright locators do — reads closer to how an agent reasons, but duplicate names force a disambiguation protocol, which is the guessing problem refs exist to remove.
 
 - **The MCP surface is two tools that dispatch on an action name.**
-  - Fifteen separate tools would carry roughly 2,500 tokens of schema in every session, browsing or not; two were estimated at roughly 600, and measured about 1,200 once the reads shipped. One tool would put the whole surface behind a single permission rule, so a preference like "never prompt me for reads" would be inexpressible — MCP permission rules glob on tool names after a literal `mcp__<server>__` prefix and do not match arguments.
+  - Fifteen separate tools would carry roughly 2,500 tokens of schema in every session, browsing or not; two were estimated at roughly 600, and measured about 1,200 once the reads shipped and about 1,850 once acting did. One tool would put the whole surface behind a single permission rule, so a preference like "never prompt me for reads" would be inexpressible — MCP permission rules glob on tool names after a literal `mcp__<server>__` prefix and do not match arguments.
   - Splitting at "does this change anything" puts the permission boundary where the risk changes. Three actions sit on the acting side for reasons worth naming:
     1. `scroll` changes viewport state.
     2. `fetch` spends the profile's cookies against a host of the agent's choosing.

@@ -1,0 +1,13 @@
+<!doctype html>
+<!-- Registers /sw.js, which answers /sw-only itself; the server answers that path 404.
+     `window.registered` resolves once the worker controls the page's scope. -->
+<meta charset="utf-8">
+<title>Worker</title>
+<h1>Worker</h1>
+<p><a id="only" href="/sw-only">The page only the worker serves</a></p>
+<p><a id="blank" target="_blank" href="/sw-only">The same page in a new tab</a></p>
+<script>
+  window.registered = navigator.serviceWorker.register('/sw.js')
+    .then(() => navigator.serviceWorker.ready)
+    .then(() => true);
+</script>

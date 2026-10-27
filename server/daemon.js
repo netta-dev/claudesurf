@@ -11,15 +11,21 @@
 const http = require('http');
 const net = require('net');
 const fs = require('fs');
-const { daemonSocketPath, profileDir } = require('./paths');
+const { daemonSocketPath, profileDir, policyFile, actionLogPath } = require('./paths');
 const { createLogger } = require('./diagnostics');
-const envelope = require('./envelope');
 const { validate, withDefaults } = require('./dispatch');
 const browser = require('./browser');
-const { Sessions, TargetGoneError } = require('./sessions');
-const { OutcomeError, WORKING_TAB_GONE, safeText, LABEL_MAX, codePointBoundary } = require('./action-support');
+const { Sessions } = require('./sessions');
+const { Policy, normalizeHost } = require('./policy');
+const { Gate } = require('./gate');
+const { ActionLog } = require('./action-log');
+const { respond, failureEnvelope, workingUrl } = require('./respond');
+const envelope = require('./envelope');
+const { fail } = require('./action-support');
 const read = require('./read');
 const input = require('./input');
+const navigation = require('./navigation');
+const { tabs } = require('./tabs');
 
 const log = createLogger('claudesurf daemon');
 const SOCK = daemonSocketPath();
@@ -28,6 +34,9 @@ const PROFILE = profileDir();
 const REQUEST_BUDGET_MS = 33_000;
 
 const sessions = new Sessions(log);
+const policy = new Policy({ file: policyFile(), log });
+const gate = new Gate({ sessions, policy, log });
+const actionLog = new ActionLog({ file: actionLogPath(), log });
 let live = null; // { conn, child } while the browser is up
 let launching = null;
 let lastRequestEnv = {};
@@ -47,6 +56,7 @@ function ensureBrowser(requestEnv) {
         log.info('browser connection closed');
       });
       sessions.attach(launched.conn);
+      gate.attach(launched.conn);
       try {
         await browser.enableTargets(launched.conn);
       } catch (e) {
@@ -61,67 +71,89 @@ function ensureBrowser(requestEnv) {
   return launching;
 }
 
+const context = { sessions, gate, policy, log };
+
+// The handlers by action, each taking (context, session, arguments with their defaults,
+// deadline) and returning { head, body?, images?, outcome?, blocked? }.
 const HANDLERS = {
-  page: (session, a, deadline) => read.readPage(sessions, session, { scope: a.scope, find: a.find, article: a.article, links: a.links, hidden: a.hidden, maxChars: a.max_chars, offset: a.offset, deadline }),
-  info: (session, a, deadline) => read.pageInfo(sessions, session, { deadline }),
-  screenshot: (session, a, deadline) => read.screenshot(sessions, session, { fullPage: a.full_page, deadline }),
-  navigate: (session, a, deadline) => input.navigate(sessions, session, { url: a.url, name: a.name, description: a.description, deadline }),
-  click: (session, a, deadline) => input.click(sessions, session, a.ref, { trusted: a.trusted, deadline }),
-  scroll: (session, a, deadline) => input.scroll(sessions, session, a.direction, a.amount, { deadline }),
+  page: (ctx, session, a, deadline) => read.readPage(ctx.sessions, session, { scope: a.scope, find: a.find, article: a.article, links: a.links, hidden: a.hidden, since: a.since, maxChars: a.max_chars, offset: a.offset, deadline }),
+  info: (ctx, session, a, deadline) => read.pageInfo(ctx.sessions, session, { deadline }),
+  screenshot: (ctx, session, a, deadline) => read.screenshot(ctx.sessions, session, { fullPage: a.full_page, deadline }),
+  navigate: navigation.navigate,
+  history: navigation.history,
+  click: input.click,
+  scroll: input.scroll,
+  type: input.type,
+  press: input.press,
+  select: input.select,
+  tabs,
 };
 
-// A dialog's message is the page's to set, and it lands in the payload outside the
-// nonce delimiter's own escaping, so it is made safe the way a marker field is: NUL
-// stripped, whitespace collapsed to one line, brackets and backslashes escaped, and
-// capped, so a message built to open its own `## Hidden elements` section or a live ref
-// marker cannot.
-function safeDialogMessage(message) {
-  const text = safeText(message);
-  if (text.length <= LABEL_MAX) return text;
-  return `${text.slice(0, codePointBoundary(text, LABEL_MAX - 1))}…`;
+// Answers a call and writes its action-log record before the answer is sent.
+async function runAction(call) {
+  const { envelope: built, carried, url, inSlot } = await answer(call);
+  actionLog.record({
+    sessionId: call.sessionId, tool: call.tool, action: call.action, args: call.args,
+    url: inSlot ? url : workingUrl(sessions, sessions.peek(call.sessionId)), outcome: built.outcome, blocked: carried,
+  });
+  return built;
 }
 
-function failureEnvelope(e) {
-  if (e instanceof OutcomeError) return e.envelope;
-  if (e instanceof TargetGoneError) return envelope.error(WORKING_TAB_GONE);
-  if (e instanceof browser.SetupError) return envelope.setupError(e.message);
-  log.warn(`action failed: ${e.stack || e.message}`);
-  return envelope.error(e.message);
-}
-
-async function runAction({ sessionId, tool, action, args, env }) {
+// Resolves { envelope, carried, url, inSlot }: what respond.js or failureEnvelope built,
+// and whether the call reached the session's queue slot, where `url` was read before a
+// later call could switch tabs.
+async function answer({ sessionId, tool, action, args, env }) {
   const invalid = validate(tool, action, args);
-  if (invalid) return invalid;
+  if (invalid) return { envelope: invalid, carried: [], inSlot: false };
   const a = withDefaults(action, args);
   const deadline = Date.now() + REQUEST_BUDGET_MS;
   try {
+    // policy changes the allowlist alone, so it neither launches the browser nor
+    // recreates a window that the human closed, and still reports the pending refusals.
+    if (action === 'policy') return await slot(sessions.get(sessionId), [], () => answerPolicy(sessionId, a));
     await ensureBrowser(env);
     const { session, notes } = await sessions.ensureWithNotes(sessionId, { deadline });
-    return await session.run(async () => {
-      let result;
-      try {
-        result = await HANDLERS[action](session, a, deadline);
-      } catch (e) {
-        const failed = failureEnvelope(e);
-        if (notes.length) failed.notes = [...notes, ...(failed.notes || [])];
-        return failed;
-      }
-      let payload = result.payload;
-      // Chrome delivers a frame's dialog on the page target's session, so the working
-      // target's queue holds it; the frame targets are drained with it because each is
-      // Page.enabled and a future Chrome may route it there.
-      const dialogTargets = [session.workingTargetId, ...sessions.frameTargets(session.workingTargetId).map((f) => f.targetId)];
-      for (const targetId of dialogTargets) {
-        for (const { type, message } of sessions.takeDialogs(targetId)) {
-          notes.push(`a ${type} dialog was dismissed`);
-          payload += `\nDialog (${type}): ${safeDialogMessage(message)}`;
-        }
-      }
-      return envelope.success(payload, { notes, images: result.images || [] });
-    });
+    return await slot(session, notes, () => HANDLERS[action](context, session, a, deadline), a.ref);
   } catch (e) {
-    return failureEnvelope(e);
+    return { ...failureEnvelope(e, sessions, null, { log }), inSlot: false };
   }
+}
+
+// Runs a handler in the session's queue slot and builds its response there.
+function slot(session, notes, handler, ref) {
+  return session.run(async () => {
+    let result;
+    try {
+      result = await handler();
+    } catch (e) {
+      return { ...failureEnvelope(e, sessions, session, { notes, ref, log }), inSlot: true };
+    } finally {
+      // An acting handler's marks say which refusals its call led to; they belong to
+      // that call alone.
+      session.marks = null;
+    }
+    return { ...respond(sessions, session, result, { notes }), inSlot: true };
+  });
+}
+
+// Allows `host` as `op` says and returns the Allowed: head. An allow_once grant lasts
+// the daemon's lifetime; allow_always appends to the file unless an entry already
+// covers the host. The host is the agent's own text, which the payload prints as the
+// URL parser normalized it.
+function answerPolicy(sessionId, { op, host }) {
+  const normalized = normalizeHost(host);
+  if (op === 'allow_once') {
+    policy.allowOnce(sessionId, host);
+    return { head: `Allowed: ${normalized} for this session` };
+  }
+  let saved;
+  try {
+    saved = policy.allowAlways(host);
+  } catch (e) {
+    log.warn(`allowlist ${policyFile()}: ${e.message}`);
+    fail(envelope.error(`the allowlist could not be written: ${e.code || 'unknown error'}; nothing was saved`));
+  }
+  return { head: saved === 'added' ? `Allowed: ${normalized}, saved to the allowlist` : `Allowed: ${normalized} was already allowed` };
 }
 
 function readBody(req) {

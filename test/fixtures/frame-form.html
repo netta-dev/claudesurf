@@ -1,0 +1,11 @@
+<!doctype html>
+<!-- form.html's cross-site frame: a pre-filled input whose keydown log lists every key
+     it sees. -->
+<meta charset="utf-8">
+<title>Frame form</title>
+<p><input id="field" type="text" aria-label="Frame field" value="frame old"></p>
+<p id="frame-log">Frame keys:</p>
+<script>
+  const log = document.getElementById('frame-log');
+  document.getElementById('field').addEventListener('keydown', (event) => { log.textContent += ` ${event.key}`; });
+</script>

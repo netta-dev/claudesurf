@@ -1,0 +1,24 @@
+<!doctype html>
+<!-- Navigations that Chrome drops without a commit: a link and a form that /no-content
+     answers with 204 No Content, and a navigation to /slow that window.stop() cancels
+     before its answer arrives. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>No content</title>
+</head>
+<body>
+  <main>
+    <h1>No content</h1>
+    <p><a href="/no-content">Nothing here</a></p>
+    <form method="post" action="/no-content"><button>Send nothing</button></form>
+    <p><button id="stop">Start and stop</button></p>
+  </main>
+  <script>
+    document.getElementById('stop').onclick = () => {
+      location.href = '/slow';
+      setTimeout(() => window.stop(), 300);
+    };
+  </script>
+</body>
+</html>
