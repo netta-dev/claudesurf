@@ -22,7 +22,7 @@ The agent clicks a `target=_blank` link, or the page calls `window.open`. Chrome
 
 ### UC3 — Page-context fetch to an unlisted domain
 
-The agent calls `fetch` with a URL whose host is unlisted. The daemon gates it as in UC1 (unlisted host on `navigate`), before any request leaves the browser.
+The agent calls `fetch` with a URL whose host is unlisted. The daemon gates it as in UC1 (unlisted host on `navigate`), before any request leaves the browser: the result is `needs_confirmation` with the line `Blocked: [t1] api.other.example — fetch of https://api.other.example/v1/me (not sent)`, and the agent asks the human before calling `policy`.
 
 ### UC28 — A page navigates to an unlisted host while no action runs
 
@@ -30,7 +30,7 @@ An allowed page sets `location` from a timer a few seconds after the agent's las
 
 ### UC29 — The human navigates a session tab to an unlisted host
 
-The human types an unlisted URL into the address bar of a session's working tab. The gate cannot tell her navigation from the page's, so the request is aborted and the tab stays on its page with nothing on screen to say why. The README tells her to browse in a tab that she opens herself, which is outside the gate.
+The human types an unlisted URL into the address bar of a session's working tab. The gate cannot tell her navigation from the page's, so the request is aborted and the tab stays on its page with nothing on screen to say why. The README tells her to browse in a tab that she opens herself, which is outside the gate. During a handoff the stop is announced on the desktop instead (UC41).
 
 ### UC36 — `history back` onto a page whose host is no longer allowed
 
@@ -42,17 +42,29 @@ The agent visited an allowed host, moved on, and the human then removed that hos
 
 A navigation completes onto a Cloudflare turnstile, a login wall, or a two-factor prompt.
 
-The daemon's detection fires and the action returns `needs_human` carrying the challenge type, the URL, the page title, and the session name. A desktop notification fires naming the session and what is blocking; a window urgency hint is attempted and its failure ignored. No tool call blocks, and focus stays where it is. The agent ends its turn and tells the human which window needs her.
+The daemon's detection fires and the action returns `needs_human`. The message names the type and the session's label, and the payload carries the action's full result with a `Challenge:` line, such as `Challenge: bot check — Cloudflare (the page's cf-mitigated header)`, `Challenge: sign-in — a password field`, or `Challenge: two-factor — a one-time-code field`. A desktop notification fires naming the session and what is blocking; a window urgency hint is attempted and its failure ignored. No tool call blocks, and focus stays where it is. The agent ends its turn and tells the human which window needs her. The second OS user has no notification server, so its handoff reaches the human through chat alone.
 
-When the human says she has cleared it, the agent re-reads. The clearance cookie persists in the profile, so a later visit to the same site does not re-challenge.
+When the human says she has cleared it, the agent re-reads. That call ends the handoff and clears the urgency hint. The clearance cookie persists in the profile, so a later visit to the same site does not re-challenge.
 
 ### UC5 — Repeated challenge detection on one page
 
-Detection fires more than once for the same session and URL within a short window. The notification fires once; subsequent detections return `needs_human` without re-notifying, so the channel stays credible.
+Detection fires more than once for the same session, type, and page, its URL compared without the query or fragment, within 10 minutes. The notification fires once; subsequent detections return `needs_human` without re-notifying, so the channel stays credible.
 
 ### UC6 — Challenge detection fires on a page that is not a challenge
 
-The agent receives `needs_human` for a page that loaded normally. `needs_human` reports a condition rather than locking the session, so the agent can read the page anyway.
+The agent receives `needs_human` for a page that loaded normally, such as a sign-up form, which shows a password field. `needs_human` reports a condition rather than locking the session, so the agent can read the page and act on it anyway; the message says so.
+
+### UC40 — A challenge that clears itself
+
+A navigation lands on Cloudflare's "Just a moment…" page, whose response carries `cf-mitigated: challenge`, and the check passes without a click a few seconds later, reloading the original page. The acting call waits up to 10 s, within its request budget, for a navigation to start from the challenge page, follows it, and returns the original page as `success` without a notification. A challenge still in place when the wait ends returns `needs_human` (UC4). An AWS WAF `captcha` answer gets no wait, since a person has to solve it.
+
+### UC41 — Signing in through an unlisted host during a handoff
+
+The agent navigated to an allowed app whose sign-in, which the human allowed when the agent asked, forwards her to her company's identity provider, a host the allowlist lacks. The gate stops that request in the session tab, as in UC29. A handoff is open, since the session's last result was `needs_human` and its next call hasn't arrived, so the daemon fires a notification, "ClaudeSurf stopped adfs.company.com", whose body reads "In "reviewing PR #42". Sign in from a tab you open yourself (Ctrl+T), which shares the cookies, or ask Claude to allow adfs.company.com." She opens a tab of her own in the ClaudeSurf window, signs in there, and tells the agent, which reloads the session tab, now signed in. The refusal also prints as a `Blocked by the page:` line on the agent's next call. A session gets one notice per host and at most three notices in 10 minutes.
+
+### UC42 — A CAPTCHA embedded in a form the agent fills
+
+The agent reads a sign-up form carrying a visible reCAPTCHA checkbox. The widget's response field is empty, so the read returns `needs_human` with `Challenge: bot check — reCAPTCHA (a visible widget)`. The agent can fill the other fields first, then asks the human to tick the box. Once she has, the response field holds a token, the widget counts as solved, and the agent's next call returns `success`. A badge-only, invisible widget doesn't count.
 
 ## Refs
 
@@ -140,7 +152,7 @@ A read of a feed is cut at `max_chars`, and the agent passes the offset that the
 
 ### UC14 — The daemon restarts mid-session
 
-systemd restarts the daemon. The browser, being its child, goes with it, closing every session window and the tabs in them. `server.js`'s retry loop rides out the restart, so the agent's next call succeeds against a freshly cold-started browser with a new window. Cookies and cleared challenges survive in the profile; open tabs and in-page state do not. The new daemon finds the previous run's browser record and announces the loss on the desktop, so the human learns a window went away rather than discovering it.
+systemd restarts the daemon. The browser, being its child, goes with it, closing every session window and the tabs in them. `server.js`'s retry loop rides out the restart, so the agent's next call succeeds against a freshly cold-started browser with a new window. Cookies and cleared challenges survive in the profile; open tabs and in-page state do not. The new daemon finds the previous run's browser record and announces the loss on the desktop with one notification, "ClaudeSurf restarted. Its browser closed, with any session windows it had open. Each Claude session reopens its window on its next call.", so the human learns a window went away rather than discovering it. The announcement goes out before any request arrives, so it uses the daemon's own session bus, and it fires after every restart that found a record, an upgrade's included.
 
 ### UC15 — The browser exits while the daemon lives
 
@@ -176,11 +188,11 @@ The parent page navigates, so Chrome destroys its frame targets. A click on an `
 
 ### UC19 — A challenge lives inside an iframe
 
-A Cloudflare turnstile is a child target. Detection runs across attached targets rather than the page target alone, so the challenge is found and UC4 proceeds normally.
+A Cloudflare turnstile is a child target. Detection runs across attached targets rather than the page target alone: a frame target whose URL belongs to a known CAPTCHA vendor, and whose `<iframe>` element in its parent is visible, counts, even when the page put the element in a closed shadow root. The challenge is found and UC4 proceeds normally.
 
 ### UC19a — The agent clicks a download link
 
-A click produces a file download rather than a document. The daemon declines it and the action returns saying so, since a download would write to the profile owner's disk on the agent's action and the domain gate never sees it. The refusal is reported from phase 4, where network capture can see the response; before that the download is denied silently and the click returns as one that changed nothing.
+A click produces a file download rather than a document. The daemon declines it and the action returns saying so, since a download would write to the profile owner's disk on the agent's action and the domain gate never sees it. The result carries `Download: denied — report.pdf from https://app.example/export`, from the file name and URL that Chrome's download event reports.
 
 ## Input
 
@@ -211,6 +223,28 @@ The agent presses `Escape` to close a dialog without focusing anything first. Th
 ### UC34 — `select` on a dropdown that is not a native `<select>`
 
 The agent calls `select` with a ref naming a styled listbox that the page built from `div`s. The action returns `error` saying the control is not a native select and to click it open and then click the option's ref. The click's summary lists the list's options with their refs when the list renders inside the read's scope (UC30, a click opens a menu); a list that the page attaches outside it shows in a `scope=all` read.
+
+## Capture and fetch
+
+### UC43 — `console` after a click that broke the page
+
+The agent clicks "Save" and the result reads `Changed: nothing`. It calls `console` and gets the messages that the working tab kept, across its navigations, oldest first, each numbered: a `console.error` from the page's script with its source location, and Chrome's own `Failed to load resource: … 500` for the request behind it. The head's `Exceptions:` line reads `Uncaught at https://app.example/main.js:1:20334 (×1), from the messages Chrome stores for this document` for the exception that followed. The line carries no message, since only Chrome's replay of the document's stored messages reports an exception, and the replay gives its location alone. The answer's head carries `Next: after=64`, and a later `console` with `after=64` returns only what came after. Capture never turns on the protocol's `Runtime` channel, so the page can't tell that it is being watched.
+
+### UC44 — `network` to see what an API answered
+
+After the same click the agent calls `network` and sees `[61] POST 500 fetch https://app.example/api/save (application/json, 87 B transferred, 220 ms)` among the tab's requests. It calls `network` with `filter=/api/save`, which lists the matching requests and prints the text body of each under its line, cut at 4,000 characters, so the agent reads the server's error. The request's own body, such as a form's fields, is never captured.
+
+### UC45 — The human signs in while capture runs
+
+During a handoff the human types her password into a sign-in form in a session tab and submits it. The form's post is listed by `network` with its URL and status like any request, while its body, which carries the password, is never stored. The responses of the sign-in, an OAuth callback's URL included, stay readable, as the HLD's secrets decision accepts.
+
+### UC46 — `fetch` of another origin's API
+
+The agent is on `app.example.com` and fetches `https://api.example.com/v1/orders`, an allowed host whose server allows `app.example.com`'s origin. The two hosts are one site, so the request carries the page's origin and `api.example.com`'s cookies, and the result prints the status, type, size, and body; a host of another site would get only its `SameSite=None` cookies. A server that doesn't allow the page's origin makes the request fail; the result is `error` saying so, and telling the agent to navigate to that origin and fetch there.
+
+### UC47 — `fetch` of a URL that redirects
+
+The agent fetches a URL on an allowed host that answers with a redirect. The fetch doesn't follow it, so no request reaches the redirect's target, and the result reads `Redirected: not followed`. The browser hides a redirect's target from page script, so the result can't name it; the agent navigates to the URL to follow the redirect through the gate.
 
 ## Untrusted content
 

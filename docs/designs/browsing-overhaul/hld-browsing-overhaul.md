@@ -1,7 +1,7 @@
 # browsing-overhaul
 
 **Last reviewed**: 2026-09-10
-**Status**: Phase 3 complete
+**Status**: Phase 4 LLD committed
 **Companions**: [use cases](../use-cases-browsing-overhaul.md) · [future](../future-claudesurf.md)
 
 ## Overview
@@ -68,8 +68,8 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
 | `claudesurf_read` | `page` | `scope`, `find`, `article`, `since`, `links`, `hidden`, `max_chars`, `offset` |
 | | `info` | — |
 | | `screenshot` | `full_page` |
-| | `console` | a cursor, named in phase 4 |
-| | `network` | `filter`, a cursor, named in phase 4 |
+| | `console` | `after` |
+| | `network` | `filter`, `after` |
 | `claudesurf_act` | `navigate` | `url`, `name`, `description` |
 | | `click` | `ref`, `trusted` |
 | | `type` | `ref`, `text` |
@@ -111,11 +111,11 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
 
 - **Secrets are kept out of the record.**
   - The action log reduces `type` text and the keys of a `press` that types printable characters to a length and a hash, since they carry whatever the agent entered into a login form on a site that the human deliberately signed into.
-  - Network capture strips `Cookie`, `Set-Cookie`, `Authorization`, and `Proxy-Authorization` before the buffer, because the same credentials travel on every request the profile makes and the capture is readable through `claudesurf_read`. Response bodies are captured whole, and URLs are recorded verbatim in both the log and the capture — so a token in a body, a magic link, or an OAuth callback is still reachable. Redacting URLs would leave the log unable to answer what the agent did. Whole bodies and verbatim URLs are both accepted as risk 2 (any allowed domain exfiltrates).
+  - Network capture stores no request or response header beyond the values of two challenge headers that detection reads, so `Cookie`, `Set-Cookie`, `Authorization`, and `Proxy-Authorization` never reach the buffer, because the same credentials travel on every request the profile makes and the capture is readable through `claudesurf_read`. It stores no request body either, since a sign-in form's post carries the password the human typed. Response bodies stay readable from Chrome's own buffer, and URLs are recorded verbatim in both the log and the capture — so a token in a body, a magic link, or an OAuth callback is still reachable. Redacting URLs would leave the log unable to answer what the agent did. Readable bodies and verbatim URLs are both accepted as risk 2 (any allowed domain exfiltrates).
 
 - **No tool call blocks waiting on the human, and a challenge reaches her through the desktop.**
   - A challenge returns `needs_human` and the agent ends its turn. A blocking wait would hold the session against a human who has walked away.
-  - `notify-send` carries what is blocking; `xdotool` sets a window urgency hint marking which of many open windows to go to. The hint is X11-only and both binaries are optional — a missing one is logged and skipped, so the handoff degrades to chat.
+  - `notify-send` carries what is blocking; `xdotool` and `wmctrl` mark which of many open windows to go to, with the urgency hint and the demands-attention state that taskbars read. The mark is X11-only and every binary is optional — a missing one is logged and skipped, so the handoff degrades to chat.
   - Neither steals focus in steady state; window and browser creation still take focus.
 
 > [!example]- **Alternatives considered** — chat alone, MCP elicitation (a non-blocking handoff with a desktop notification)
@@ -132,7 +132,7 @@ flowchart TD
   S1 -->|"HTTP over 0600 Unix socket"| D["daemon.js — one per OS user"]
   S2 -->|"HTTP over 0600 Unix socket"| D
   D -->|"CDP over --remote-debugging-pipe"| B["Chrome — dedicated --user-data-dir"]
-  D -.->|"optional: notify-send, xdotool"| DESK["Desktop session"]
+  D -.->|"optional: notify-send, xdotool, wmctrl"| DESK["Desktop session"]
   B --> W1["Window: session 1"]
   B --> W2["Window: session 2"]
 ```
@@ -174,13 +174,16 @@ One per OS user:
 - **`server/changes.js`** — the change summary and `since`.
 - **`server/respond.js`** — each response's assembly, with the dialog and refusal lines, moved out of `daemon.js`.
 - **`server/settle.js`** — quiescence detection.
-- **`server/requests.js`** — each session tab's in-flight requests, which settle detection reads.
+- **`server/requests.js`** — each session tab's in-flight requests, which settle detection reads and which it hands to network capture as each ends.
+- **`server/mime.js`** — the rule for a textual MIME type, shared by network capture and page-context fetch.
 - **`server/retained.js`** — each tab's retained render.
 - **`server/act-result.js`** — what every acting call ends with: the navigation wait, settling, and the change summary.
 - **`server/challenge.js`** — challenge, login, and two-factor detection.
+- **`server/handoff.js`** — each session's open handoff, the notification limit, and the urgency hint's lifetime.
 - **`server/notify.js`** — desktop notification and urgency hint.
 - **`server/action-log.js`** — the JSONL action log. Named apart from `diagnostics.js` so an import mix-up cannot route credential-bearing action records into the journal.
-- **`server/network.js`** and **`server/fetch.js`** — capture with a capped ring buffer, and page-context fetch.
+- **`server/ring.js`**, **`server/network.js`**, and **`server/console-capture.js`** — the capped, numbered lists that capture keeps, and network and console capture into them.
+- **`server/fetch.js`** — page-context fetch.
 
 The `extension/` directory is deleted. Its session-identity page becomes `server/static/session.html`, addressed by `file://`.
 
@@ -189,7 +192,7 @@ The `extension/` directory is deleted. Its session-identity page becomes `server
 - **Domain policy** — a newline-delimited list of hosts, per user, outside the repository. The daemon is the only process that appends to it, so concurrent sessions cannot interleave appends; the daemon re-reads the file on each change, so the human's hand edits take effect.
 - **Once-grants** — hosts granted by `allow_once`, held in daemon memory keyed by session id and never written, so one session's grant does not widen another's reach.
 - **Action log record** — timestamp, session id, tool, action, arguments, resulting URL, outcome, and the refusals that the response carried. One JSON object per line. In the arguments, `type` text and the keys of a `press` that types printable characters are reduced to a length and hash.
-- **Browser record** — the child browser's process id and start time, persisted beside the socket so a daemon that crashed and restarted can identify and reap the browser it no longer controls. Written at launch, cleared when the daemon observes the browser exit or reaps it, and left in place on daemon shutdown, so a record present at startup means the browser outlived its daemon.
+- **Browser record** — the child browser's process id and start time, persisted beside the socket so a daemon that crashed and restarted can identify and reap the browser it no longer controls. Written at launch, overwritten by the next launch, cleared when the next daemon reaps the browser or finds its process gone, and otherwise left in place, so a record present at startup means the previous run had a browser, and one whose process lives means that browser outlived its daemon.
 - **Retained render** — the last render of each tab from a read, a `since` read, or a change summary. It includes the uncut overlay blocks, region, link lists, and hidden section, along with the parameters used to render it. The daemon retains it for `since`, the change summary, and paging reads. It does not retain renders over 500,000 characters, ignores the render once the tab navigates, and drops it with the tab, since it is the largest thing the daemon retains per session.
 - **Daemon session state** — session id to `{ windowId, workingTargetId, identityTargetId }`, the session's tab numbers, the tabs that it worked in before the current one, and the refusals that the gate has not yet reported, plus a per-target document generation counter that increments on navigation and scopes every ref. Held in memory, and dropped when the session's working tab is gone and none of its tabs remains in its window. The next tab number survives the drop, as the label does.
 - **Session label** — session id to `{ name, description }`, held separately so a closed window can be recreated under the name it had. Kept for the daemon's lifetime, since a label is a few dozen bytes and losing it would make a recreated window anonymous.
@@ -232,7 +235,7 @@ An outcome reports a condition rather than locking the session: an agent holding
 
 **Browser lifetime and daemon restarts.** The browser is a child of the daemon, and the unit's default `KillMode=control-group` takes the whole cgroup down on stop or restart, so the browser dies with the daemon regardless of what Chrome does on pipe EOF. The persisted browser record covers the case the cgroup kill misses: a daemon killed outside systemd's control, after which a new daemon must identify and reap a browser it never launched. Pairing the process id with its start time keeps that reap from hitting an unrelated process that inherited the id. The cost is that a daemon restart closes every session window and the tabs open in them, while cookies and cleared challenges survive in the profile on disk.
 
-The daemon runs `Restart=always` and `server.js` retries connection failures, so a restart is invisible to the agent and the human can lose a window without being told — sharpest during a `needs_human` handoff, where a restart mid-solve takes away the window she was working in. That is accepted, with one mitigation: a persisted browser record present at daemon startup is evidence the previous run had a browser, so the daemon announces the loss through the notification channel the `needs_human` handoff uses. The announcement says only that there was a browser, not how many windows it held.
+The daemon runs `Restart=always` and `server.js` retries connection failures, so a restart is invisible to the agent, apart from a capture cursor from before it, which reads back with a `Missed:` line naming the restart, and the human can lose a window without being told — sharpest during a `needs_human` handoff, where a restart mid-solve takes away the window she was working in. That is accepted, with one mitigation: a persisted browser record present at daemon startup is evidence the previous run had a browser, so the daemon announces the loss through the notification channel the `needs_human` handoff uses. The announcement says only that there was a browser, not how many windows it held.
 
 The reverse direction is rarer than it looks. The pipe holds Chrome alive with zero windows, so the human closing every session window leaves an idle browser that the next command reuses without a cold start; only a quit, a crash, or a kill reaches EOF on the pipe. On EOF every session's recorded window and target ids point at a browser that is gone, so the daemon drops all session state and the next command cold-starts.
 
@@ -309,20 +312,21 @@ Beyond those, the CDP client, tree pruning, and settle detection need a recorded
 35. Every action returns one of the fixed outcomes in the result envelope.
 36. Challenges, login walls, and two-factor prompts return `needs_human` with type, URL, title, and session name. No screenshot is taken and focus is left alone.
 37. No tool call blocks waiting on the human.
-38. A `needs_human` result fires a `notify-send` notification and best-effort sets an `xdotool` urgency hint; a missing binary is logged and skipped.
-39. A daemon that starts and finds a persisted browser record from a previous run notifies through the same desktop channel as the `needs_human` handoff, since that record is the only evidence that a restart took live session windows with it.
+38. A `needs_human` result fires a `notify-send` notification and best-effort marks the session's window through `xdotool` and `wmctrl`; a missing binary is logged and skipped.
+39. A daemon that starts and finds a persisted browser record from a previous run notifies through the same desktop channel as the `needs_human` handoff, since that record is the only evidence that the previous run had a browser, and with it any session windows that the restart closed.
 40. Every action is logged to a JSONL file, with typed text reduced to a length and hash.
 41. A flat allowlist in the daemon gates, by host, every route to a new top-level document in a session's working and page-opened tabs.
 42. `navigate` and `fetch` accept `http` and `https` URLs only; `navigate` enforces this from the phase that ships it, ahead of the allowlist.
 43. An unlisted host returns `needs_confirmation`; the agent issues `policy` with `allow_once`, scoped to that session, or `allow_always`, which is persisted for all.
-44. Network and console capture run continuously into capped ring buffers, read from a cursor. Capture retains response bodies and strips credential headers.
-45. A page-context fetch performs an authenticated request with the browser's cookies, subject to the allowlist.
+44. Network and console capture run continuously into capped ring buffers, read from an `after` cursor. Console capture goes through Chrome's `Console` and `Log` domains and never enables `Runtime`, which page script can detect. Capture keeps response bodies in Chrome's buffer and stores no request body and no header beyond the values of two challenge headers.
+45. A page-context fetch performs an authenticated GET from the working tab's isolated world with the browser's cookies, under the page's CORS rules and without following redirects, subject to the allowlist.
 46. The MCP surface is two tools, `claudesurf_read` and `claudesurf_act`, each taking an action plus arguments and carrying a compact verb index in its description.
 47. A malformed call returns `schema_error` carrying the schema for the action named.
 48. A target the page opens is attached paused, so its first navigation is gated like any other.
 49. JavaScript dialogs are dismissed and reported; `beforeunload` is accepted so a human-initiated close proceeds.
 50. Downloads are declined and the refusal is reported.
 51. The graphical session values reach the daemon from its own environment or, failing that, from the bridge, which sends an allowlist of them with each request; a unit drop-in remains an option for either user. The second OS user's notifications fall back to chat.
+52. From a `needs_human` result until the session's next call other than `policy`, a domain-gate refusal in that session's tabs fires a notification naming the host and telling the human to sign in from a tab she opens herself or to ask the agent to allow the host.
 
 ## Phases
 
@@ -478,14 +482,14 @@ After this phase the agent has every action except capture and the challenge han
 
 ### Phase 4 — Handoff and capture (8%)
 
-Challenges, login walls, and two-factor prompts are detected, returned as `needs_human`, and surfaced to the desktop by notification and a best-effort urgency hint. Network capture retains response bodies and strips credential headers; console capture and a page-context fetch carrying the browser's cookies land alongside it. This completes the action inventory.
+Challenges, login walls, and two-factor prompts are detected, returned as `needs_human`, and surfaced to the desktop by notification and a best-effort urgency hint. Network capture keeps response bodies readable and stores no headers or request bodies; console capture and a page-context fetch carrying the browser's cookies land alongside it. This completes the action inventory.
 
 **Key files:**
-- `server/challenge.js` (new — detection), `server/notify.js` (new — notification and urgency hint, including the restart-loss announcement)
-- `server/network.js` (new — capture, capped ring buffer, header stripping), `server/fetch.js` (new — page-context fetch)
-- `server/daemon.js` (modified — detection hook, startup announcement, capture enablement)
-- `server/dispatch.js`, `server/policy.js` (modified)
-- `test/challenge.test.js`, `test/network.test.js` (new)
+- `server/challenge.js`, `server/page/detect.js`, and `server/page/visible.js` (new — detection), `server/handoff.js` (new — the open handoff and its notifications), `server/notify.js` (new — notification and urgency hint)
+- `server/ring.js`, `server/network.js`, `server/console-capture.js`, and `server/mime.js` (new — capture), `server/fetch.js` and `server/page/fetch.js` (new — page-context fetch)
+- `server/daemon.js` (modified — the handoff's opening and closing, startup announcement, the new handlers), `server/act-result.js` and `server/read.js` (modified — detection), `server/arming.js` (modified — capture enablement and buffer sizes), `server/requests.js` (modified — the hand-over to capture)
+- `server/dispatch.js`, `server/envelope.js`, `server/respond.js`, `server/gate.js`, `server/sessions.js`, `server/browser.js` (modified)
+- `test/challenge.test.js`, `test/handoff.test.js`, `test/notify.test.js`, `test/network.test.js`, `test/console-capture.test.js`, `test/fetch.test.js`, `test/live/capture.test.js`, `test/live/challenge.test.js` (new)
 
 **Open questions:**
 
