@@ -1,0 +1,23 @@
+<!doctype html>
+<!-- Starts a dedicated worker and prints its answer; at the top level it also embeds
+     itself from the cross-site listener, and prints the frame worker's answer that the
+     frame posts up. -->
+<meta charset="utf-8">
+<title>Dedicated worker</title>
+<p id="own">Own worker: waiting</p>
+<p id="frame">Frame worker: waiting</p>
+<script>
+  const worker = new Worker(URL.createObjectURL(new Blob(['postMessage("answered")'])));
+  worker.onmessage = (e) => {
+    document.getElementById('own').textContent = `Own worker: ${e.data}`;
+    if (parent !== window) parent.postMessage(e.data, '*');
+  };
+  addEventListener('message', (e) => {
+    if (e.source !== window) document.getElementById('frame').textContent = `Frame worker: ${e.data}`;
+  });
+  if (parent === window) {
+    const frame = document.createElement('iframe');
+    frame.src = '__CROSS_SITE__/dedicated-worker.html';
+    document.body.append(frame);
+  }
+</script>

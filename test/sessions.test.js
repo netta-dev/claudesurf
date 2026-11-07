@@ -637,7 +637,7 @@ test('a destroyed frame takes the frames inside it, and their ref sets, with it'
   assert.strictEqual(session.workingTargetId, working.targetId, 'and the page is untouched');
 });
 
-test('the per-target auto-attach filters iframes and is sent to every page and frame target', async () => {
+test('the per-target auto-attach filters iframes and workers and is sent to every page and frame target', async () => {
   const { fake, sessions } = await setup();
   const session = await sessions.ensure('s1');
   const working = fake.targets.get(session.workingTargetId);
@@ -649,9 +649,21 @@ test('the per-target auto-attach filters iframes and is sent to every page and f
     const sent = perTarget.find((c) => c.sessionId === t.sessionId);
     assert.ok(sent, `${t.targetId} got the per-target call`);
     assert.deepStrictEqual(sent.params, {
-      autoAttach: true, waitForDebuggerOnStart: true, flatten: true, filter: [{ type: 'iframe' }],
-    }, `${t.targetId}'s call carries the filter, so a frame of its own surfaces too`);
+      autoAttach: true, waitForDebuggerOnStart: true, flatten: true,
+      filter: [{ type: 'iframe' }, { type: 'worker' }, { type: 'shared_worker' }, { type: 'service_worker' }],
+    }, `${t.targetId}'s call carries the filter, so a frame of its own surfaces too, and a worker that the pause holds is released`);
   }
+});
+
+test('a worker that attaches is released and detached, and left out of the registry', async () => {
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const working = fake.targets.get(session.workingTargetId);
+  const worker = fake.createTarget({ type: 'worker', parent: working, url: 'blob:http://a.test/w' });
+  await fake.waitForCall('Target.detachFromTarget', (c) => c.params.sessionId === worker.sessionId);
+  assert.ok(fake.callsTo('Runtime.runIfWaitingForDebugger').some((c) => c.sessionId === worker.sessionId), 'released');
+  assert.deepStrictEqual(fake.calls.filter((c) => c.sessionId === worker.sessionId).map((c) => c.method), ['Runtime.runIfWaitingForDebugger']);
+  assert.strictEqual(sessions.target(worker.targetId), null);
 });
 
 test('worlds are kept per frame and generation, and a frame target navigating on its own drops only its own', async () => {

@@ -32,13 +32,13 @@ test('launch completes the handshake and writes the record; the record is cleare
   assert.ok(!fs.existsSync(record), 'record cleared when the pipe closes');
 });
 
-test('enableTargets sends a flattened, paused auto-attach for page and iframe targets, then download denial', async () => {
+test('enableTargets sends a flattened, paused auto-attach for page, iframe, and worker targets, then download denial', async () => {
   const { fake, conn } = fakeSession();
   await browser.enableTargets(conn);
   assert.deepStrictEqual(fake.calls.map((c) => c.method), ['Target.setAutoAttach', 'Browser.setDownloadBehavior']);
   assert.deepStrictEqual(fake.calls[0].params, {
     autoAttach: true, waitForDebuggerOnStart: true, flatten: true,
-    filter: [{ type: 'page' }, { type: 'iframe' }],
+    filter: [{ type: 'page' }, { type: 'iframe' }, { type: 'worker' }, { type: 'shared_worker' }, { type: 'service_worker' }],
   });
   assert.deepStrictEqual(fake.calls[1].params, { behavior: 'deny' });
   conn.close();

@@ -589,3 +589,9 @@ test('scroll moves a scrollable container on a fixture whose window does not scr
   const info = await read.pageInfo(sessions, session, {});
   assert.match(info.head, /\nScroll: 700 of /);
 });
+
+test('a dedicated worker runs in a session tab and in a cross-site frame, though the attach pauses each new target', { skip }, async () => {
+  await open('dedicated-worker.html');
+  const shows = async (text) => (await readAll({ scope: 'all' })).payload.includes(text);
+  await waitFor(async () => (await shows('Own worker: answered')) && (await shows('Frame worker: answered')), 5000);
+});

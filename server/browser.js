@@ -142,6 +142,12 @@ async function launch({ binary, profileDir, env, headless = false, log }) {
   return { conn, child };
 }
 
+// A paused auto-attach holds a new worker as well, and reports it only when the filter
+// lets it through, so a worker left out of the filter never runs. Every auto-attach
+// lets them through, and sessions.js releases and detaches each one as it attaches.
+const WORKERS = new Set(['worker', 'shared_worker', 'service_worker']);
+const WORKER_FILTER = [...WORKERS].map((type) => ({ type }));
+
 // Sent after every launch, once the attach handlers are registered: new targets pause
 // until released, and downloads are denied. The iframe filter entry is inert at
 // browser level, where Chrome surfaces page targets alone; sessions.js sends a
@@ -149,7 +155,7 @@ async function launch({ binary, profileDir, env, headless = false, log }) {
 async function enableTargets(conn) {
   await conn.send('Target.setAutoAttach', {
     autoAttach: true, waitForDebuggerOnStart: true, flatten: true,
-    filter: [{ type: 'page' }, { type: 'iframe' }],
+    filter: [{ type: 'page' }, { type: 'iframe' }, ...WORKER_FILTER],
   });
   await conn.send('Browser.setDownloadBehavior', { behavior: 'deny' });
 }
@@ -194,5 +200,5 @@ async function reapOrphan(log) {
 module.exports = {
   SetupError, BrowserError,
   locateBinary, graphicalEnv, launch, enableTargets,
-  readRecord, writeRecord, reapOrphan, processStartTime,
+  readRecord, writeRecord, reapOrphan, processStartTime, WORKERS, WORKER_FILTER,
 };

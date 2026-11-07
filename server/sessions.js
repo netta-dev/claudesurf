@@ -33,6 +33,7 @@ const retained = require('./retained');
 const refusals = require('./refusals');
 const { isWeb } = require('./policy');
 const { mainFrame, isMainFrame } = require('./frames');
+const { WORKERS, WORKER_FILTER } = require('./browser');
 
 const SESSION_PAGE = pathToFileURL(path.join(__dirname, 'static', 'session.html')).href;
 const WINDOW_TIMEOUT_MS = 5_000;
@@ -40,6 +41,9 @@ const CTRL_MODIFIER = 2;
 const MAX_DIALOGS = 20;
 const CROSS_DOCUMENT = new Set(['differentDocument', 'historyDifferentDocument', 'reload', 'reloadBypassingCache', 'restore', 'restoreWithPost']);
 const UNGATED = 'the working tab could not be put under the domain gate; call again';
+// The per-target auto-attach: out-of-process child frames, paused so that their
+// commands go ahead of their first commit, and the workers that the pause holds.
+const ATTACH = { autoAttach: true, waitForDebuggerOnStart: true, flatten: true, filter: [{ type: 'iframe' }, ...WORKER_FILTER] };
 
 class TargetGoneError extends Error {
   constructor(targetId) {
@@ -636,6 +640,7 @@ class Sessions {
     } finally {
       if (waitingForDebugger) this.conn.send('Runtime.runIfWaitingForDebugger', {}, opts).catch(() => {});
     }
+    if (WORKERS.has(targetInfo.type)) this.conn.send('Target.detachFromTarget', { sessionId: cdpSessionId }).catch(() => {});
     if (!queued) return;
     const { t, page, opener, armed, window, enabled, attaching, focused } = queued;
     // Every command is settled from here on, before anything is awaited: a wedged
@@ -704,9 +709,7 @@ class Sessions {
     const enabled = this.conn.send('Page.enable', {}, opts);
     // Out-of-process child frames surface through this per-target call only; the
     // browser-level one reaches page targets alone.
-    const attaching = this.conn.send('Target.setAutoAttach', {
-      autoAttach: true, waitForDebuggerOnStart: true, flatten: true, filter: [{ type: 'iframe' }],
-    }, opts);
+    const attaching = this.conn.send('Target.setAutoAttach', ATTACH, opts);
     // Focus emulation lifts an input stall on a tab that is not its window's active
     // one, and on a frame inside it, which takes keys and scripted input.
     const focused = this.conn.send('Emulation.setFocusEmulationEnabled', { enabled: true }, opts);
