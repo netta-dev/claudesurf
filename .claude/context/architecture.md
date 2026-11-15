@@ -59,7 +59,7 @@ When the region is the page unit's, its render gives each picked overlay an `ove
 
 ## Targets and attach
 
-`Target.setAutoAttach` runs with `flatten` and `waitForDebuggerOnStart` for `page` and `iframe` targets, at browser level for pages and again on every page and iframe attach, the per-target call that surfaces out-of-process child frames. An iframe target is recorded like a page, but without the window lookup, with `type: 'iframe'`, the parent target whose protocol session carried its attach, and a frame number from its root page's counter that is never reused.
+`Target.setAutoAttach` runs with `flatten` and `waitForDebuggerOnStart` for `page` and `iframe` targets, at browser level for pages and again on every page and iframe attach, the per-target call that surfaces out-of-process child frames. Both calls let worker targets through as well: the pause holds a new dedicated, shared, or service worker whatever the filter says, and reports it only when the filter lets it through, so a worker left out never runs (Cloudflare's Turnstile never finished, and its sign-in button stayed disabled). `onAttached` releases each worker and detaches from it, without recording it. An iframe target is recorded like a page, but without the window lookup, with `type: 'iframe'`, the parent target whose protocol session carried its attach, and a frame number from its root page's counter that is never reused.
 
 The attach handler (`onAttached`, `queueAttach`) takes a page target through these steps:
 
