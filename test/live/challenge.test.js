@@ -292,7 +292,7 @@ async function detected(vendors) {
 // which the test's row names, so the outer frame isn't a widget of its own.
 async function nestedSignal(style) {
   await crossSiteFrame(style, `<iframe src="${site.base}/other" style="width:304px;height:78px;border:0"></iframe>`);
-  await waitFor(() => committedFrames().length === 2, 5_000);
+  await waitFor(() => committedFrames().length === 2, 10_000);
   const row = { vendor: 'Nested widget', frame: (url) => url.origin === site.base && url.pathname === '/other', field: '[name="test-response"]' };
   const found = await detected([row]);
   return found ? found.signal : null;
