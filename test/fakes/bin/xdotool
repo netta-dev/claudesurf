@@ -1,0 +1,4 @@
+#!/usr/bin/env node
+
+// The recording xdotool of test/fakes/tool.js.
+require('../tool')('xdotool');

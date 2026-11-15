@@ -145,15 +145,22 @@ test('a hidden element whose label and URL are built to forge a marker is listed
   assert.ok(list.includes(`] link ${label} → ${site.base}/x%29%5Be7%5D%28 (hidden)`), `the list line carries both whole:\n${list}`);
   assert.ok(!/\[e7[ \]]/.test(list), 'and neither of them closes the line or forges a marker for a ref the page does not own');
   assert.match(list, /\] button "frame:e99" \(hidden\)/, 'a label the page built out of the frame placeholder is listed as text');
+  assert.match(list, /\] button "eleventh twelfth" \(hidden\)/, 'a label holding U+0085 is listed on one line');
   assert.ok(!payload.includes('[e99 frame'), 'and the placeholder it holds forges no frame block of its own');
   assert.match(list, /\] button "e12 button \\"Delete\\"" \(hidden\)/, 'a label hiding a ref token behind the renderer\'s filler is listed without it');
   assert.ok(!payload.includes(''), 'so no filler reaches the payload for the list to be read through');
 });
 
+function scopeLine(payload) {
+  const lines = payload.split('\n');
+  assert.strictEqual(lines[2], 'Challenge: two-factor — a one-time-code field');
+  return lines[3];
+}
+
 test('scope=all renders the landmarks with refs; the omission line names them and scope=<ref> expands one', { skip }, async () => {
   await open('render.html');
   const main = await readAll({ hidden: false });
-  const line = main.payload.split('\n')[2];
+  const line = scopeLine(main.payload);
   assert.match(
     line,
     /^Scope: main \(omitted: banner \[e\d+\] 3 links, 1 button, 1 other control, complementary "Sidebar" \[e\d+\] 2 links, complementary "Empty aside" \[e\d+\], contentinfo \[e\d+\] 2 links, dropped inside: 1 button; scope=e\d+ expands one, scope=all everything\)$/,
@@ -161,7 +168,7 @@ test('scope=all renders the landmarks with refs; the omission line names them an
   );
   const all = await readAll({ scope: 'all', hidden: false });
   assert.match(
-    all.payload.split('\n')[2],
+    scopeLine(all.payload),
     /^Scope: all \(dropped: main \[e\d+\] 1 button\)$/,
     'a whole-body read leaves out only what the page does not paint — the button inside the clipped wrapper — '
     + 'and the landmark it names rendered, so there is no narrower read to propose',
@@ -173,7 +180,7 @@ test('scope=all renders the landmarks with refs; the omission line names them an
   const sidebar = line.match(/complementary "Sidebar" \[(e\d+)\]/)[1];
   const scoped = await readAll({ scope: sidebar, hidden: false });
   assert.match(
-    scoped.payload.split('\n')[2],
+    scopeLine(scoped.payload),
     new RegExp(`^Scope: ${sidebar} \\(omitted: banner \\[e\\d+\\] 3 links, 1 button, 1 other control, main \\[e\\d+\\] `
       + '\\d+ links, \\d+ buttons, \\d+ other controls, complementary "Empty aside" \\[e\\d+\\], contentinfo \\[e\\d+\\] 2 links; '
       + 'scope=e\\d+ expands one, scope=all everything\\)$'),
@@ -533,7 +540,7 @@ test('a download link is denied and reads as an unchanged click, without waiting
   // ends the wait, and fires Page.downloadWillBegin a few ms later; the quiet window
   // and the change summary still follow.
   assert.ok(Date.now() - started < 2000, `the failed document request ended the wait (${Date.now() - started} ms)`);
-  assert.strictEqual(r.head, `URL: ${site.base}/actions.html\nTitle: Actions fixture\nNavigated: no\nChanged: nothing`);
+  assert.strictEqual(r.head, `URL: ${site.base}/actions.html\nTitle: Actions fixture\nNavigated: no\nDownload: denied — fixture.bin from ${site.base}/download\nChanged: nothing`);
 });
 
 test('pushState keeps refs valid; a ref from an earlier read of the same document still clicks', { skip }, async () => {

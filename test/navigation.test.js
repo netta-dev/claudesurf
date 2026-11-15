@@ -10,7 +10,7 @@ const navigation = require('../server/navigation');
 const { respond } = require('../server/respond');
 const { OutcomeError } = require('../server/action-support');
 const { NAVIGATION_MS } = require('../server/navigation-wait');
-const { fakeSession, markedRefs, waitFor } = require('./helpers');
+const { fakeSession, frameAt, markedRefs, waitFor } = require('./helpers');
 
 async function setup(t, pages = {}, { allow } = {}) {
   const ctx = fakeSession({ t, allow });
@@ -33,6 +33,10 @@ async function outcome(promise) {
 
 function go(ctx, url) {
   return navigation.navigate(ctx.context, ctx.session, { url, name: 'n' });
+}
+
+function stateRead(params) {
+  return /function claudesurfScroll/.test(params.functionDeclaration) && !(params.arguments || []).length;
 }
 
 test('history on a fresh working tab\'s session page answers error saying to navigate first', async (t) => {
@@ -97,7 +101,7 @@ test('a navigate the gate refuses returns the before-acting needs_confirmation w
   assert.deepStrictEqual(ctx.session.refusals, [], 'a pre-check records nothing on the session');
   const { envelope } = respond(ctx.sessions, ctx.session, result);
   assert.strictEqual(envelope.outcome, 'needs_confirmation');
-  assert.match(envelope.message, /^The navigation was not started: its host needs the human's approval\./);
+  assert.match(envelope.message, /^The call didn't start: its host needs the human's approval\./);
   assert.ok(!envelope.message.includes('evil'), 'the host stays out of the message');
   assert.strictEqual(envelope.payload, 'URL: http://a.test/\nTitle: A\nBlocked: [t1] evil.test — navigation to http://evil.test/collect?d=1 (not started)');
 });
@@ -469,4 +473,260 @@ test('history checks its entry at the gate first, so a restore onto a host taken
   assert.strictEqual(line, 'Blocked: [t1] c.test — navigation to http://c.test/x%29%5Be9%20button%20"Delete"%5D%28y (not started)');
   assert.deepStrictEqual(markedRefs(line), [], 'the URL the page chose opens no marker');
   assert.strictEqual(ctx.working().url, 'http://a.test/');
+});
+
+test('an acting call detects once its page has settled, prints the Challenge: line after the state lines, and responds needs_human', async (t) => {
+  const ctx = await setup(t, { 'http://a.test/login': page('Sign in', { detect: { password: true } }) });
+  const result = await go(ctx, 'http://a.test/login');
+  assert.strictEqual(result.head, 'URL: http://a.test/login\nTitle: Sign in\nChallenge: sign-in — a password field\nNavigated: yes');
+  assert.deepStrictEqual(result.challenge, { type: 'sign-in', signal: 'a password field', clears: false, title: 'Sign in' });
+  const { envelope } = respond(ctx.sessions, ctx.session, result);
+  assert.strictEqual(envelope.outcome, 'needs_human');
+  assert.strictEqual(envelope.payload, result.head);
+});
+
+test('a navigation that commits during detection onto a sign-in page sends the call round its loop again, so it reports that page and its challenge', async (t) => {
+  const ctx = await setup(t, { 'http://a.test/': page('A'), 'http://a.test/login': page('Sign in', { detect: { password: true } }) });
+  let moved = false;
+  const original = ctx.fake.handlers.get('Runtime.callFunctionOn');
+  ctx.fake.handle('Runtime.callFunctionOn', (params, sid, f) => {
+    const tab = f.bySession(sid);
+    if (!moved && /function claudesurfDetect/.test(params.functionDeclaration) && tab.url === 'http://a.test/') {
+      moved = true;
+      f.navigateByPage(tab, 'http://a.test/login');
+    }
+    return original(params, sid, f);
+  });
+  const result = await go(ctx, 'http://a.test/');
+  assert.ok(moved, 'the page moved during the first detection');
+  assert.strictEqual(result.head, 'URL: http://a.test/login\nTitle: Sign in\nChallenge: sign-in — a password field\nNavigated: yes');
+  assert.strictEqual(respond(ctx.sessions, ctx.session, result).envelope.outcome, 'needs_human');
+});
+
+test('a detection that throws on an acting call leaves the call its success, without a Challenge: line', async (t) => {
+  const ctx = await setup(t, { 'http://a.test/odd': page('Odd', { detect: { throws: 'the page did not answer' } }) });
+  const result = await go(ctx, 'http://a.test/odd');
+  assert.strictEqual(result.head, 'URL: http://a.test/odd\nTitle: Odd\nNavigated: yes');
+  assert.strictEqual(result.challenge, null);
+  assert.strictEqual(respond(ctx.sessions, ctx.session, result).envelope.outcome, 'success');
+});
+
+test("detection on an acting call runs under a deadline 3 s short of the request's, the summary's reserve", async (t) => {
+  const ctx = await setup(t, { 'http://a.test/login': page('Sign in', { detect: { password: true } }) });
+  const spy = t.mock.method(ctx.sessions, 'callInWorld');
+  const deadline = Date.now() + 30_000;
+  await navigation.navigate(ctx.context, ctx.session, { url: 'http://a.test/login', name: 'n' }, deadline);
+  const scans = spy.mock.calls.filter((c) => /function claudesurfDetect/.test(c.arguments[1]));
+  assert.deepStrictEqual(scans.map((c) => c.arguments[3]), [{ deadline: deadline - 3_000 }]);
+});
+
+test('after a challenge that may clear itself, the call waits for the page to reload as it passes and reports the page it reloaded to', async (t) => {
+  const ctx = await setup(t, {
+    'http://a.test/check': page('Just a moment...', { status: 403, headers: { 'cf-mitigated': 'challenge' } }),
+    'http://a.test/app': page('App'),
+  });
+  let reloading = false;
+  const original = ctx.fake.handlers.get('Runtime.callFunctionOn');
+  ctx.fake.handle('Runtime.callFunctionOn', (params, sid, f) => {
+    const tab = f.bySession(sid);
+    if (!reloading && stateRead(params) && tab.url === 'http://a.test/check') {
+      reloading = true;
+      setTimeout(() => f.navigateByPage(tab, 'http://a.test/app'), 500);
+    }
+    return original(params, sid, f);
+  });
+  const started = Date.now();
+  const result = await go(ctx, 'http://a.test/check');
+  assert.ok(Date.now() - started >= 450, `it waited for the reload (${Date.now() - started} ms)`);
+  assert.strictEqual(result.head, 'URL: http://a.test/app\nTitle: App\nNavigated: yes');
+  assert.strictEqual(result.challenge, null);
+});
+
+test('a reload that starts during the self-clearing wait and commits later is waited for, so the call reports the page it reloaded to', async (t) => {
+  const ctx = await setup(t, {
+    'http://a.test/check': page('Just a moment...', { status: 403, headers: { 'cf-mitigated': 'challenge' } }),
+    'http://a.test/app': page('App'),
+  });
+  let reloading = false;
+  const original = ctx.fake.handlers.get('Runtime.callFunctionOn');
+  ctx.fake.handle('Runtime.callFunctionOn', (params, sid, f) => {
+    const tab = f.bySession(sid);
+    if (!reloading && stateRead(params) && tab.url === 'http://a.test/check') {
+      reloading = true;
+      setTimeout(() => f.announce(tab, 'http://a.test/app'), 500);
+      setTimeout(() => f.commitDocument(tab, 'http://a.test/app'), 800);
+    }
+    return original(params, sid, f);
+  });
+  const result = await go(ctx, 'http://a.test/check');
+  assert.strictEqual(result.head, 'URL: http://a.test/app\nTitle: App\nNavigated: yes');
+  assert.strictEqual(result.challenge, null);
+});
+
+test('a working tab that closes after detection matched, as the state lines are read, leaves the call its Tab: line without the challenge', async (t) => {
+  let scanned = false;
+  const ctx = await setup(t, { 'http://a.test/login': page('Sign in', { detect: () => { scanned = true; return { password: true }; } }) });
+  const original = ctx.fake.handlers.get('Runtime.callFunctionOn');
+  ctx.fake.handle('Runtime.callFunctionOn', (params, sid, f) => {
+    if (!scanned || !stateRead(params)) return original(params, sid, f);
+    f.destroyTarget(f.bySession(sid).targetId);
+    throw { code: -32001, message: 'Session with given id not found.' };
+  });
+  const result = await go(ctx, 'http://a.test/login');
+  assert.strictEqual(result.head, 'Tab: the working tab closed during the call; the next call returns to a working tab');
+  assert.strictEqual(result.challenge, null);
+});
+
+test("the self-clearing wait is cut to the summary's reserve of the deadline and spent once per document, so a later call on the check detects at once", async (t) => {
+  const ctx = await setup(t, { 'http://a.test/check': page('Just a moment...', { status: 403, headers: { 'cf-mitigated': 'challenge' } }) });
+  const started = Date.now();
+  const first = await navigation.navigate(ctx.context, ctx.session, { url: 'http://a.test/check', name: 'n' }, Date.now() + 5_500);
+  const took = Date.now() - started;
+  assert.ok(took >= 2_000 && took < 4_000, `it waited until 3 s before the deadline (${took} ms)`);
+  assert.deepStrictEqual(first.challenge, { type: 'bot check', signal: "Cloudflare (the page's cf-mitigated header)", clears: true, title: 'Just a moment...' });
+  const again = Date.now();
+  const second = await require('../server/input').scroll(ctx.context, ctx.session, { direction: 'down', amount: 100 }, Date.now() + 30_000);
+  assert.ok(Date.now() - again < 1_500, `the wait was spent on this document (${Date.now() - again} ms)`);
+  assert.match(second.head, /^URL: http:\/\/a\.test\/check\nTitle: Just a moment\.\.\.\nChallenge: bot check — Cloudflare \(the page's cf-mitigated header\)\nScroll: /);
+});
+
+test("the self-clearing wait is spent with 500 ms left before the summary's reserve, and stays unspent with 499", async (t) => {
+  for (const [left, spent] of [[499, false], [500, true]]) {
+    const ctx = await setup(t, { 'http://a.test/check': page('Just a moment...', { status: 403, headers: { 'cf-mitigated': 'challenge' } }) });
+    const deadline = Date.now() + 30_000;
+    // Detection ends with the title read after a header match. The test then fixes
+    // Date.now() at `left` ms before the summary's reserved interval begins.
+    let frozen = null;
+    const original = ctx.fake.handlers.get('Runtime.callFunctionOn');
+    ctx.fake.handle('Runtime.callFunctionOn', (params, sid, f) => {
+      if (!frozen && stateRead(params) && f.bySession(sid).url === 'http://a.test/check') frozen = t.mock.method(Date, 'now', () => deadline - 3_000 - left);
+      return original(params, sid, f);
+    });
+    const waits = [];
+    const waitUntil = ctx.sessions.waitUntil.bind(ctx.sessions);
+    t.mock.method(ctx.sessions, 'waitUntil', (targetId, predicate, opts) => {
+      if (!frozen) return waitUntil(targetId, predicate, opts);
+      waits.push(opts);
+      return Promise.resolve(false);
+    });
+    const result = await navigation.navigate(ctx.context, ctx.session, { url: 'http://a.test/check', name: 'n' }, deadline);
+    frozen.mock.restore();
+    assert.strictEqual(result.challenge.clears, true, `${left} ms`);
+    assert.deepStrictEqual(waits, spent ? [{ timeout: 10_000, deadline: deadline - 3_000 }] : [], `${left} ms`);
+    assert.strictEqual(ctx.working().clearWaited, spent ? ctx.working().generation : null, `${left} ms`);
+  }
+});
+
+test("a self-clearing wait on a call already past the summary's reserve stays unspent, so a later call on the check waits for its reload", async (t) => {
+  const ctx = await setup(t, {
+    'http://a.test/check': page('Just a moment...', { status: 403, headers: { 'cf-mitigated': 'challenge' } }),
+    'http://a.test/app': page('App'),
+  });
+  // The call has 3 s until its deadline, matching the summary's reserve.
+  const first = await navigation.navigate(ctx.context, ctx.session, { url: 'http://a.test/check', name: 'n' }, Date.now() + 3_000);
+  assert.strictEqual(first.challenge.clears, true);
+  assert.strictEqual(ctx.working().clearWaited, null);
+  let reloading = false;
+  const original = ctx.fake.handlers.get('Runtime.callFunctionOn');
+  ctx.fake.handle('Runtime.callFunctionOn', (params, sid, f) => {
+    const tab = f.bySession(sid);
+    if (!reloading && stateRead(params) && tab.url === 'http://a.test/check') {
+      reloading = true;
+      setTimeout(() => f.navigateByPage(tab, 'http://a.test/app'), 500);
+    }
+    return original(params, sid, f);
+  });
+  const second = await require('../server/input').scroll(ctx.context, ctx.session, { direction: 'down', amount: 100 }, Date.now() + 30_000);
+  assert.strictEqual(second.challenge, null);
+  assert.match(second.head, /^URL: http:\/\/a\.test\/app\nTitle: App\n/);
+});
+
+test("the self-clearing wait lasts up to 10 s, cut to the summary's reserve of the deadline, and a challenge that can't clear itself skips it", async (t) => {
+  const ctx = await setup(t, {
+    'http://a.test/check': page('Just a moment...', { status: 403, headers: { 'cf-mitigated': 'challenge' } }),
+    'http://a.test/captcha': page('Verify', { status: 405, headers: { 'x-amzn-waf-action': 'captcha' } }),
+  });
+  const original = ctx.fake.handlers.get('Runtime.callFunctionOn');
+  let detected = false;
+  ctx.fake.handle('Runtime.callFunctionOn', (params, sid, f) => {
+    // A header match's title read is the call's first page-state read.
+    if (stateRead(params)) detected = true;
+    return original(params, sid, f);
+  });
+  const waits = [];
+  const waitUntil = ctx.sessions.waitUntil.bind(ctx.sessions);
+  t.mock.method(ctx.sessions, 'waitUntil', (targetId, predicate, opts) => {
+    if (!detected) return waitUntil(targetId, predicate, opts);
+    waits.push(opts);
+    return Promise.resolve(false);
+  });
+  const deadline = Date.now() + 30_000;
+  const check = await navigation.navigate(ctx.context, ctx.session, { url: 'http://a.test/check', name: 'n' }, deadline);
+  assert.strictEqual(check.challenge.clears, true);
+  assert.deepStrictEqual(waits, [{ timeout: 10_000, deadline: deadline - 3_000 }]);
+  detected = false;
+  waits.length = 0;
+  const captcha = await navigation.navigate(ctx.context, ctx.session, { url: 'http://a.test/captcha', name: 'n' }, Date.now() + 30_000);
+  assert.strictEqual(captcha.challenge.clears, false);
+  assert.deepStrictEqual(waits, [], "AWS WAF's captcha can't clear itself");
+});
+
+test("a widget without a response field counts on the document once a result keeps it, so a navigation that starts during detection and is dropped still leaves it reported", async (t) => {
+  const ctx = await setup(t, { 'http://a.test/': page('A') });
+  await go(ctx, 'http://a.test/');
+  let drop = false;
+  let scans = 0;
+  const original = ctx.fake.handlers.get('Runtime.callFunctionOn');
+  ctx.fake.handle('Runtime.callFunctionOn', (params, sid, f) => {
+    if (/function claudesurfDetect/.test(params.functionDeclaration)) {
+      scans += 1;
+      if (drop) {
+        drop = false;
+        f.announce(f.bySession(sid), 'http://a.test/next');
+        f.failNavigation(f.bySession(sid));
+      }
+    }
+    return original(params, sid, f);
+  });
+  await frameAt(ctx, ctx.fake.targets.get(ctx.working().targetId), 'https://client-api.arkoselabs.com/fc/gc/?token=x', { field: 'absent' });
+  const scroll = () => require('../server/input').scroll(ctx.context, ctx.session, { direction: 'down', amount: 100 }, Date.now() + 30_000);
+  drop = true;
+  const navigations = ctx.working().navigations;
+  const first = await scroll();
+  assert.strictEqual(ctx.working().navigations, navigations + 1, 'the dropped navigation started during the first detection');
+  assert.strictEqual(scans, 2, 'the navigation sent the call round its loop to detect again');
+  assert.deepStrictEqual(first.challenge, { type: 'bot check', signal: 'Arkose (a visible widget)', clears: false, title: 'A' }, 'the second detection still reports it');
+  assert.match(first.head, /^URL: http:\/\/a\.test\/\nTitle: A\nChallenge: bot check — Arkose \(a visible widget\)\n/);
+  assert.strictEqual((await scroll()).challenge, null, 'the kept result spent it on this document');
+});
+
+test("a call with a refusal of its own answers needs_confirmation and leaves a widget without a response field unspent, so the next call on the document hands it off", async (t) => {
+  const ctx = await setup(t, { 'http://a.test/': page('A'), 'http://a.test/go': { redirect: 'http://evil.test/landing' } }, { allow: ['a.test'] });
+  await go(ctx, 'http://a.test/');
+  await frameAt(ctx, ctx.fake.targets.get(ctx.working().targetId), 'https://client-api.arkoselabs.com/fc/gc/?token=x', { field: 'absent' });
+  const arkose = { type: 'bot check', signal: 'Arkose (a visible widget)', clears: false, title: 'A' };
+  const refused = await go(ctx, 'http://a.test/go');
+  assert.deepStrictEqual(refused.challenge, arkose);
+  assert.strictEqual(respond(ctx.sessions, ctx.session, refused).envelope.outcome, 'needs_confirmation');
+  const next = await require('../server/input').scroll(ctx.context, ctx.session, { direction: 'down', amount: 100 }, Date.now() + 30_000);
+  assert.deepStrictEqual(next.challenge, arkose, 'the needs_confirmation result spent nothing');
+  assert.strictEqual(respond(ctx.sessions, ctx.session, next).envelope.outcome, 'needs_human');
+});
+
+test('a commit that lands between detection and the state lines leaves the Challenge: line and the challenge out', async (t) => {
+  const ctx = await setup(t, { 'http://a.test/login': page('Sign in', { detect: { password: true } }) });
+  const original = ctx.fake.handlers.get('Runtime.callFunctionOn');
+  let detected = false;
+  ctx.fake.handle('Runtime.callFunctionOn', (params, sid, f) => {
+    if (/claudesurfDetect/.test(params.functionDeclaration)) detected = true;
+    else if (detected && /function claudesurfScroll/.test(params.functionDeclaration)) {
+      detected = false;
+      const tab = f.bySession(sid);
+      f.emit('Page.frameNavigated', { frame: { id: tab.targetId, url: tab.url, loaderId: 'later' }, type: 'BackForwardCacheRestore' }, sid);
+    }
+    return original(params, sid, f);
+  });
+  const result = await go(ctx, 'http://a.test/login');
+  assert.strictEqual(result.challenge, null);
+  assert.ok(!result.head.includes('Challenge:'), result.head);
 });

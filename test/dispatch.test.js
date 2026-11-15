@@ -132,7 +132,7 @@ test('unknown tool or action, and an action on the wrong tool, return schema_err
   const unknown = validate('claudesurf_read', 'fly', {});
   assert.strictEqual(unknown.outcome, 'schema_error');
   assert.match(unknown.message, /^fly: unknown action/);
-  assert.deepStrictEqual(unknown.schema.actions, ['page', 'info', 'screenshot']);
+  assert.deepStrictEqual(unknown.schema.actions, ['page', 'info', 'screenshot', 'console', 'network']);
   const wrongTool = validate('claudesurf_read', 'click', { ref: 'e1' });
   assert.strictEqual(wrongTool.outcome, 'schema_error');
 });
@@ -207,11 +207,11 @@ test('tool definitions list exactly the shipped actions with a flat schema and t
   const tools = toolDefinitions();
   assert.deepStrictEqual(tools.map((t) => t.name), ['claudesurf_read', 'claudesurf_act']);
   const [read, act] = tools;
-  assert.deepStrictEqual(read.inputSchema.properties.action.enum, ['page', 'info', 'screenshot']);
-  assert.deepStrictEqual(act.inputSchema.properties.action.enum, ['navigate', 'click', 'scroll', 'type', 'press', 'select', 'history', 'tabs', 'policy']);
+  assert.deepStrictEqual(read.inputSchema.properties.action.enum, ['page', 'info', 'screenshot', 'console', 'network']);
+  assert.deepStrictEqual(act.inputSchema.properties.action.enum, ['navigate', 'click', 'scroll', 'type', 'press', 'select', 'history', 'tabs', 'fetch', 'policy']);
   assert.deepStrictEqual(read.inputSchema.required, ['action']);
   assert.deepStrictEqual(act.inputSchema.required, ['action']);
-  assert.deepStrictEqual(Object.keys(read.inputSchema.properties), ['action', 'scope', 'find', 'article', 'links', 'hidden', 'max_chars', 'offset', 'since', 'full_page']);
+  assert.deepStrictEqual(Object.keys(read.inputSchema.properties), ['action', 'scope', 'find', 'article', 'links', 'hidden', 'max_chars', 'offset', 'since', 'full_page', 'after', 'filter']);
   assert.deepStrictEqual(read.inputSchema.properties.links.enum, ['inline', 'index']);
   assert.deepStrictEqual(Object.keys(act.inputSchema.properties), ['action', 'url', 'name', 'description', 'ref', 'trusted', 'direction', 'amount', 'text', 'keys', 'option', 'op', 'target', 'host']);
   assert.deepStrictEqual(act.inputSchema.properties.direction.enum, ['up', 'down', 'top', 'bottom']);
@@ -233,7 +233,47 @@ test('tool definitions list exactly the shipped actions with a flat schema and t
   assert.match(act.description, /`history`\(op\) — back, forward, or reload the working tab; /);
   assert.match(act.description, /`tabs`\(op, target\) — use `list` to list the session's tabs; `new` opens target=URL and makes it the working tab; use `switch` or `close` with target=t2; /);
   assert.match(act.description, /`policy`\(op, host\) — call `policy` only after the human approves a host that a Blocked: line named\. Use allow_once for this session or allow_always to save the host\./);
-  assert.ok(act.description.endsWith(' Results end with a Changed: diff of the page since your last read or action. needs_confirmation means the domain gate stopped a navigation; ask the human before calling policy.'));
+  const needsHuman = ' needs_human means a person has to clear the page (a bot check, a sign-in, or a code); tell the human which window, end your turn, and read the page again when she says it is done.';
+  assert.ok(act.description.endsWith(' navigate, click, scroll, type, press, select, history, and tabs new end with a Changed: diff of the page since your last read or action when they stay on its document.'
+    + ' needs_confirmation means the domain gate stopped a navigation or a fetch; ask the human before calling policy.' + needsHuman));
+  assert.ok(read.description.endsWith(' or layout matters.' + needsHuman));
+});
+
+test('console, network, and fetch are in the verb index with their arguments', () => {
+  const [read, act] = toolDefinitions();
+  assert.match(read.description, /`console`\(after\) — the working tab's console messages and Chrome's own messages, numbered, oldest first, without uncaught exceptions; after=N returns those numbered above N; /);
+  assert.match(read.description, /`network`\(filter, after\) — the working tab's requests, numbered; filter=text keeps those whose URL contains it and prints their text response bodies; after=N returns those numbered above N\./);
+  assert.match(act.description, /`fetch`\(url\) — GET an http\(s\) URL from the working tab with its cookies, as the page's own script would: same-origin, or a server that allows the page's origin; redirects are not followed; /);
+});
+
+test("after is a non-negative integer defaulting to 0 and filter a non-empty string; fetch's url is a required http(s) URL without credentials", () => {
+  assert.strictEqual(validate('claudesurf_read', 'console', {}), null);
+  assert.strictEqual(validate('claudesurf_read', 'network', { filter: '/api', after: 12 }), null);
+  assert.deepStrictEqual(withDefaults('console', {}), { after: 0 });
+  assert.deepStrictEqual(withDefaults('network', { filter: 'x' }), { filter: 'x', after: 0 });
+  assert.match(validate('claudesurf_read', 'console', { after: -1 }).message, /^console: after must not be negative/);
+  assert.match(validate('claudesurf_read', 'network', { after: -1 }).message, /^network: after must not be negative/);
+  assert.match(validate('claudesurf_read', 'network', { after: 1.5 }).message, /^network: after must be a integer/);
+  assert.match(validate('claudesurf_read', 'network', { filter: '  ' }).message, /^network: filter must not be empty/);
+  assert.match(validate('claudesurf_read', 'console', { filter: 'x' }).message, /^console: unknown argument filter/);
+  assert.match(validate('claudesurf_act', 'fetch', {}).message, /^fetch: url is required/);
+  assert.match(validate('claudesurf_act', 'fetch', { url: 'file:///etc/passwd' }).message, /^fetch: url must be http or https/);
+  assert.strictEqual(validate('claudesurf_act', 'fetch', { url: 'https://a.test/api.json' }), null);
+  for (const url of ['https://user:pw@a.test/api.json', 'https://user@a.test/', 'https://:pw@a.test/']) {
+    assert.strictEqual(validate('claudesurf_act', 'fetch', { url }).message, "fetch: url must not carry a user name or password, since the page's fetch refuses such a URL", url);
+  }
+  assert.strictEqual(validate('claudesurf_act', 'navigate', { url: 'https://user:pw@a.test/', name: 'n' }), null, 'a navigation may carry them');
+  assert.match(validate('claudesurf_act', 'console', {}).message, /^console: unknown action for claudesurf_act/);
+});
+
+test('url, which navigate and fetch declare, and after, which console and network declare, merge with one type each', () => {
+  const [read, act] = toolDefinitions();
+  assert.deepStrictEqual(act.inputSchema.properties.url, { type: 'string', description: 'navigate: The http or https URL to load. fetch: The http or https URL to GET.' });
+  assert.strictEqual(read.inputSchema.properties.after.type, 'integer');
+  assert.strictEqual(read.inputSchema.properties.after.description,
+    "console: Return the entries numbered above this number. To see what is new, pass the Next: line of this action's previous answer; start from 0 when the working tab changes."
+    + " network: Return the entries numbered above this number. To see what is new, pass the Next: line of this action's previous answer made with the same filter; start from 0 when the filter or the working tab changes.");
+  assert.strictEqual(read.inputSchema.properties.filter.description, 'network: Keep the requests whose URL contains this text, case-insensitively, and print their text response bodies.');
 });
 
 test('a property several actions declare is merged: its enums joined, its descriptions joined under each action', () => {

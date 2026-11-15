@@ -95,6 +95,8 @@ Two tools, each taking an `action` plus that action's arguments as flat properti
 | `claudesurf_read` | `page` | `scope` (default `main`), `find`, `article` (default false), `links` (default `inline`), `hidden` (default false), `max_chars` (default 40000), `offset` (default 0), `since` (default false) | The page as markdown, with every control inline as a ref marker and open dialogs as blocks ahead of it. Header lines give the URL and title, what the scope left out, the hidden-control count, and what a cut left for the next `offset`. `since=true` returns what changed since the last read or action instead. |
 | | `info` | — | URL, title, scroll position, session name. |
 | | `screenshot` | `full_page` (default false) | A PNG of the viewport, or up to 4 viewport-sized segments of the whole page with a line naming the pixel range covered. |
+| | `console` | `after` (default 0) | The working tab's console messages and Chrome's own messages, numbered, oldest first. `after=N` returns the entries numbered above N (see Console and network capture). |
+| | `network` | `filter`, `after` (default 0) | The working tab's requests, one numbered line each, then those still in flight. `filter` keeps the requests whose URL contains the text, case-insensitively, as Chrome reports it or in its percent-encoded form, and prints their text response bodies; `after=N` returns the entries numbered above N. |
 | `claudesurf_act` | `navigate` | **`url`** (http/https), **`name`**, `description` | Loads the URL and labels the window; the same `name` on later calls keeps it. |
 | | `click` | **`ref`**, `trusted` (default false) | Clicks an element by ref. |
 | | `scroll` | **`direction`** (`up`/`down`/`top`/`bottom`), `amount` (default 500) | Scrolls the window, or the page's scrollable container when the window does not scroll, and reports the scroll position. |
@@ -103,11 +105,12 @@ Two tools, each taking an `action` plus that action's arguments as flat properti
 | | `select` | **`ref`**, **`option`** | Chooses an option of a native `<select>` by its label, else its value. |
 | | `history` | **`op`** (`back`/`forward`/`reload`) | Goes back, forward, or reloads in the working tab. |
 | | `tabs` | **`op`** (`list`/`new`/`switch`/`close`), `target` (a URL for `new`, a tab id like `t2` for `switch` and `close`) | Lists the session's tabs, opens a URL in a new tab and works there, makes another tab the working tab, or closes one. |
+| | `fetch` | **`url`** (http/https, without a user name or password) | GETs the URL from the working tab with the page's cookies, as the page's own script would, and returns the response; redirects aren't followed (see `fetch`). |
 | | `policy` | **`op`** (`allow_once`/`allow_always`), **`host`** (a bare host such as `example.com`) | Allows a host for this session, or saves it to the allowlist. Claude calls it only after you approve a host that a `Blocked:` line named. |
 
 `navigate`, `click`, `scroll`, `type`, `press`, `select`, `history`, and `tabs new` are acting calls: each result says what the action did and what changed on the page (see What an acting call returns).
 
-Outcomes: `success`, `needs_confirmation`, `unsettled`, `stale_ref`, `schema_error`, `setup_error`, `error`. The bridge marks `error`, `schema_error`, and `setup_error` as tool errors. `needs_confirmation` means the domain gate stopped a navigation to a host off the allowlist (see The allowlist). `unsettled` means the page was still busy when the wait ran out; the result is complete otherwise. `needs_human` is reserved for the challenge handoff, which is not built yet.
+Outcomes: `success`, `needs_confirmation`, `needs_human`, `unsettled`, `stale_ref`, `schema_error`, `setup_error`, `error`. The bridge marks `error`, `schema_error`, and `setup_error` as tool errors. `needs_confirmation` means the domain gate stopped a navigation or a `fetch` to a host off the allowlist (see The allowlist). `needs_human` means the page needs a person to clear it, a bot check, a sign-in, or a two-factor code; the result is complete, with a `Challenge:` line (see Challenges and the handoff). `unsettled` means the page was still busy when the wait ran out; the result is complete otherwise. When more than one applies, `needs_confirmation` comes first, then `needs_human`, then `unsettled`.
 
 **Refs** are valid for the current document. After the page navigates, an action on an old ref returns `stale_ref`; a ref that was never returned by a read of the current document returns `error`. Refs from an earlier read of the same document stay valid, and refs cut by `max_chars` are clickable without paging to them. A ref doesn't name its tab, so once the working tab changes, by `tabs switch`, by `tabs new`, or by the return to an earlier tab after the working tab closed, every ref returns `stale_ref` until a read of the new working tab, unless that tab is the one Claude last read. A ref read inside a cross-site frame carries that frame's number, `f1e42`; a scripted click, `type`, and `select` reach it, a trusted click doesn't, and it goes stale when the frame's own document changes. `press` sends its keys to whatever holds focus, a field inside a frame included, so Claude clicks or types into a field before pressing keys there.
 
@@ -130,7 +133,7 @@ A **web browser** is an application for accessing [websites](/wiki/Website)[e104
 Choices [e3 radio "One" (checked)] [e4 radio "Two"]
 ```
 
-After `URL:` and `Title:`, the header lines come in this order, each only when it applies: the truncation line, `Settled:`, `Paged:`, `Since:`, `Scope:`, `Overlays:`, `Hidden:`, `Links:`, `Find:`, and `Article:`.
+After `URL:` and `Title:`, the header lines come in this order, each only when it applies: `Challenge:` (see Challenges and the handoff), the truncation line, `Settled:`, `Paged:`, `Since:`, `Scope:`, `Overlays:`, `Hidden:`, `Links:`, `Find:`, and `Article:`.
 
 Prose, headings, lists, tables, and code come from the page's markup; the role, name, and state in each marker come from Chrome's accessibility tree, and the value from the element itself, so a marker shows what was typed rather than what the markup set. A `[`, `]`, or `\` the page put in a name, a value, an `alt`, an option list, an article's title or byline, or a hidden element's label arrives backslash-escaped, and every URL the markers carry has its brackets, parentheses, and whitespace percent-encoded, so nothing the page writes — its markup as much as its text — can close a marker or pose as one. A link carries its URL and its ref, `[text](/path)[e1]`, with the URL shown once per repeated link; an anchor the page gives another role renders as that control instead, with its target after it, `[e12 button "Act" (pressed)](/act)`. Images render as `[image "alt"]`. A cross-site frame renders as `[e40 frame https://host/path cross-site]` … `[/frame]`, its own refs prefixed. A frame the read could not enter, one past its limit of eight frames or three nesting levels, and one whose content it cut each say so on one line, with `scope=e40` to read that frame whole.
 
@@ -189,11 +192,13 @@ Changed: 2 lines added, 1 removed
 The head lines come in this order, each only when it applies:
 
 - `URL:` and `Title:`, or `State: not read` when the page didn't answer.
+- `Challenge: sign-in — a password field`, or another type and signal, when the page needs a person to clear it (see Challenges and the handoff).
 - The action's own lines. `scroll` prints `Scroll: 1200 of 5400 (viewport 900)`. `press` prints where its keys went, `Keys to: [e42] input "Search"`, `Keys to: the page (nothing focused)`, or `Keys to: [e40] frame`, with the ref when Claude's last read of this document returned it. An input action that stopped partway prints `Input: incomplete (the page stopped answering)`, or `Input: incomplete (the field lost focus; click it, then type again)` for `type`. A `tabs new` whose tab closed before its page loaded prints `Tab: the new tab closed before its page loaded; tabs list shows the open tabs`, and the lines around it describe the tab the call began on.
 - `Focus now: [e13] button "Next"`, after a `press` that moved focus and stayed on its document.
 - `Navigated:`, judged from the tab as the head is built: `yes` when the tab is on a new page that has fired its own `DOMContentLoaded` and isn't navigating again, `started (the new page has not finished loading)` when the new page hasn't fired it or a navigation that started during the call is still under way, and `no` otherwise. A navigation stopped at the allowlist, one that turned into a download, or one that Chrome cancelled without loading a new page is over.
 - `Navigation error: net::ERR_NAME_NOT_RESOLVED`, Chrome's name for the failure, after a `tabs new` whose page failed to load.
 - `Opened: t4, a new tab (not the working tab)` or `Opened: t4, a popup window (not the working tab)` for each tab the page opened during the call; `tabs switch` with `target=t4` works there.
+- `Download: denied — report.pdf from https://app.example/export?id=9` for each download that the working tab's page began during the call, at most three, then `… and N more`.
 - `Settled: no — …`, as above.
 - `Changed:`, when the call ended on the document and the tab it started on. After `tabs new`, the new tab counts as the tab it started on, so a navigation that Chrome cancelled, which leaves the tab on its blank first page, prints `Changed: not tracked (read the page first)`.
 - `Dialog (<type>): <message>` for each dialog the page raised, then `Blocked:` and `Blocked by the page:` lines (see The allowlist).
@@ -211,7 +216,7 @@ When the command that acts times out, the call returns `error` with `the action 
 
 **Typing and choosing.** `type` focuses the field by script, selects its content, and inserts the text as one input event, which replaces what was there; a newline in the text doesn't submit a form, and `press Enter` does. It refuses a field that is disabled, read-only, or not a text field. `select` sets a native `<select>` to the first option whose label matches, else whose value does, else the one option whose label matches ignoring case, and dispatches `input` and `change`; for a custom list, Claude clicks the control open and then clicks the option's ref.
 
-**Dialogs** (`alert`, `confirm`, `prompt`) are dismissed and their text appears among the head lines of the next result that carries page text, as `Dialog (<type>): <message>`, made safe the way page text elsewhere in a result is (one line, capped, brackets escaped); `beforeunload` is accepted. Downloads are denied.
+**Dialogs** (`alert`, `confirm`, `prompt`) are dismissed and their text appears among the head lines of the next result that carries page text, as `Dialog (<type>): <message>`, made safe the way page text elsewhere in a result is (one line, capped, brackets escaped); `beforeunload` is accepted. Downloads are denied, and an acting call prints a `Download:` line for each one the page began, three at most, then a count of the rest.
 
 ### Tabs
 
@@ -225,6 +230,66 @@ Tabs: 3
 ```
 
 A tab's kind is `working`, `identity`, `tab` (another tab in the session's window), or `popup` (a tab in another window). Numbers aren't reused, so a recreated window's tabs take new ones. `tabs new` opens `target` in a new tab, through the allowlist, and makes it the working tab. It opens the tab beside the working tab, or else the latest earlier working tab, when that tab is in the session's window, and otherwise beside the identity tab, in whichever window the identity tab is. Opening it brings that window to the front once, as a link that opens a tab does. `tabs switch` makes `target` the working tab without bringing it to the front and prints `Working tab: t3`; input reaches a background tab, though screenshots of one are slow (see Troubleshooting). `tabs close` closes a tab without running its `beforeunload` handlers and prints `Closed: t3`; when that was the working tab, the next call returns to a working tab as when you close it. Claude can't switch to the identity tab or close it.
+
+### Console and network capture
+
+Each of the session's tabs records its console and its network traffic while it belongs to the session, and `console` and `network` print the working tab's records:
+
+- The last 500 console entries: the page's `console` calls, as flat text with their source location (an object logs as `\[object Object\]`), and Chrome's own messages, such as failed loads and blocked content. Uncaught exceptions aren't reported, since Chrome reports them only through its `Runtime` domain, which the daemon keeps off because a page's script can detect it.
+- The last 500 requests that ended, each with its method, URL, resource type, status, MIME type, transferred size, timing, and how it ended. The requests still in flight print after them, unnumbered and at most 20, when the answer isn't cut.
+- Response bodies stay in Chrome's buffer, up to 10 MiB per tab and 1 MiB per response, where a filtered `network` read finds them. Chrome drops bodies past those limits, and a dropped body prints `(body not kept)`.
+
+An entry's text, and a request's MIME type and failure, print with `[`, `]`, and `\` escaped by a backslash, and a URL with its brackets, parentheses, and whitespace percent-encoded, so a record can't pose as another line. The records last across navigations and go when the tab leaves the session or closes. They leave out every request and response header, apart from the values of two challenge headers that the daemon keeps for each main-frame document (`cf-mitigated` and `x-amzn-waf-action`), so cookies and authorization headers aren't stored. They also leave out post bodies, so a password you type during a handoff isn't stored. A cross-site frame's console messages and requests aren't recorded either, apart from the request that loads the frame, which ends `(continued in a cross-site frame)`. URLs are kept verbatim, query strings included, up to their first 2,000 characters for a request and 1,000 for a console entry, and a console entry keeps the 1,000 characters of its text that print.
+
+```
+URL: https://app.example/settings
+Title: Settings
+Console: 3 entries after 0; the tab keeps its last 500
+Next: after=64
+
+[41] log https://app.example/main.js:12:5 saving draft 17
+[42] error https://app.example/main.js:88:13 Error: save failed: 500
+[43] error (chrome network) Failed to load resource: the server responded with a status of 500 (Internal Server Error) https://app.example/api/save
+```
+
+```
+URL: https://app.example/settings
+Title: Settings
+Requests: 1 entry after 0, filter "/api/save"; the tab keeps its last 500 ended
+Next: after=64
+
+[61] POST 500 fetch https://app.example/api/save (application/json, 87 B transferred, 220 ms)
+    {"error":"draft is locked by another editor"}
+```
+
+A request's other endings print as `[63] GET 302 document https://app.example/old (redirect)`, `[64] GET — image https://cdn.example/x.png failed: net::ERR_ABORTED (canceled)`, `(ended by a navigation)`, and `(continued in a cross-site frame)`. A request in flight prints as `[in flight] GET 200 fetch https://app.example/api/poll (3.2 s so far)`, and past 20 of them as `… and 4 more in flight`.
+
+**Reading after a cursor.** One counter in the daemon numbers the entries of both lists across every tab: a console entry as it arrives, and a request as it ends. Each answer's head carries `Next: after=<n>`; pass it back as `after` to see only what came since, including how each request that was in flight at the earlier read ended. A cursor belongs to the action, the tab, and the filter of the read that gave it, so start again from 0 when any of them changes. An answer is cut at 40,000 characters at an entry's boundary and ends with `… 17 more; call again with after=230`. When the tab has dropped entries above the cursor, the head adds `Missed: the tab dropped entries up to [<n>]`, and a cursor above the counter's latest number, as one from before a daemon restart can be, lists every entry kept under `Missed: the daemon restarted since after=<n>`.
+
+**`filter`** keeps the requests whose URL contains the text, case-insensitively, as Chrome reports it or with its whitespace (U+0085 included), brackets, and parentheses percent-encoded as its line prints them, and prints each one's response body under its line when the request is an XHR, a fetch, or a document that finished with a textual MIME type (`text/*`, JSON, XML, JavaScript, form-encoded, or a type ending in `+json` or `+xml`) or none. Each body is cut at 4,000 characters and indented four spaces; a binary body prints `(binary body, <n> bytes)`, and an empty one `(empty body)`. The bodies share the call's deadline, and a list that runs out of time or of its 40,000 characters is cut at the request whose body went unread or unprinted.
+
+### `fetch`
+
+`fetch` GETs a URL from the working tab's isolated world, as the page's own script would, and prints the response:
+
+```
+URL: https://app.example/orders
+Title: Orders
+Fetched: https://app.example/api/orders.json
+Status: 200 OK (application/json, 3214 bytes)
+
+{"orders":[{"id":17,"state":"shipped"}]}
+```
+
+These rules apply:
+
+- It sends only GET requests, with the page's cookies, past the HTTP cache. A same-origin URL gets every cookie, `SameSite=Strict` included; a cross-origin one answers only when its server allows the page's origin under CORS; and a cross-site one carries only its `SameSite=None` cookies. A cross-origin failure tells Claude to navigate to that origin and fetch there.
+- The page's content security policy applies: on a page whose `connect-src` is `'self'`, a fetch to another site fails even when its server allows the page's origin with credentials.
+- It doesn't follow a redirect. `Redirected: not followed; navigate to the URL to follow it through the domain gate` takes the place of `Status:`, without a body, and the redirect's target receives nothing.
+- The domain gate checks the URL's host before anything is sent, as it does for `navigate`; an unlisted host returns `needs_confirmation` with `Blocked: [t1] api.other.example — fetch of https://api.other.example/v1/me (not sent)`. The request goes out under the URL's absolute form, which `Fetched:` prints, so a short form such as `http:api.other.example/v1` reaches the host that the gate checked, whatever `<base href>` the page set. A URL with a user name or password answers `schema_error`, since the page's fetch refuses one.
+- A text body is cut at 40,000 characters under `Body: the first 40000 characters; the response is longer`, or 39999 when the cut would split a character, and its `Status:` line gives the size as `at least <n> bytes`. A binary body prints its type and size alone, as in `Status: 200 OK (application/pdf, 48211 bytes; binary, not shown)`; its bytes are counted up to 10 MiB, and `over 10 MiB` takes the size's place past that. A body without a `Content-Type` prints as text when it decodes as UTF-8 and is counted as binary otherwise, with `no type` in the `Status:` line.
+- It fails with `error` after 20 s, or sooner when the call's deadline leaves less, and when the page navigates during the fetch, since the request may have been sent. A navigation that lands before the request goes out fails the call with nothing sent, and so does a call that would leave the request under 0.5 s.
+- It needs an http(s) page in the working tab, and it only reads: it doesn't settle, print `Changed:`, or check for a challenge.
 
 ## The allowlist
 
@@ -249,7 +314,7 @@ Blocked: [t1] evil.example — navigation to https://evil.example/collect?d=…
 
 The message tells Claude to ask you about that host and then call `policy`: `allow_once` allows it for the session until the daemon restarts, and `allow_always` appends it to the file. The other forms of the line are these:
 
-- `… (not started)` for a `navigate` or `history` whose own URL is unlisted, and `… — a new tab to … (not opened)` for such a `tabs new`; neither touched the page.
+- `… (not started)` for a `navigate` or `history` whose own URL is unlisted, `… — a new tab to … (not opened)` for such a `tabs new`, and `… — fetch of … (not sent)` for such a `fetch`; each left the page as it was.
 - `… — a new tab to …, closed` for a tab a page opened toward an unlisted host, which the gate closes.
 - `… — the tab reached … without a request the gate could see, so it went to about:blank`, or `…, so it was closed` for a new tab. A back-forward cache restore doesn't make a request for the gate to stop, so `history` checks its entry first, and a restore that the page itself starts is caught when it commits. This form always prints as `Blocked by the page:` and leaves the call's outcome as it was.
 
@@ -257,9 +322,41 @@ A refusal that Claude's call didn't lead to, such as a timer redirect between ca
 
 Approving the whole `claudesurf_act` tool in Claude Code's permissions approves `policy` too, so Claude can then allow a host without a permission prompt; the tool description tells it to ask you first.
 
-**Your own browsing in a session tab** goes through the gate as well. A URL you type into a session tab's address bar, or a link you follow there, toward an unlisted host is stopped without a message on screen, and the tab stays where it was. Browse such a site in a tab of your own.
+**Your own browsing in a session tab** goes through the gate as well. A URL you type into a session tab's address bar, or a link you follow there, toward an unlisted host is stopped without a message on screen, and the tab stays where it was. Browse such a site in a tab of your own. During a handoff, a desktop notification names the stopped host (see Challenges and the handoff).
 
 **Service workers.** The session tabs bypass service workers, so every navigation reaches the gate, and they don't prerender pages. A site's offline pages, and routes that only its service worker serves, fail to load in a session tab; your own tabs keep their workers.
+
+## Challenges and the handoff
+
+After a `page` read that renders, and after an acting call that the domain gate didn't stop before it started, the daemon checks the working tab for a page that a person has to clear. It judges strictly, by a short list of signals for each of three types, and the first match in this order decides:
+
+- **Bot check** — the page's own response carries Cloudflare's `cf-mitigated: challenge` or AWS WAF's `x-amzn-waf-action: challenge` or `captcha`; a visible, unsolved CAPTCHA widget from Cloudflare Turnstile, reCAPTCHA, hCaptcha, DataDome, or Arkose sits on the page; or HUMAN's press-and-hold element (`#px-captcha`) is visible.
+- **Two-factor** — a visible field with `autocomplete="one-time-code"`, a visible field whose name or label names a sign-in code (`otp`, `mfa`, `verification code`, and the like), or a row of 4 to 8 single-character boxes within one document or shadow root. A postal code, a card's security code, and a promo or gift code don't count.
+- **Sign-in** — a visible password field.
+
+A field counts when it is visible, at least 10 × 10 CSS pixels, and not wholly above or left of the page, where pages park autofill traps. A widget counts when it is visible, at least 20 × 20, and its response field hasn't filled; one inside a frame of another site counts only while that frame is visible and at least 20 × 20 too. A DataDome or Arkose widget lacks a solved state that the daemon can read, so it counts once per document, in the first `needs_human` result that reports it. The scan covers the document, its open shadow roots, and each same-origin frame that counts as a field would, and checks each widget frame that it finds there by the same rules, so a widget served from the page's own site, such as reCAPTCHA on Google's own pages, counts too. A page that doesn't match any of these reads as ordinary content. So does a challenge inside a frame of another origin, other than the widgets above, and a page waiting on a passkey or security-key dialog, which Chrome draws outside the page. A paging read, `info`, `screenshot`, `console`, `network`, `fetch`, `policy`, and the `tabs` ops other than `new` don't check.
+
+A challenge that may clear itself gets a wait: after an acting call lands on Cloudflare's header challenge, AWS WAF's `challenge`, or DataDome's device check, the call waits up to 10 s for the check to pass and reload the page, and reports on the page it reloads to. A check of an unsolved widget waits up to 3 s for its response field to fill, since Turnstile can solve itself. Each wait runs once per document, on the first call with time left for it, so later calls on a check that needs a person answer at once.
+
+**`needs_human`.** On a match the call returns `needs_human` with its full result, and the head gains a line after `URL:` and `Title:`, such as `Challenge: sign-in — a password field`. The other forms are `bot check — Cloudflare (the page's cf-mitigated header)`, `bot check — AWS WAF (the page's x-amzn-waf-action header)`, `bot check — reCAPTCHA (a visible widget)` and the same form with each other widget's name, `bot check — DataDome (a device check)`, `bot check — HUMAN (a press-and-hold element)`, `two-factor — a one-time-code field`, `two-factor — a verification-code field`, and `two-factor — a row of code boxes`. The message tells Claude to tell you which window needs you, by the session's name, to end its turn, and to read the page again once you say it is done. It also says that the page stays readable and actable, so on a false alarm Claude carries on, and that a sign-in through a host the allowlist lacks can go through a tab you open yourself (Ctrl+T), which shares the cookies. The result opens a handoff, which lasts until the session's next call other than `policy`.
+
+**Notifications.** The daemon sends desktop notifications through `notify-send`:
+
+| Event | Urgency | Summary | Body |
+|---|---|---|---|
+| `needs_human` | critical | `ClaudeSurf: <label> needs you` | `A sign-in on <host> is waiting in that session's window.`, or `A bot check` or `A two-factor code` in its place |
+| A refusal during a handoff | normal | `ClaudeSurf stopped <host>` | `In <label>. Sign in from a tab you open yourself (Ctrl+T), which shares the cookies, or ask Claude to allow <host>.` |
+| A restart after a run that launched the browser | normal | `ClaudeSurf restarted` | `Its browser closed, with any session windows it had open. Each Claude session reopens its window on its next call.` |
+
+`<label>` is the session's name in quotes, cut at 60 characters, or `an unnamed session`, and `<host>` is the page's host, or the stopped one for a refusal, cut at 80 characters; a notification doesn't carry anything else from the page, so a page's title never reaches the desktop. A `critical` notification stays on screen until you dismiss it. The daemon sends one `needs_human` notification per session, challenge type, and page in 10 minutes, comparing the page's URL by its origin and path, since sign-in and challenge retries change the query on each attempt; the limit holds back the notification alone, and the call still returns `needs_human`.
+
+**The taskbar.** Opening the handoff also marks the session's window as wanting attention with both the ICCCM urgency bit (`xdotool`) and EWMH's demands-attention state (`wmctrl`), since taskbars differ in which of the two they read; closing the handoff clears both. GNOME's and Cinnamon's window managers keep demands-attention off a window that is in plain view, which then carries the urgency bit alone. The daemon picks the window among the browser's X windows as the one whose title starts with the working tab's title followed by ` - `. It skips the mark, with an info line in the journal, on Wayland without `DISPLAY`, for an untitled page, without `xdotool`, and unless exactly one window matches; without `wmctrl` the window gets the urgency bit alone. A window's title is its active tab's, so when the working tab isn't its window's active tab, as after `tabs switch`, the mark is skipped or lands on another window whose active tab carries the same title.
+
+**Refusals during a handoff.** While a handoff is open, a navigation that the domain gate stops in one of the session's tabs, yours included, sends the refusal notification above, once per host and three times at most per session in 10 minutes, so a page that cycles through hosts can't flood the desktop. The gate itself is unchanged, and the refusal still reaches Claude's next call as a `Blocked by the page:` line.
+
+**Closing.** The handoff closes on the session's next call other than `policy`, which Claude calls when you allow a host partway through a sign-in; a call that fails before the session's queue takes it, such as a `schema_error` or a failed browser launch, leaves it open too. The closing call clears the window's marks, and when it returns `needs_human` again it opens a fresh handoff. The handoff doesn't lock the session, and a daemon restart drops it.
+
+**Without a notification server.** A second OS user whose session bus lacks a notification server doesn't get notifications: `notify-send` fails there, the journal logs the failure, and Claude tells you in chat, which the `needs_human` message asks it to do anyway. Without `notify-send`, `xdotool`, or `wmctrl` the daemon goes without that tool and logs its absence once.
 
 ## The action log
 
@@ -306,10 +403,10 @@ returns `{"status":"ok","browser":"running"|"none","sessions":N}`.
 
 ```bash
 npm --prefix server test                              # everything; live tests skip without Chrome
-CLAUDESURF_LIVE_HEADFUL=1 npm --prefix server test    # adds the headful window test and act cases
+CLAUDESURF_LIVE_HEADFUL=1 npm --prefix server test    # adds the headful window test, act cases, and taskbar case
 ```
 
-Live tests run a headless Chrome against a temporary profile. The headful run adds the window test and four act cases: `type` into a cross-site frame in a background tab, a screenshot after `tabs switch`, `tabs new` landing in its own session's window, and a trusted click after `tabs switch`. They need a display, and use `xdotool` for their focus and window assertions.
+Live tests run a headless Chrome against a temporary profile. The headful run adds the window test, four act cases (`type` into a cross-site frame in a background tab, a screenshot after `tabs switch`, `tabs new` landing in its own session's window, and a trusted click after `tabs switch`), and the taskbar case, which checks the handoff's marks on the session window in plain view and minimized. They need a display, and use `xdotool` for their focus and window assertions; the taskbar case also reads the marks back with `xprop`, and needs `wmctrl` to set demands-attention.
 
 ## Troubleshooting
 
@@ -317,8 +414,10 @@ Live tests run a headless Chrome against a temporary profile. The headful run ad
 - **`schema_error` for an action or argument the tool description lists** — the daemon is still running older code; restart it (see Upgrading). A Claude Code session started before the upgrade lists the old actions and refuses the new ones itself; restart Claude Code there.
 - **`setup_error`: profile held by another Chrome** — another Chrome has the profile open. Close it, or point `CLAUDESURF_PROFILE_DIR` elsewhere.
 - **`setup_error`: no `DISPLAY`** — add the drop-in above, or run Claude Code from a desktop session so the bridge can supply the display.
-- **"navigate first"** — `page`, `click`, `scroll`, `type`, `press`, `select`, and `history` work on http(s) pages only; a fresh window is on the session page until the first `navigate` or `tabs new`.
-- **`needs_confirmation`** — the domain gate stopped a navigation to a host the allowlist lacks. Approve the host when Claude asks, or add it to the allowlist file.
+- **"navigate first"** — `page`, `click`, `scroll`, `type`, `press`, `select`, `history`, and `fetch` work on http(s) pages only; a fresh window is on the session page until the first `navigate` or `tabs new`.
+- **`needs_confirmation`** — the domain gate stopped a navigation or a `fetch` to a host the allowlist lacks. Approve the host when Claude asks, or add it to the allowlist file.
+- **Notifications don't appear** — the daemon sends them with `notify-send`, which needs a notification server on the session bus, and the journal logs each failure. Check that `notify-send` is installed (`libnotify-bin` on Debian and Ubuntu), that a notification server runs on your session bus, and that the daemon's environment carries `DBUS_SESSION_BUS_ADDRESS`: the bridge's value fills in for a handoff's notifications, but the restart announcement goes out before any request, under the daemon's own environment. A second OS user without a notification server hears about a handoff from Claude in chat.
+- **`needs_human` keeps coming back** — a sign-up or password-change page shows a password field, so it reads as a sign-in, and every rendering read and acting call on it returns `needs_human`. A site that shows a sign-in form on every page, in a header or a sidebar, does the same on each page. The 10-minute limit keeps the desktop to one notification per page, and the result is complete, so Claude can carry on.
 - **A session tab won't load a site you typed** — the domain gate applies to your own navigation in a session tab; browse the site in a tab of your own, or add it to the allowlist.
 - **A site's offline page, or a route its service worker serves, fails in a session tab** — the session tabs bypass service workers; open it in a tab of your own.
 - **`unsettled` on every call** — the page keeps changing or keeps requests open, as a page that polls or streams does. The result is complete, and its `Settled:` line says what was busy; each acting call on such a page takes about 5 s.
@@ -328,7 +427,7 @@ Live tests run a headless Chrome against a temporary profile. The headful run ad
 
 ## Upgrading
 
-The daemon and each bridge keep the code they started with, apart from what is read from disk as it's needed: Chrome loads the session page, `server/static/session.html`, each time the daemon opens a session tab, and the daemon builds the page renderer from `server/page/render.js`, its three libraries, and `server/page/state.js`, which it splices in, at its first render and keeps it. The scripts that click, type, choose an option, and list hidden controls take their copy of `state.js` as the daemon starts. So after a pull, an old daemon opens its new session tabs on the new session page, and one that hadn't rendered a page yet renders with the new renderer and `state.js` but clicks and types with the old `state.js`. An old daemon answers a call to an action or an argument it lacks, such as `since`, with `schema_error`. A Claude Code session started before the pull keeps the old tool descriptions, and its bridge refuses the new actions and arguments with `schema_error` itself. After pulling a new version, restart each OS user's daemon: `systemctl --user restart claudesurf`, or stop and start `node server/daemon.js` by hand. Then restart Claude Code in each session that was running, so each starts a new bridge. A daemon restart closes the browser and every session window and drops the `allow_once` grants; each session's next call other than `policy` opens a fresh window. An allowlist file that doesn't exist yet starts empty, so Claude asks you about each host it needs: once for a host saved with `allow_always`, and in each session for one granted with `allow_once`.
+The daemon and each bridge keep the code they started with, apart from what is read from disk as it's needed: Chrome loads the session page, `server/static/session.html`, each time the daemon opens a session tab, and the daemon builds the page renderer from `server/page/render.js`, its three libraries, and `server/page/state.js` and `server/page/collapse.js`, which it splices in, at its first render and keeps it. The scripts that type, choose an option, and list hidden controls take their copies of `state.js` and `collapse.js` as the daemon starts, the one that clicks takes `state.js` alone, and the scripts that check for a challenge take theirs of `state.js` and `nearest.js`. So after a pull, an old daemon opens its new session tabs on the new session page, and one that hadn't rendered a page yet renders with the new renderer, `state.js`, and `collapse.js`, but clicks and types with the old ones. An old daemon answers a call to an action or an argument it lacks, such as `since`, with `schema_error`. A Claude Code session started before the pull keeps the old tool descriptions, and its bridge refuses the new actions and arguments with `schema_error` itself. After pulling a new version, restart each OS user's daemon: `systemctl --user restart claudesurf`, or stop and start `node server/daemon.js` by hand. Then restart Claude Code in each session that was running, so each starts a new bridge. A daemon restart closes the browser and every session window and drops the `allow_once` grants, any open handoff, and the console and network records; each session's next call other than `policy` opens a fresh window. When the previous run had launched the browser, the restarted daemon announces the restart once with a `ClaudeSurf restarted` notification (see Challenges and the handoff). An allowlist file that doesn't exist yet starts empty, so Claude asks you about each host it needs: once for a host saved with `allow_always`, and in each session for one granted with `allow_once`.
 
 ## Migrating from the extension-based version
 

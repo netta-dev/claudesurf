@@ -8,7 +8,7 @@ const input = require('../server/input');
 const retained = require('../server/retained');
 const { OutcomeError } = require('../server/action-support');
 const { ConnectionClosedError } = require('../server/cdp');
-const { navigatedSession, readPayload, recordingLog, refsIn, waitFor } = require('./helpers');
+const { navigatedSession, frameAt, readPayload, recordingLog, refsIn, waitFor } = require('./helpers');
 const { attachFrame } = require('./frame-setup');
 const { bareNode } = require('./fixtures/ax/nodes');
 
@@ -1742,4 +1742,81 @@ test("a read whose region render meets a closed pipe fails with the pipe's error
     return new Promise(() => {});
   });
   await assert.rejects(call(), (e) => e.name === 'ConnectionClosedError' || /browser connection closed|target .* is gone/.test(e.message));
+});
+
+test("a rendering read detects a challenge and prints its Challenge: line right after the state lines, and a since read does too", async (t) => {
+  const { call, fake, session } = await setup(t, page([control('button', 'Sign in')], { detect: { password: true }, title: 'Sign in' }));
+  const whole = await call({ maxChars: 20 });
+  assert.deepStrictEqual(whole.challenge, { type: 'sign-in', signal: 'a password field', clears: false, title: 'Sign in' });
+  assert.match(whole.payload, /^URL: http:\/\/a\.test\/\nTitle: Sign in\nChallenge: sign-in — a password field\n\[Showing characters 0–\d+ of /, 'ahead of the truncation line');
+  const since = await call({ since: true });
+  assert.deepStrictEqual(since.challenge, whole.challenge);
+  assert.match(since.payload, /^URL: http:\/\/a\.test\/\nTitle: Sign in\nChallenge: sign-in — a password field\nSince: /);
+  const detections = () => fake.callsTo('Runtime.callFunctionOn').filter((c) => /claudesurfDetect/.test(c.params.functionDeclaration)).length;
+  const before = detections();
+  const paged = await call({ maxChars: 20, offset: Number(/offset=(\d+)/.exec(whole.payload)[1]) });
+  assert.strictEqual(detections(), before, 'a paging read slices the retained render without detecting');
+  assert.strictEqual(paged.challenge, undefined);
+  assert.ok(!paged.payload.includes('Challenge:'));
+  assert.strictEqual(session.refsTarget, session.workingTargetId);
+});
+
+test("detection on a rendering read runs under a deadline 2 s short of the request's", async (t) => {
+  const { call, sessions } = await setup(t, page([control('button', 'Sign in')], { detect: { password: true }, title: 'Sign in' }));
+  const spy = t.mock.method(sessions, 'callInWorld');
+  const deadline = Date.now() + 30_000;
+  assert.ok((await call({ deadline })).challenge);
+  const scans = spy.mock.calls.filter((c) => /function claudesurfDetect/.test(c.arguments[1]));
+  assert.deepStrictEqual(scans.map((c) => c.arguments[3]), [{ deadline: deadline - 2_000 }]);
+});
+
+test("a commit between detection and the state lines fails the read as a changed document, and a detection that fails costs the Challenge: line alone", async (t) => {
+  const log = recordingLog();
+  const { call, fake } = await setup(t, page([], { detect: { password: true } }), { log });
+  fake.site['http://a.test/next'] = page([], { title: 'Next' });
+  const original = fake.handlers.get('Runtime.callFunctionOn');
+  let scanned = false;
+  fake.handle('Runtime.callFunctionOn', (params, sid, f) => {
+    const answer = original(params, sid, f);
+    if (/claudesurfDetect/.test(params.functionDeclaration)) scanned = true;
+    else if (scanned && /claudesurfScroll/.test(params.functionDeclaration)) {
+      scanned = false;
+      fake.emit('Page.frameNavigated', { frame: { id: fake.bySession(sid).targetId, url: URL, loaderId: 'moved' }, type: 'Navigation' }, sid);
+    }
+    return answer;
+  });
+  await assert.rejects(call(), (e) => e instanceof OutcomeError && /changed/.test(e.envelope.message), 'the render no longer describes the document');
+  fake.handle('Runtime.callFunctionOn', original);
+  fake.site[URL].detect = { throws: 'no answer' };
+  const failed = await call();
+  assert.strictEqual(failed.challenge, null);
+  assert.ok(!failed.payload.includes('Challenge:'));
+  assert.match(log.lines.info.join('\n'), /detecting a challenge on T\d+ failed/);
+});
+
+test('a read that fails after detection leaves a widget without a response field unreported, and the next read to keep it spends it on the document', async (t) => {
+  const { call, fake, sessions, session } = await setup(t, page([]));
+  await frameAt({ fake, sessions }, fake.targets.get(session.workingTargetId), 'https://client-api.arkoselabs.com/fc/gc/?token=x', { field: 'absent' });
+  const original = fake.handlers.get('Runtime.callFunctionOn');
+  let checked = false;
+  fake.handle('Runtime.callFunctionOn', (params, sid, f) => {
+    if (/function claudesurfVisible/.test(params.functionDeclaration)) checked = true;
+    else if (checked && /function claudesurfScroll/.test(params.functionDeclaration)) {
+      fake.handle('Runtime.callFunctionOn', original);
+      throw { code: -32603, message: 'Internal error' };
+    }
+    return original(params, sid, f);
+  });
+  await assert.rejects(call());
+  const arkose = { type: 'bot check', signal: 'Arkose (a visible widget)', clears: false, title: 'A' };
+  assert.deepStrictEqual((await call()).challenge, arkose, 'the failed read kept nothing');
+  assert.strictEqual((await call()).challenge, null, 'the kept read spent it on this document');
+});
+
+test('a fresh read whose offset is past the end fails without spending a widget that has no response field', async (t) => {
+  const { call, fake, sessions, session } = await setup(t, page([]));
+  await frameAt({ fake, sessions }, fake.targets.get(session.workingTargetId), 'https://client-api.arkoselabs.com/fc/gc/?token=x', { field: 'absent' });
+  const { fail } = await outcome(call({ offset: 1_000_000 }));
+  assert.match(fail.message, /^offset 1000000 is past the end of the page text/);
+  assert.strictEqual((await call()).challenge.signal, 'Arkose (a visible widget)');
 });

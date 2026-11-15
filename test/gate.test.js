@@ -257,6 +257,8 @@ test('claim leaves a second working tab unowned and disarmed, bypass set back be
     ['Network.setBypassServiceWorker', { bypass: false }],
     ['Page.setPrerenderingAllowed', { isAllowed: true }],
     ['Network.disable', {}],
+    ['Console.disable', {}],
+    ['Log.disable', {}],
   ]);
   assert.strictEqual(await raise(fake, opened, 'http://evil.test/'), 'continue');
   fake.navigateTarget(opened, 'http://elsewhere.test/');
@@ -286,7 +288,7 @@ test('a page-opened tab that the window-state drop disowns is disarmed, its requ
   await waitFor(() => session.windowId === null);
   assert.deepStrictEqual([record.sessionId, record.role, record.armed], [null, null, false], 'disowned');
   assert.deepStrictEqual(fake.calls.slice(before).filter((c) => c.sessionId === popup.sessionId).map((c) => c.method), [
-    'Fetch.disable', 'Network.setBypassServiceWorker', 'Page.setPrerenderingAllowed', 'Network.disable',
+    'Fetch.disable', 'Network.setBypassServiceWorker', 'Page.setPrerenderingAllowed', 'Network.disable', 'Console.disable', 'Log.disable',
   ]);
   assert.strictEqual(requests.busy(record).count, 0, "the tab's requests are dropped");
   assert.strictEqual(await raise(fake, popup, 'http://evil.test/'), 'continue');
@@ -904,4 +906,57 @@ test("a tabs new whose tab's Fetch.enable rejected answers error without a Page.
   assert.strictEqual(fake.callsTo('Target.closeTarget').filter((c) => c.params.targetId === tab.targetId).length, 1);
   assert.ok(!fake.calls.some((c) => c.method === 'Page.navigate' && c.sessionId === tab.sessionId));
   assert.deepStrictEqual(session.takeNotes(), ['t3 was closed because it could not be put under the domain gate']);
+});
+
+test("onRefusal hears the handler's and the backstop's refusals, after the gate has answered or acted, and never the pre-check's", async (t) => {
+  const ctx = await setup(t);
+  const { fake, gate, session, working } = ctx;
+  const heard = [];
+  gate.onRefusal = (refusedIn, entry) => {
+    const answered = fake.calls.some((c) => c.method === 'Fetch.failRequest' && c.sessionId === working.sessionId);
+    const blanked = fake.calls.some((c) => c.method === 'Page.navigate' && c.params.url === 'about:blank');
+    heard.push({ session: refusedIn.id, kind: entry.kind, host: entry.host, answered, blanked });
+  };
+  await pageGoes(ctx, working, 'http://fake.test/');
+  assert.strictEqual(await raise(fake, working, 'http://evil.test/'), 'fail Aborted');
+  await waitFor(() => heard.length === 1);
+  assert.deepStrictEqual(heard[0], { session: 's1', kind: 'navigation', host: 'evil.test', answered: true, blanked: false }, 'after the gate failed the request');
+  fake.emit('Page.frameNavigated', { frame: { id: working.targetId, url: 'http://restored.test/' }, type: 'BackForwardCacheRestore' }, working.sessionId);
+  await waitFor(() => heard.length === 2);
+  assert.deepStrictEqual(heard[1], { session: 's1', kind: 'restore', host: 'restored.test', answered: true, blanked: true }, 'after the backstop sent the tab away');
+  assert.ok(gate.check('http://precheck.test/', session, 'navigation'));
+  assert.ok(gate.check('http://precheck.test/', session, 'fetch'));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(heard.length, 2, 'a pre-check records nothing and calls nothing');
+});
+
+test('a gate without onRefusal records its refusals and logs nothing about announcing them', async (t) => {
+  const log = recordingLog();
+  const ctx = await setup(t, { log });
+  const { fake, gate, session, working } = ctx;
+  assert.strictEqual(gate.onRefusal, null);
+  await pageGoes(ctx, working, 'http://fake.test/');
+  assert.strictEqual(await raise(fake, working, 'http://evil.test/'), 'fail Aborted');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepStrictEqual(session.refusals.map((e) => e.host), ['evil.test']);
+  assert.deepStrictEqual(log.lines.warn.filter((l) => /announcing a refusal/.test(l)), []);
+});
+
+test("an onRefusal that throws is logged at warn and leaves the gate's answer and the refusal in place", async (t) => {
+  const log = recordingLog();
+  const ctx = await setup(t, { log });
+  const { fake, gate, session, working } = ctx;
+  gate.onRefusal = () => { throw new Error('the handoff broke'); };
+  await pageGoes(ctx, working, 'http://fake.test/');
+  assert.strictEqual(await raise(fake, working, 'http://evil.test/'), 'fail Aborted');
+  await waitFor(() => log.lines.warn.some((l) => /announcing a refusal: Error: the handoff broke/.test(l)));
+  assert.deepStrictEqual(session.refusals.map((e) => e.host), ['evil.test']);
+});
+
+test('the pre-check takes the fetch kind, whose entry the call returns without recording it', async (t) => {
+  const { gate, session } = await setup(t);
+  const entry = gate.check('https://api.other.test/v1/me', session, 'fetch');
+  assert.deepStrictEqual({ kind: entry.kind, how: entry.how, host: entry.host, url: entry.url }, { kind: 'fetch', how: 'not started', host: 'api.other.test', url: 'https://api.other.test/v1/me' });
+  assert.strictEqual(gate.check('http://fake.test/x', session, 'fetch'), null);
+  assert.deepStrictEqual(session.refusals, []);
 });

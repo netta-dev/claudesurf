@@ -83,10 +83,10 @@ async function history({ sessions, gate }, session, { op }, deadline) {
   return finishAction(sessions, session, t, before, { deadline, navigation: waited });
 }
 
-// Resolves with the result of a navigation that the gate refused before it started:
-// the state lines of the tab `t`, which stays where it is, and the gate's entry of
-// `kind` (Gate.check) as `blocked`. Resolves with null when the gate lets `url` through
-// or the call runs without a gate.
+// Resolves with the result of a call whose URL the gate refuses before the call sends
+// its request (a navigation, a new tab, or a fetch): the state lines of the tab `t`,
+// which stays where it is, and the gate's entry of `kind` (Gate.check) as `blocked`.
+// Resolves with null when the gate lets `url` through or the call runs without a gate.
 async function precheck(gate, sessions, session, t, url, kind, opts) {
   const refused = gate && gate.check(url, session, kind);
   if (!refused) return null;

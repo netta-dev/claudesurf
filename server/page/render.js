@@ -17,6 +17,7 @@
 // empty.
 function claudesurfRender(options, descriptors, ...nodes) {
   // @include state.js
+  // @include collapse.js
 
   const REF_ATTR = 'data-cs-ref';
   const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT']);
@@ -77,7 +78,7 @@ function claudesurfRender(options, descriptors, ...nodes) {
   // clone's text nodes are stripped as they are cloned.
   const RESERVED = /[\0\uE000]/g;
   const plain = (value) => (value || '').replace(RESERVED, '');
-  const collapse = (value) => plain(value).replace(/\s+/g, ' ').trim();
+  const collapse = (value) => claudesurfCollapse(plain(value));
 
   function cap(value) {
     const text = collapse(value);
@@ -306,16 +307,19 @@ function claudesurfRender(options, descriptors, ...nodes) {
     return String(count).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   }
 
-  // A URL of the unit's own document renders as its path, any other absolute; one too
-  // long to be navigable renders as its length, and the ref stays clickable. A URL the
-  // parser refuses renders as the page wrote it, with its whitespace collapsed.
+  // Returns absolute()'s `href` as a marker prints it. A URL of the unit's own document
+  // prints as its path; any other URL prints in absolute form. A URL that is too long to
+  // navigate to prints as its length, and the ref stays clickable. A URL that the parser
+  // refuses renders as the page wrote it, with its whitespace collapsed.
   function linkTarget(href) {
-    // The URL is collapsed before it is measured, as render.js collapses a frame's
-    // URL, so the two print the same length for the same URL.
+    // The URL is collapsed to be measured, as server/render.js's markerUrl collapses a
+    // frame's URL, so the two print the same length for the same URL. The parse takes
+    // it uncollapsed, since an opaque path such as a mailto: one keeps its runs of
+    // spaces on the index line.
     const text = collapse(href);
     if (/^data:/i.test(text) || text.length > maxUrl) return `url omitted: ${grouped(text.length)} chars`;
     try {
-      const url = new URL(text, document.baseURI);
+      const url = new URL(href, document.baseURI);
       return safeUrl(url.origin === location.origin ? `${url.pathname}${url.search}${url.hash}` : url.href);
     } catch {
       return safeUrl(text);
@@ -329,7 +333,7 @@ function claudesurfRender(options, descriptors, ...nodes) {
   // them, since a newline would break the line that the marker sits on. action-support.js
   // holds the daemon's copy of this rule, for the URLs that the daemon prints itself.
   function safeUrl(url) {
-    return url.replace(/[()[\]\s]/g, (c) => URL_ESCAPES[c] || encodeURIComponent(c));
+    return url.replace(/[()[\]\s\u0085]/g, (c) => URL_ESCAPES[c] || encodeURIComponent(c));
   }
 
   // The absolute form of a link's target: what the links index carries and what

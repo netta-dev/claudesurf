@@ -1,15 +1,24 @@
 // The daemon's paths (the command socket, the browser profile, the browser record, the
-// allowlist, and the action log) and the graphical variables that the bridge forwards;
-// the bridge takes the socket path from here too. Each path follows its override, so a
+// allowlist, and the action log); the graphical variables that the bridge forwards; and
+// the XAUTHORITY check that the browser's and the desktop tools' environments share.
+// The bridge takes the socket path from here too. Each path follows its override, so a
 // worktree daemon started with CLAUDESURF_SOCKET, CLAUDESURF_PROFILE_DIR,
 // CLAUDESURF_POLICY_FILE, and CLAUDESURF_ACTION_LOG uses its own socket, profile,
 // record, allowlist, and log.
+const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
 // The bridge sends these from Claude Code's environment; the daemon uses them for
 // the browser when its own environment has no display.
 const GRAPHICAL_VARS = ['DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'DBUS_SESSION_BUS_ADDRESS'];
+
+function dropUnreadableXauthority(env) {
+  if (env.XAUTHORITY) {
+    try { fs.accessSync(env.XAUTHORITY, fs.constants.R_OK); } catch { delete env.XAUTHORITY; }
+  }
+  return env;
+}
 
 // Unix socket, 0600 inside the 0700 per-user runtime directory; only this OS user can
 // reach it.
@@ -50,4 +59,4 @@ function browserRecordPath() {
   return path.join(path.dirname(sock), base + '.browser.json');
 }
 
-module.exports = { daemonSocketPath, profileDir, browserRecordPath, policyFile, actionLogPath, GRAPHICAL_VARS };
+module.exports = { daemonSocketPath, profileDir, browserRecordPath, policyFile, actionLogPath, GRAPHICAL_VARS, dropUnreadableXauthority };

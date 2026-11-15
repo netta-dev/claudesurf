@@ -1,12 +1,7 @@
-// Shared by the handlers: the error that carries an envelope, the state lines that every
-// payload starts with, the sanitizers for page text on a payload line, the
-// working-target lookup, the http check, the load wait's budget, a wait cut at a
-// deadline, the page-state read, the object-group release, and the page-side scripts
-// as source.
-
 const fs = require('fs');
 const path = require('path');
 const envelope = require('./envelope');
+const { ConnectionClosedError } = require('./cdp');
 const { SetupError } = require('./browser');
 const { isWeb } = require('./policy');
 
@@ -24,6 +19,10 @@ const URL_MAX = 200;
 // strips from the finished markdown. Every page-controlled string is stripped of both,
 // there and here.
 const RESERVED = /[\0\uE000]/g;
+// A run of whitespace or line terminators, which a one-line field collapses to one
+// space; \s leaves out U+0085, which network.js's body lines break at too.
+// server/page/collapse.js holds the page scripts' copy of the rule.
+const SPACES = /[\s\u0085]+/g;
 // The margin that a load wait leaves before the request deadline, so the page state that
 // follows it still has time to be read.
 const LOAD_MARGIN_MS = 2_000;
@@ -55,7 +54,7 @@ const URL_ESCAPES = { '(': '%28', ')': '%29' };
 // encodeURIComponent leaves the parentheses alone and encodes the rest, multi-byte
 // whitespace included. server/page/render.js holds the page script's copy of the rule.
 function safeUrl(url) {
-  return url.replace(RESERVED, '').replace(/[()[\]\s]/g, (c) => URL_ESCAPES[c] || encodeURIComponent(c));
+  return url.replace(RESERVED, '').replace(/[()[\]\s\u0085]/g, (c) => URL_ESCAPES[c] || encodeURIComponent(c));
 }
 
 // Returns page text made safe for a header line: the characters that the renderer
@@ -64,7 +63,7 @@ function safeUrl(url) {
 // or open a marker. The text isn't capped, since a page may legitimately set a long
 // title.
 function safeText(text) {
-  return (text || '').replace(RESERVED, '').replace(/\s+/g, ' ').trim().replace(/[\\[\]]/g, '\\$&');
+  return (text || '').replace(RESERVED, '').replace(SPACES, ' ').trim().replace(/[\\[\]]/g, '\\$&');
 }
 
 // Returns page text as one bounded field, such as a marker's name, a tab's title, or a
@@ -73,22 +72,36 @@ function safeText(text) {
 // and then brackets and backslashes are escaped, so the field can't close the marker it
 // sits in or open one. The cap counts the page's characters, not the escapes.
 function cappedText(text, max = LABEL_MAX) {
-  const collapsed = (text || '').replace(RESERVED, '').replace(/\s+/g, ' ').trim();
-  const cut = collapsed.length > max ? `${collapsed.slice(0, codePointBoundary(collapsed, max - 1))}…` : collapsed;
-  return cut.replace(/[\\[\]]/g, '\\$&');
+  return collapsedText(text, max).replace(/[\\[\]]/g, '\\$&');
+}
+
+// Returns page text stripped, collapsed, and cut as cappedText does, without the
+// escapes, for a store that prints it later: cappedText(collapsedText(text, max), max)
+// equals cappedText(text, max).
+function collapsedText(text, max = LABEL_MAX) {
+  return cutText((text || '').replace(RESERVED, '').replace(SPACES, ' ').trim(), max);
+}
+
+function letters(word) {
+  return String(word || '').toLowerCase().replace(/[^a-z]/g, '');
 }
 
 // Returns a URL made safe by safeUrl and cut at URL_MAX with an ellipsis, for a line
 // that names a page rather than links to it.
 function cappedUrl(url) {
-  const safe = safeUrl(url || '');
-  return safe.length <= URL_MAX ? safe : `${safe.slice(0, codePointBoundary(safe, URL_MAX - 1))}…`;
+  return cutText(safeUrl(url || ''), URL_MAX);
 }
 
-// Steps a cut back so it never splits a surrogate pair, whose lone half renders as a
-// replacement character: cappedText cuts a field at its cap, cappedUrl a URL at
-// URL_MAX, and render.js a region at max_chars and a frame at its cap. The page
-// scripts hold their own copies, since they run in the browser.
+// Returns `text` whole when it has at most `max` characters; otherwise returns its first
+// `max - 1` characters and an ellipsis. Cuts one character sooner if the cut would split
+// a surrogate pair.
+function cutText(text, max) {
+  return text.length > max ? `${text.slice(0, codePointBoundary(text, max - 1))}…` : text;
+}
+
+// Returns a cut index that doesn't split a surrogate pair. An unpaired surrogate
+// renders as a replacement character. The page scripts carry copies of this function
+// because they run in the browser.
 function codePointBoundary(text, index) {
   if (index > 0 && index < text.length) {
     const code = text.charCodeAt(index);
@@ -105,6 +118,14 @@ function workingTarget(sessions, session) {
 
 function requireHttp(t) {
   if (!isWeb(t.url)) fail(envelope.error(NAVIGATE_FIRST));
+}
+
+function pipeClosed(sessions, e) {
+  return e instanceof ConnectionClosedError || Boolean(sessions.conn && sessions.conn.closed);
+}
+
+function pipeClosedOrTabGone(sessions, t, e) {
+  return pipeClosed(sessions, e) || sessions.target(t.targetId) !== t;
 }
 
 // Returns the milliseconds that a load wait of `limit` gets: cut to the deadline less the
@@ -124,8 +145,8 @@ function within(promise, deadline) {
 // Returns the page script `name` as source: one function declaration, with each
 // `// @include <file>` line inside it replaced by that file's content, so the scripts
 // that judge an element's state share one copy of state.js, those that find the
-// focused element one copy of focused.js, and those that compare whitespace-collapsed
-// text one copy of collapse.js.
+// focused element one copy of focused.js, and those that collapse whitespace one copy
+// of collapse.js.
 function pageScript(name) {
   const source = fs.readFileSync(path.join(PAGE_DIR, name), 'utf8');
   return source.replace(/^[ \t]*\/\/ @include (\S+)\n/gm, (line, file) => fs.readFileSync(path.join(PAGE_DIR, file), 'utf8'));
@@ -178,6 +199,9 @@ const SETTLE_SOURCE = pageScript('settle.js');
 const EDIT_SOURCE = pageScript('edit.js');
 const SELECT_SOURCE = pageScript('select.js');
 const FOCUSED_SOURCE = pageScript('focused.js');
+const DETECT_SOURCE = pageScript('detect.js');
+const VISIBLE_SOURCE = pageScript('visible.js');
+const FETCH_SOURCE = pageScript('fetch.js');
 
 // Resolves with the target's url, title, and scroll position: the scroll script, when
 // called with no arguments, reports them without scrolling.
@@ -200,4 +224,4 @@ function releaseObjects(sessions, targetId, objectGroup, deadline) {
     .catch((e) => sessions.log.debug(`releasing ${objectGroup}: ${e.message}`));
 }
 
-module.exports = { OutcomeError, fail, stateLines, codePointBoundary, workingTarget, requireHttp, loadBudget, within, TIMED_OUT, pageState, currentStateLines, releaseObjects, renderSource, LABEL_MAX, URL_MAX, RESERVED, WORKING_TAB_GONE, WALK_SOURCE, CLICK_SOURCE, SCROLL_SOURCE, SETTLE_SOURCE, EDIT_SOURCE, SELECT_SOURCE, FOCUSED_SOURCE, safeUrl, cappedText, cappedUrl };
+module.exports = { OutcomeError, fail, stateLines, codePointBoundary, cutText, workingTarget, requireHttp, pipeClosed, pipeClosedOrTabGone, loadBudget, within, TIMED_OUT, pageState, currentStateLines, releaseObjects, renderSource, LABEL_MAX, URL_MAX, RESERVED, SPACES, WORKING_TAB_GONE, WALK_SOURCE, CLICK_SOURCE, SCROLL_SOURCE, SETTLE_SOURCE, EDIT_SOURCE, SELECT_SOURCE, FOCUSED_SOURCE, DETECT_SOURCE, VISIBLE_SOURCE, FETCH_SOURCE, safeUrl, cappedText, collapsedText, cappedUrl, letters };

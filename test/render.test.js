@@ -310,15 +310,17 @@ test("a blank-line run inside the page's own prose survives; only the seams a fr
 
 test('a frame URL follows the link rule: a data: URL renders its length, and no URL can close the marker early', () => {
   const long = `http://a/${'x'.repeat(200)}`;
-  const text = inlineFrames('\u0000frame:e1\u0000\n\n\u0000frame:e2\u0000\n\n\u0000frame:e3\u0000\n\n\u0000frame:e4\u0000', new Map([
+  const text = inlineFrames('\u0000frame:e1\u0000\n\n\u0000frame:e2\u0000\n\n\u0000frame:e3\u0000\n\n\u0000frame:e4\u0000\n\n\u0000frame:e5\u0000', new Map([
     ['e1', { url: 'data:text/html,<p>srcdoc</p>', markdown: 'Inline.' }],
     ['e2', { url: long, reason: 'not readable' }],
     ['e3', { url: 'http://a/one]two\nthree', markdown: 'Bracket.' }],
     ['e4', { url: `http://a/\u0000${'x'.repeat(195)}`, markdown: 'Reserved.' }],
+    ['e5', { url: 'http://a/one\u0085\u0085two', markdown: 'Next line.' }],
   ]));
   assert.match(text, /\[e1 frame \(url omitted: 28 chars\)\]\nInline\.\n\[\/frame\]/);
   assert.match(text, /\[e2 frame \(url omitted: 209 chars\) \(not readable\)\]/);
   assert.match(text, /\[e3 frame http:\/\/a\/one%5Dtwo%20three\]\nBracket\./, 'a ] cannot close the marker, and a newline is collapsed before it is encoded');
+  assert.match(text, /\[e5 frame http:\/\/a\/one%20two\]\nNext line\./, 'and so is a run of U+0085');
   assert.match(
     text,
     /\[e4 frame \(url omitted: 204 chars\)\]\nReserved\./,

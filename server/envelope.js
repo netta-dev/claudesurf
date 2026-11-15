@@ -17,15 +17,40 @@ function success(payload, { notes = [], images = [] } = {}) {
   return envelope;
 }
 
-// The two needs_confirmation messages: the call acted and a navigation it led to was
-// stopped, or the gate refused the call's own URL before the call acted.
-const ACTED = 'The action ran, and a navigation it led to was stopped at the domain gate. Ask the human about the host on the Blocked: line, then call policy with allow_once or allow_always. Check the result lines before repeating the action: a form it submitted may already have been processed.';
-const NOT_STARTED = "The navigation was not started: its host needs the human's approval. Ask her about the host on the Blocked: line, then call policy with allow_once or allow_always and retry.";
+// These messages include policy-call instructions for sessions whose tool schema
+// predates the policy action.
+const ACTED = 'The action ran, and a navigation it led to was stopped at the domain gate. Ask the human about the host on the Blocked: line; once she approves, call claudesurf_act with action: policy, op: allow_once (this session) or allow_always (saved), and host set to the host on the Blocked: line. Check the result lines before repeating the action: a form it submitted may already have been processed.';
+const NOT_STARTED = "The call didn't start: its host needs the human's approval. Ask her about the host on the Blocked: line; once she approves, call claudesurf_act with action: policy, op: allow_once (this session) or allow_always (saved), and host set to the host on the Blocked: line, then retry.";
 
 // Returns the envelope of a domain-gate refusal. The host stays in the payload's
 // Blocked: line, out of the message.
 function needsConfirmation(payload, { notes = [], acted }) {
   const envelope = { outcome: 'needs_confirmation', message: acted ? ACTED : NOT_STARTED, payload };
+  if (notes.length) envelope.notes = notes;
+  return envelope;
+}
+
+const CHALLENGE_NAMES = { 'bot check': 'a bot check', 'sign-in': 'a sign-in', 'two-factor': 'a two-factor code' };
+
+function challengeName(type) {
+  return CHALLENGE_NAMES[type] || 'a challenge';
+}
+
+// Returns a session's label, the agent's text, as one line: each run of
+// whitespace, control characters, and the bidi embeddings, overrides, and isolates
+// becomes one space. The other format characters stay, since a zero-width joiner holds
+// an emoji sequence together.
+function oneLineLabel(label) {
+  return String(label || '').replace(/[\s\p{Cc}\u202A-\u202E\u2066-\u2069]+/gu, ' ').trim();
+}
+
+function needsHuman(payload, { notes = [], type, label }) {
+  const name = oneLineLabel(label);
+  const where = name ? `the window ${JSON.stringify(name)}` : "the session's window";
+  const message = `A person has to clear this page: ${challengeName(type)}. Tell the human that ${where} needs her, then end your turn; read the page again once she says it is done. `
+    + "The page stays readable and actable, so if this isn't a challenge, carry on. "
+    + 'If clearing it takes her through a host the allowlist lacks, she can sign in from a tab she opens herself (Ctrl+T), which shares the cookies.';
+  const envelope = { outcome: 'needs_human', message, payload };
   if (notes.length) envelope.notes = notes;
   return envelope;
 }
@@ -59,4 +84,4 @@ function isEnvelope(value) {
   return Boolean(value) && typeof value === 'object' && OUTCOMES.includes(value.outcome);
 }
 
-module.exports = { OUTCOMES, ERROR_OUTCOMES, success, needsConfirmation, unsettled, error, schemaError, setupError, staleRef, isEnvelope };
+module.exports = { OUTCOMES, ERROR_OUTCOMES, success, needsConfirmation, needsHuman, challengeName, oneLineLabel, unsettled, error, schemaError, setupError, staleRef, isEnvelope };

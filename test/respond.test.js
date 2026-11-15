@@ -48,6 +48,7 @@ test('blockedLine has one form per kind and how, with a repeat\'s count', () => 
     `Blocked by the page: [t5] evil.example — the tab reached ${url} without a request the gate could see, so it was closed`,
   );
   assert.strictEqual(blockedLine(entry({ url, count: 3 }), false), `Blocked by the page: [t1] evil.example — navigation to ${url} (×3)`);
+  assert.strictEqual(blockedLine(entry({ url: `${url}v1/me`, kind: 'fetch', how: 'not started' }), true), `Blocked: [t1] evil.example — fetch of ${url}v1/me (not sent)`);
 });
 
 test('blockedLine cuts a URL past the cap, and makes a URL and a host built to forge a marker safe', () => {
@@ -84,13 +85,29 @@ test('the message is the before-acting form when every refusal that the call ret
   const { sessions, session } = await setup(t);
   const before = respond(sessions, session, { head: 'h', blocked: [entry({ how: 'not started' })] }).envelope;
   assert.strictEqual(before.message, envelope.needsConfirmation('', { acted: false }).message);
-  assert.match(before.message, /^The navigation was not started/);
+  assert.match(before.message, /^The call didn't start/);
   const after = respond(sessions, session, { head: 'h', blocked: [entry({ how: 'not started' }), entry({ kind: 'new tab', tab: 3 })] }).envelope;
   assert.match(after.message, /^The action ran, and a navigation it led to was stopped/);
   const plain = respond(sessions, session, { head: 'h' }).envelope;
   assert.deepStrictEqual(plain, { outcome: 'success', payload: 'h' });
   const unsettled = respond(sessions, session, { head: 'h', outcome: 'unsettled', images: [{ data: 'd', mimeType: 'image/png' }] }).envelope;
   assert.deepStrictEqual(unsettled, { outcome: 'unsettled', payload: 'h', images: [{ data: 'd', mimeType: 'image/png' }] });
+});
+
+test('a challenge makes the outcome needs_human, ranked below a refusal of its own and above unsettled, with the session\'s label in the message', async (t) => {
+  const { sessions, session } = await setup(t);
+  session.label = { name: 'reviewing PR #42', description: '' };
+  const challenge = { type: 'sign-in', signal: 'a password field', title: 'Sign in', clears: false };
+  const human = respond(sessions, session, { head: 'URL: x\nChallenge: sign-in — a password field', challenge, outcome: 'unsettled' }).envelope;
+  assert.strictEqual(human.outcome, 'needs_human');
+  assert.strictEqual(human.payload, 'URL: x\nChallenge: sign-in — a password field');
+  assert.strictEqual(human.message, envelope.needsHuman('', { type: 'sign-in', label: 'reviewing PR #42' }).message);
+  const refused = respond(sessions, session, { head: 'h', challenge, blocked: [entry({ how: 'not started' })] }).envelope;
+  assert.strictEqual(refused.outcome, 'needs_confirmation', 'a refusal of the call\'s own ranks first');
+  refusals.record(session, entry({ url: 'https://ads.example/', host: 'ads.example', kind: 'new tab', tab: 2 }));
+  const withPage = respond(sessions, session, { head: 'h', challenge }).envelope;
+  assert.strictEqual(withPage.outcome, 'needs_human', 'a refusal the page led to is a Blocked by the page: line alone');
+  assert.match(withPage.payload, /\nBlocked by the page: \[t2\] ads\.example/);
 });
 
 test('refusals past the fifth print as one count after five lines, the ones the full list dropped included, and a take resets that count', async (t) => {

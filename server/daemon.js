@@ -25,21 +25,34 @@ const { fail } = require('./action-support');
 const read = require('./read');
 const input = require('./input');
 const navigation = require('./navigation');
+const consoleCapture = require('./console-capture');
+const network = require('./network');
+const fetchAction = require('./fetch');
 const { tabs } = require('./tabs');
+const { Notifier, toolEnv } = require('./notify');
+const { Handoff } = require('./handoff');
 
 const log = createLogger('claudesurf daemon');
 const SOCK = daemonSocketPath();
 const PROFILE = profileDir();
 // The bridge's request timeout is 35 s; everything here runs under a deadline inside it.
 const REQUEST_BUDGET_MS = 33_000;
+const RESTARTED = {
+  summary: 'ClaudeSurf restarted',
+  body: 'Its browser closed, with any session windows it had open. Each Claude session reopens its window on its next call.',
+  urgency: 'normal',
+};
 
+let live = null;
+let launching = null;
+let lastRequestEnv = {};
 const sessions = new Sessions(log);
 const policy = new Policy({ file: policyFile(), log });
 const gate = new Gate({ sessions, policy, log });
 const actionLog = new ActionLog({ file: actionLogPath(), log });
-let live = null; // { conn, child } while the browser is up
-let launching = null;
-let lastRequestEnv = {};
+const notifier = new Notifier({ log, env: () => toolEnv(process.env, lastRequestEnv) });
+const handoff = new Handoff({ notifier, browserPid: () => (live && !live.conn.closed ? live.child.pid : null), log });
+gate.onRefusal = (session, entry) => handoff.refused(session, entry);
 
 // A burst of first calls launches one browser. Retains the request's
 // graphical environment for child processes spawned later.
@@ -73,8 +86,6 @@ function ensureBrowser(requestEnv) {
 
 const context = { sessions, gate, policy, log };
 
-// The handlers by action, each taking (context, session, arguments with their defaults,
-// deadline) and returning { head, body?, images?, outcome?, blocked? }.
 const HANDLERS = {
   page: (ctx, session, a, deadline) => read.readPage(ctx.sessions, session, { scope: a.scope, find: a.find, article: a.article, links: a.links, hidden: a.hidden, since: a.since, maxChars: a.max_chars, offset: a.offset, deadline }),
   info: (ctx, session, a, deadline) => read.pageInfo(ctx.sessions, session, { deadline }),
@@ -87,6 +98,9 @@ const HANDLERS = {
   press: input.press,
   select: input.select,
   tabs,
+  console: consoleCapture.read,
+  network: network.read,
+  fetch: fetchAction.fetch,
 };
 
 // Answers a call and writes its action-log record before the answer is sent.
@@ -108,20 +122,21 @@ async function answer({ sessionId, tool, action, args, env }) {
   const a = withDefaults(action, args);
   const deadline = Date.now() + REQUEST_BUDGET_MS;
   try {
-    // policy changes the allowlist alone, so it neither launches the browser nor
-    // recreates a window that the human closed, and still reports the pending refusals.
-    if (action === 'policy') return await slot(sessions.get(sessionId), [], () => answerPolicy(sessionId, a));
+    // The daemon handles policy without launching the browser or recreating a window
+    // that the human closed, and includes pending refusals in the response.
+    // The handoff remains open because the human may approve a host during sign-in.
+    if (action === 'policy') return await slot(sessions.get(sessionId), [], () => answerPolicy(sessionId, a), { closes: false });
     await ensureBrowser(env);
     const { session, notes } = await sessions.ensureWithNotes(sessionId, { deadline });
-    return await slot(session, notes, () => HANDLERS[action](context, session, a, deadline), a.ref);
+    return await slot(session, notes, () => HANDLERS[action](context, session, a, deadline), { ref: a.ref });
   } catch (e) {
     return { ...failureEnvelope(e, sessions, null, { log }), inSlot: false };
   }
 }
 
-// Runs a handler in the session's queue slot and builds its response there.
-function slot(session, notes, handler, ref) {
+function slot(session, notes, handler, { ref, closes = true } = {}) {
   return session.run(async () => {
+    if (closes) handoff.closed(session.id);
     let result;
     try {
       result = await handler();
@@ -132,7 +147,9 @@ function slot(session, notes, handler, ref) {
       // that call alone.
       session.marks = null;
     }
-    return { ...respond(sessions, session, result, { notes }), inSlot: true };
+    const built = respond(sessions, session, result, { notes });
+    if (built.envelope.outcome === 'needs_human') handoff.opened(session, result.challenge, built.url);
+    return { ...built, inSlot: true };
   });
 }
 
@@ -224,4 +241,9 @@ function shutdown() {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-browser.reapOrphan(log).catch((e) => log.warn(`reaping the previous browser: ${e.message}`)).then(listen);
+// The daemon announces a restart after finding a previous browser record, including
+// a stale one. The previous browser's windows are lost when it exits or is reaped.
+// The daemon sends the notice without awaiting it, using its own environment.
+browser.reapOrphan(log).then(({ found }) => {
+  if (found) notifier.notify(RESTARTED);
+}, (e) => log.warn(`reaping the previous browser: ${e.message}`)).then(listen);

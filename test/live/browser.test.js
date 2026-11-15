@@ -25,8 +25,8 @@ test('launch, handshake, one window per session, and a clean close', { skip }, a
     // The test checks the record before live.close(), which restores CLAUDESURF_SOCKET
     // and deletes the record's directory.
     await live.conn.send('Browser.close').catch(() => {});
-    await waitFor(() => browser.readRecord() === null, 5000).catch(() => {});
-    assert.strictEqual(browser.readRecord(), null, 'record cleared on close');
+    await waitFor(() => live.conn.closed, 5000);
+    assert.strictEqual(browser.readRecord().pid, live.child.pid, 'the record stays when the pipe closes, for the next daemon to announce');
   } finally {
     await live.close();
   }

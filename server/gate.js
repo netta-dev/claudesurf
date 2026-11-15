@@ -1,16 +1,11 @@
-// The domain gate, which stops a gated tab's route to a new top-level document whose
-// host that the allowlist doesn't cover. Three checks make it up:
-//   - the request handler, which judges each paused document request of an armed tab
-//     (arming.js sends Fetch.enable) and answers every one of them, since a pause left
-//     unanswered wedges the tab's navigation;
-//   - the pre-check, which navigate, history, and tabs new run on their own URL
-//     before they send anything;
-//   - the backstop, which judges each commit of a gated tab's main frame, for a
-//     document that arrived without a request that the handler saw, such as a
-//     back-forward cache restore.
-//
-// A tab is gated while it belongs to a session and isn't its identity tab. A refusal
-// closes a tab that still counts as new, which would otherwise sit on about:blank.
+// This module enforces the host allowlist for top-level http(s) navigation in
+// session tabs other than the identity tab, through three checks. The request handler
+// judges each paused document request of an armed tab, and answers it even when
+// judging fails, because an unanswered pause blocks navigation. The pre-check judges
+// the URL of navigate, history, tabs new, and fetch before they send anything. The
+// backstop judges each main-frame commit, because a back-forward cache restore
+// arrives without a request. A refusal closes a tab that still counts as new, which
+// would otherwise sit on about:blank.
 
 const { hostOf, isWeb } = require('./policy');
 const { isMainFrame } = require('./frames');
@@ -29,6 +24,9 @@ class Gate {
     this.log = log;
     this.conn = null;
     this.logged = new Map();
+    // The callback, (session, entry) → void, that `refuse` calls with each refusal it
+    // records; daemon.js sets it.
+    this.onRefusal = null;
   }
 
   // Takes the paused requests of a launch's connection and makes the gate the
@@ -40,8 +38,8 @@ class Gate {
   }
 
   // Returns null when the session may load `url`, and otherwise the refusal entry, which
-  // the caller returns as its `blocked` without recording it. `kind` is 'navigation', or
-  // 'new tab' for tabs new. A URL other than http(s) passes.
+  // the caller returns as its `blocked` without recording it. `kind` is 'navigation',
+  // 'new tab' for tabs new, or 'fetch'. A URL other than http(s) passes.
   check(url, session, kind) {
     if (!isWeb(url)) return null;
     const host = hostOf(url);
@@ -52,13 +50,25 @@ class Gate {
     return entry;
   }
 
-  // Records the gate's refusal `entry` on the session and wakes the refused tab's
-  // waiters. Returns the recorded entry.
+  // Records the gate's refusal `entry` on the session, wakes the refused tab's waiters,
+  // and calls onRefusal from a microtask, so the callback runs after the gate has
+  // answered the paused request or acted on the commit and can't keep it from acting.
+  // Returns the recorded entry.
   refuse(session, entry) {
     const recorded = refusals.record(session, entry);
     this.logRefusal(entry);
     const t = this.sessions.target(entry.targetId);
     if (t) this.sessions.notify(t);
+    if (this.onRefusal) {
+      const onRefusal = this.onRefusal;
+      queueMicrotask(() => {
+        try {
+          onRefusal(session, recorded);
+        } catch (e) {
+          this.log.warn(`announcing a refusal: ${e.stack || e.message}`);
+        }
+      });
+    }
     return recorded;
   }
 

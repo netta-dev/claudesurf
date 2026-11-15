@@ -19,7 +19,7 @@ const { frameThere } = require('./frames');
 const { SetupError } = require('./browser');
 const { ConnectionClosedError } = require('./cdp');
 const { TargetGoneError } = require('./sessions');
-const { OutcomeError, fail, releaseObjects, WALK_SOURCE, LABEL_MAX, safeUrl } = require('./action-support');
+const { OutcomeError, fail, releaseObjects, pipeClosedOrTabGone, WALK_SOURCE, LABEL_MAX, safeUrl } = require('./action-support');
 
 // The object group that holds the hidden walk's element handles until hiddenElements
 // releases it.
@@ -200,7 +200,7 @@ async function guardFrames(sessions, t, scope, trail, fn, deadline) {
 }
 
 async function lostFrame(sessions, t, { located, named }, e, deadline) {
-  if (e instanceof ConnectionClosedError || sessions.conn.closed || sessions.target(t.targetId) !== t) return null;
+  if (pipeClosedOrTabGone(sessions, t, e)) return null;
   const opts = { frameTrees: new Map(), deadline: frameDeadline(deadline) };
   const there = (target, frameId) => frameThere(sessions, target, frameId, opts);
   try {

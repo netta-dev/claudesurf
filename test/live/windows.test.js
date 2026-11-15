@@ -10,7 +10,7 @@ const { execFileSync } = require('child_process');
 const read = require('../../server/read');
 const input = require('../../server/input');
 const navigation = require('../../server/navigation');
-const { liveBinary, liveBrowser, readPayload, refsIn, sleep } = require('../helpers');
+const { holdDisplay, liveBinary, liveBrowser, readPayload, refsIn, sleep } = require('../helpers');
 const { serve } = require('../fixtures/serve');
 
 const skip = !process.env.CLAUDESURF_LIVE_HEADFUL ? 'set CLAUDESURF_LIVE_HEADFUL=1 to run'
@@ -24,7 +24,8 @@ const activeWindow = () => xdotool('getactivewindow');
 const windowName = (id) => xdotool('getwindowname', id);
 const activate = (id) => { xdotool('windowactivate', '--sync', id); };
 
-test('the working tab is the active tab, the identity tab joins its window, and only creation, tab-opening clicks, and trusted clicks raise', { skip }, async () => {
+test('the working tab is the active tab, the identity tab joins its window, and only creation, tab-opening clicks, and trusted clicks raise', { skip }, async (t) => {
+  t.after(await holdDisplay());
   const live = await liveBrowser({ headless: false });
   const site = await serve();
   const before = activeWindow();

@@ -1,0 +1,4 @@
+#!/usr/bin/env node
+
+// The recording wmctrl of test/fakes/tool.js.
+require('../tool')('wmctrl');

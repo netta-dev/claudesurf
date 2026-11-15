@@ -8,7 +8,7 @@
 // without a browser.
 
 const envelope = require('./envelope');
-const { fail, stateLines, codePointBoundary, releaseObjects, renderSource, safeUrl, LABEL_MAX, URL_MAX, RESERVED } = require('./action-support');
+const { fail, stateLines, codePointBoundary, releaseObjects, renderSource, safeUrl, LABEL_MAX, URL_MAX, RESERVED, SPACES } = require('./action-support');
 const { isMissingContext } = require('./sessions');
 const { OPTION_OWNERS } = require('./snapshot');
 const { REF_SOURCE } = require('./dispatch');
@@ -256,7 +256,7 @@ function modalMark(modal) {
 // Returns the URL for a frame marker. It comes from the page, so it follows a link's
 // rule: a data: URL and one too long to navigate render as their length.
 function markerUrl(url) {
-  const text = url.replace(RESERVED, '').replace(/\s+/g, ' ').trim();
+  const text = url.replace(RESERVED, '').replace(SPACES, ' ').trim();
   if (/^data:/i.test(text) || text.length > URL_MAX) return omitted(text.length);
   return safeUrl(text);
 }
@@ -337,12 +337,13 @@ function nextPart(end) {
   return ` Pass offset=${end} for the next part.`;
 }
 
-// Returns the lines before the region, in this order; they are never cut, so a small
-// budget still returns the whole header. `settled`, `paged`, and `since` are whole
-// lines; `overlays` is { blocks, more }, the blocks that rendered ahead of the region
-// and the refs of the overlays left out.
-function header(state, { truncation, settled, paged, since, scope, omissions, overlays, hidden, hiddenListed, links, find, article }) {
+// Returns the header lines before the region. The region's character budget doesn't
+// truncate the header. `challenge`, `settled`, `paged`, and `since` are complete lines.
+// `overlays` is { blocks, more }, containing the blocks rendered ahead of the region
+// and the refs of omitted overlays.
+function header(state, { challenge, truncation, settled, paged, since, scope, omissions, overlays, hidden, hiddenListed, links, find, article }) {
   const lines = [stateLines(state.url, state.title)];
+  if (challenge) lines.push(challenge);
   if (truncation) lines.push(truncation);
   for (const line of [settled, paged, since]) if (line) lines.push(line);
   lines.push(scopeLine(scope, omissions));

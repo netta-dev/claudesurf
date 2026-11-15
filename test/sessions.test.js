@@ -6,7 +6,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const browser = require('../server/browser');
 const { Sessions, SESSION_PAGE, parseSessionPage } = require('../server/sessions');
-const { fakeSession, sleep, waitFor, isolatedPaths, silentLog, recordingLog, FAKE_CHROME } = require('./helpers');
+const { fakeSession, sleep, flush, waitFor, isolatedPaths, silentLog, recordingLog, FAKE_CHROME } = require('./helpers');
 const { Connection, ProtocolError } = require('../server/cdp');
 const { FakeBrowser } = require('./fakes/fake-browser');
 const refusals = require('../server/refusals');
@@ -128,7 +128,7 @@ test('the tab is attributed and numbered at attach, and its commands, arming fir
   assert.deepStrictEqual(atRelease, { role: 'opened', tab: 3, enabled: false }, 'attributed and numbered before any of its commands answered');
   const sent = fake.calls.filter((c) => c.sessionId === opened.sessionId).map((c) => c.method);
   assert.deepStrictEqual(sent.slice(0, sent.indexOf('Runtime.runIfWaitingForDebugger') + 1), [
-    'Network.enable', 'Network.setBypassServiceWorker', 'Page.setPrerenderingAllowed',
+    'Network.enable', 'Network.setBypassServiceWorker', 'Page.setPrerenderingAllowed', 'Console.enable', 'Log.enable',
     'Page.enable', 'Target.setAutoAttach', 'Emulation.setFocusEmulationEnabled', 'Runtime.runIfWaitingForDebugger',
   ]);
   assert.strictEqual(sessions.target(opened.targetId).role, 'opened');
@@ -740,7 +740,7 @@ test('ready resolves once Page.enable settles: with null for a tab not armed at 
   assert.strictEqual(await ready, null, 'the destruction resolves it with no outcomes');
 });
 
-test('arming: Network.enable with zero buffers, the bypass, and prerendering off are queued before the release of a tab a session page opened, and awaited by repair for the working tab; Fetch.enable goes only under an interceptor', async () => {
+test("arming: Network.enable with capture's body buffers, the bypass, prerendering off, and capture's Console and Log are queued before the release of a tab a session page opened, and awaited by repair for the working tab; Fetch.enable goes only under an interceptor", async () => {
   for (const allow of [undefined, ['a.test']]) {
     const ctx = fakeSession({ allow });
     await enableTargets(ctx.conn);
@@ -749,12 +749,13 @@ test('arming: Network.enable with zero buffers, the bypass, and prerendering off
     const working = sessions.target(session.workingTargetId);
     const on = (target) => fake.calls.filter((c) => c.sessionId === fake.targets.get(target).sessionId).map((c) => c.method);
     assert.ok(working.armed, 'repair armed the working tab before ensure returned');
-    assert.deepStrictEqual(fake.callsTo('Network.enable').find((c) => c.sessionId === working.cdpSessionId).params, { maxTotalBufferSize: 0, maxResourceBufferSize: 0 });
+    assert.deepStrictEqual(fake.callsTo('Network.enable').find((c) => c.sessionId === working.cdpSessionId).params, { maxTotalBufferSize: 10 * 1024 * 1024, maxResourceBufferSize: 1024 * 1024 });
+    assert.ok(['Console.enable', 'Log.enable'].every((method) => on(working.targetId).includes(method)), "repair's arming enables capture on the working tab");
     const opened = fake.createTarget({ url: 'http://a.test/tab', openerId: working.targetId, holdUntilRelease: true });
     await waitFor(() => sessions.target(opened.targetId) && sessions.target(opened.targetId).armed);
     const sent = on(opened.targetId);
     const released = sent.indexOf('Runtime.runIfWaitingForDebugger');
-    for (const method of ['Network.enable', 'Network.setBypassServiceWorker', 'Page.setPrerenderingAllowed']) {
+    for (const method of ['Network.enable', 'Network.setBypassServiceWorker', 'Page.setPrerenderingAllowed', 'Console.enable', 'Log.enable']) {
       assert.ok(sent.indexOf(method) !== -1 && sent.indexOf(method) < released, `${method} queued before the release`);
     }
     for (const target of [working.targetId, opened.targetId]) {
@@ -884,7 +885,7 @@ test('the window state lasts while a session tab remains in the window, a tab wh
   assert.strictEqual(fake.callsTo('Target.createTarget').length, 2, 'no identity page to return through, so the window is recreated');
   assert.strictEqual(sessions.target(pending.targetId).sessionId, null, 'and the tab left behind is disowned');
   const undone = fake.calls.slice(before).filter((c) => c.sessionId === pending.sessionId).map((c) => c.method);
-  assert.deepStrictEqual(undone, ['Fetch.disable', 'Network.setBypassServiceWorker', 'Page.setPrerenderingAllowed', 'Network.disable'], 'and disarmed');
+  assert.deepStrictEqual(undone, ['Fetch.disable', 'Network.setBypassServiceWorker', 'Page.setPrerenderingAllowed', 'Network.disable', 'Console.disable', 'Log.disable'], 'and disarmed');
 });
 
 test("a session's tab that reaches the session page of its other role keeps the role it holds, its number, and its arming", async () => {
@@ -1095,4 +1096,54 @@ test("a new document's commit ends the requests that its tab's earlier document 
   fake.commitDocument(tab, 'http://a.test/next');
   await waitFor(() => t.url === 'http://a.test/next');
   assert.strictEqual(requests.busy(t).count, 1);
+});
+
+test("the registry records the loader id that a main-frame commit carries, and a silent first commit's from the frame-tree read", async () => {
+  const { fake, sessions, conn } = await setup();
+  const session = await sessions.ensure('s1');
+  const tab = fake.targets.get(session.workingTargetId);
+  const t = sessions.target(tab.targetId);
+  assert.strictEqual(t.loaderId, tab.documentLoaderId, "the working tab's first commit");
+  fake.navigateTarget(tab, 'http://a.test/next');
+  await waitFor(() => t.url === 'http://a.test/next');
+  assert.strictEqual(t.loaderId, tab.documentLoaderId);
+  assert.notStrictEqual(t.loaderId, null);
+  fake.emit('Page.frameNavigated', { frame: { id: 'CHILD', parentId: tab.targetId, url: 'http://child.test/', loaderId: 'child-loader' }, type: 'Navigation' }, tab.sessionId);
+  await flush(conn);
+  assert.strictEqual(t.loaderId, tab.documentLoaderId, "a child frame's commit leaves it alone");
+  const opened = fake.openWindow(tab, 'http://a.test/popup');
+  await waitFor(() => sessions.target(opened.targetId) && sessions.target(opened.targetId).url === 'http://a.test/popup');
+  assert.strictEqual(sessions.target(opened.targetId).loaderId, opened.documentLoaderId, 'read from the frame tree, since the commit sent no event');
+});
+
+test('a main-frame download is kept on the tab, the last ten, each with the download count after it; a child frame\'s is not', async () => {
+  const { fake, sessions, conn } = await setup();
+  const session = await sessions.ensure('s1');
+  const tab = fake.targets.get(session.workingTargetId);
+  const t = sessions.target(tab.targetId);
+  for (let i = 1; i <= 12; i++) fake.emit('Page.downloadWillBegin', { frameId: tab.targetId, url: `http://a.test/f${i}`, suggestedFilename: `f${i}.bin` }, tab.sessionId);
+  fake.emit('Page.downloadWillBegin', { frameId: 'CHILD', url: 'http://a.test/child.bin', suggestedFilename: 'child.bin' }, tab.sessionId);
+  await flush(conn);
+  assert.strictEqual(t.downloads, 12);
+  assert.deepStrictEqual(t.downloadLog.map((d) => d.n), [3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  assert.deepStrictEqual(t.downloadLog.at(-1), { n: 12, url: 'http://a.test/f12', file: 'f12.bin' });
+});
+
+test("forget drops a tab's captured requests and console entries with its in-flight requests", async (t) => {
+  const network = require('../server/network');
+  const consoleCapture = require('../server/console-capture');
+  const dropped = [];
+  for (const [name, module] of [['network', network], ['console', consoleCapture]]) {
+    const original = module.drop;
+    t.after(() => { module.drop = original; });
+    module.drop = (target) => { dropped.push([name, target.targetId]); return original(target); };
+  }
+  const { fake, sessions } = await setup();
+  const session = await sessions.ensure('s1');
+  const opened = fake.openWindow(fake.targets.get(session.workingTargetId), 'http://a.test/popup');
+  await waitFor(() => sessions.target(opened.targetId));
+  dropped.length = 0;
+  fake.destroyTarget(opened.targetId);
+  await waitFor(() => !sessions.target(opened.targetId));
+  assert.deepStrictEqual([...new Set(dropped.filter(([, id]) => id === opened.targetId).map(([name]) => name))].sort(), ['console', 'network']);
 });

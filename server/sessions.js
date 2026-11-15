@@ -29,6 +29,8 @@ const { fail, within, TIMED_OUT } = require('./action-support');
 const arming = require('./arming');
 const tabRecords = require('./tab-records');
 const requests = require('./requests');
+const network = require('./network');
+const consoleCapture = require('./console-capture');
 const retained = require('./retained');
 const refusals = require('./refusals');
 const { isWeb } = require('./policy');
@@ -38,6 +40,7 @@ const SESSION_PAGE = pathToFileURL(path.join(__dirname, 'static', 'session.html'
 const WINDOW_TIMEOUT_MS = 5_000;
 const CTRL_MODIFIER = 2;
 const MAX_DIALOGS = 20;
+const MAX_DOWNLOADS = 10;
 const CROSS_DOCUMENT = new Set(['differentDocument', 'historyDifferentDocument', 'reload', 'reloadBypassingCache', 'restore', 'restoreWithPost']);
 const UNGATED = 'the working tab could not be put under the domain gate; call again';
 
@@ -141,7 +144,8 @@ class Sessions {
     conn.on('Network.loadingFailed', (p, sid) => this.onRequestFailed(p, sid));
     conn.on('Page.javascriptDialogOpening', (p, sid) => this.onDialog(p, sid));
     conn.onClose(() => this.dropAll());
-    requests.attachRequests(conn, this);
+    requests.attachRequests(conn, this, network.sink);
+    consoleCapture.attachConsole(conn, this);
   }
 
   // Returns the session, or undefined for an id that a call hasn't used yet; unlike
@@ -718,6 +722,7 @@ class Sessions {
     const { frameTree: { frame } } = await this.conn.send('Page.getFrameTree', {}, opts);
     if (!t.mainFrameId) t.mainFrameId = frame.id;
     if (!t.url) t.url = frame.url + (frame.urlFragment || '');
+    if (!t.loaderId) t.loaderId = frame.loaderId || null;
     if (isWeb(frame.url)) t.committedWeb = true;
   }
 
@@ -768,6 +773,7 @@ class Sessions {
     if (!own) return;
     t.mainFrameId = frame.id;
     t.url = frame.url + (frame.urlFragment || '');
+    t.loaderId = frame.loaderId || null;
     t.generation += 1;
     t.navigationsAtCommit = t.navigations;
     t.pendingLoader = null;
@@ -847,17 +853,21 @@ class Sessions {
     this.notify(t);
   }
 
-  // Counts a download of the target's main frame, which navigate's download wait
-  // reads. Under download denial Chrome still fires this: for a navigation to a file,
-  // once it has failed the navigation's document request (onRequestFailed), and for an
-  // <a download> link or a blob URL, which don't start a navigation and can fire it
-  // while the page's own navigation is under way, so a download doesn't stop a
-  // navigation. A same-process child frame's download arrives on its page's session
-  // under the child's frame id, so only the target's main frame counts.
-  onDownload({ frameId }, cdpSessionId) {
+  // Counts main-frame downloads for navigate's download wait and keeps their details
+  // for an acting call's Download: lines.
+  // Chrome emits this event despite download denial. A navigation to a file emits it
+  // after Chrome fails the document request (onRequestFailed).
+  // An <a download> link or blob URL can emit it without starting a navigation,
+  // including while another navigation is underway. A download therefore doesn't
+  // stop an ongoing navigation.
+  // Downloads from child frames in the page's process arrive on the page's session
+  // with the child's frame id and are excluded here.
+  onDownload({ frameId, url, suggestedFilename }, cdpSessionId) {
     const t = this.byCdpSession(cdpSessionId);
     if (!t || !isMainFrame(t, frameId)) return;
     t.downloads += 1;
+    t.downloadLog.push({ n: t.downloads, url: url || '', file: suggestedFilename || '' });
+    if (t.downloadLog.length > MAX_DOWNLOADS) t.downloadLog.shift();
     this.notify(t);
   }
 
@@ -883,13 +893,13 @@ class Sessions {
     return current && current.type === 'page' ? current : null;
   }
 
-  // Fails the waiters of a target that left the registry, resolves its `ready` with
-  // null, and drops its in-flight requests.
   forget(t) {
     for (const w of t.waiters) { clearTimeout(w.timer); w.reject(new TargetGoneError(t.targetId)); }
     t.waiters.clear();
     t.resolveReady(null);
     requests.drop(t);
+    network.drop(t);
+    consoleCapture.drop(t);
   }
 
   async pageElement(targetId, elementId, opts) {
@@ -927,35 +937,45 @@ class Sessions {
   }
 }
 
-// Returns a new target's record. Beside the counts and worlds that the handlers read, it
-// holds what a navigation's verdict is judged from:
-//   - loadedGeneration: the generation whose own DOMContentLoaded fired, null before
-//     the first, so the current document has loaded while it equals `generation`;
-//   - navigationsAtCommit: `navigations` as the current document committed;
-//   - pendingLoader: the loader id of the main frame's latest cross-document
-//     navigation, until a commit;
-//   - navigationsStopped: `navigations` as Chrome last dropped the tab's latest
-//     navigation without a commit (onRequestFailed), as it drops a refused one; the
-//     drop ends the navigations started by then.
-// It also carries the domain gate's state:
-//   - closing: the daemon has sent Target.closeTarget (closeTab);
-//   - armingSent, armed, arming, armingEpoch: arming.js's, whether its commands went
-//     out, whether every one but the prerendering switch succeeded, the latest
-//     arming's outcomes, and its epoch;
-//   - openerPage: the session's page target that opened the tab, a frame's root page
-//     when a frame opened it;
-//   - committedWeb: an http(s) document has committed, from frameNavigated or the
-//     attach handler's frame-tree read;
-//   - everWorking: it has been a working tab;
-//   - ready: a promise that never rejects, resolved once Page.enable and, for a tab
-//     armed at attach, the arming commands have settled, with arming's outcomes or
-//     null, and with null when the target disappears first.
+// Returns a new target's record, including counters and worlds used by handlers.
+// Navigation verdicts use these fields:
+// `loadedGeneration` identifies the generation whose DOMContentLoaded event fired.
+// It is null before the first event; equality with `generation` means that the current
+// document has loaded.
+// `navigationsAtCommit` records `navigations` at the current document's commit.
+// `pendingLoader` holds the main frame's latest cross-document loader id until commit.
+// `navigationsStopped` records `navigations` when Chrome last dropped the latest
+// navigation without committing (onRequestFailed). The drop ends the navigations
+// started by that point.
+// `downloadLog` retains recent main-frame downloads as { n, url, file } for acting
+// calls. Each `n` is the download count after that event.
+// `loaderId` identifies the current document's loader. It comes from the main-frame
+// commit or the attach handler's frame-tree read when the first commit wasn't reported.
+// `clearWaited` records the generation when the wait for a challenge to clear last ran.
+// `widgetWaited` records the generation when the widget wait last ran.
+// `widgetReported` records the generation when a widget without a response field
+// was last reported. These generation markers limit waits and reports per document.
+// The domain gate also uses these fields:
+// `closing` indicates that the daemon has sent Target.closeTarget (closeTab).
+// `armingSent` indicates whether arming commands have been sent.
+// `armed` indicates whether Network.enable, the bypass, and any Fetch.enable succeeded.
+// `arming` is the promise for the latest arming outcomes.
+// `armingEpoch` identifies the latest arming or disarm (arming.js).
+// `openerPage` identifies the session page target that opened the tab; a frame's
+// root page is used when a frame opened it.
+// `committedWeb` indicates an http(s) commit reported by frameNavigated or read from
+// the frame tree during attach.
+// `everWorking` indicates whether the target has been a working tab.
+// `ready` resolves without rejecting after Page.enable and any arming commands sent
+// at attach have settled. Its value is the arming outcomes or null.
+// It resolves with null if the target disappears first.
 function targetRecord(targetInfo, cdpSessionId) {
   const { targetId, type } = targetInfo;
   const t = {
     targetId, cdpSessionId, type, url: targetInfo.url || '', openerId: targetInfo.openerId || null,
     windowId: null, generation: 0, role: null, sessionId: null, worlds: new Map(), mainFrameId: null,
-    loads: 0, loadedGeneration: null, navigations: 0, navigationsAtCommit: 0, pendingLoader: null, navigationsStopped: 0, downloads: 0, sameDocument: 0, waiters: new Set(), dialogs: [],
+    loads: 0, loadedGeneration: null, navigations: 0, navigationsAtCommit: 0, pendingLoader: null, navigationsStopped: 0, downloads: 0, downloadLog: [], sameDocument: 0, waiters: new Set(), dialogs: [],
+    loaderId: null, clearWaited: null, widgetWaited: null, widgetReported: null,
     closing: false, armingSent: false, armed: false, arming: null, armingEpoch: 0,
     openerPage: null, committedWeb: false, everWorking: false,
   };

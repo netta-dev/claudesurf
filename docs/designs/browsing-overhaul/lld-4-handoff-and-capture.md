@@ -2,7 +2,7 @@
 
 ## Goal
 
-After a page read or an acting call, the daemon recognizes a page that a person has to clear — a bot check, a sign-in, or a two-factor code — returns `needs_human` with the call's full result, and alerts the human on the desktop until the session's next call. Every session tab captures its console and network traffic for the new `console` and `network` actions of `claudesurf_read`, and `claudesurf_act` gains `fetch`. A restart over a live browser is announced, and a denied download is reported; with this phase the HLD's action inventory is complete. A challenge inside a frame of another origin, other than the CAPTCHA widgets that decision 1 (strict detection signals) lists, still reads as ordinary content.
+After a page read, or an acting call that the gate's pre-check lets through, the daemon recognizes a page that a person has to clear — a bot check, a sign-in, or a two-factor code — returns `needs_human` with the call's full result, and alerts the human on the desktop until the session's next call other than `policy`. Every session tab captures its console and network traffic for the new `console` and `network` actions of `claudesurf_read`, and `claudesurf_act` gains `fetch`. A restart over a live browser is announced, and a denied download is reported; with this phase the HLD's action inventory is complete. A challenge inside a frame of another origin, other than the CAPTCHA widgets that decision 1 (strict detection signals) lists, still reads as ordinary content.
 
 ## Resolved decisions
 
@@ -58,7 +58,7 @@ After a page read or an acting call, the daemon recognizes a page that a person 
 > [!abstract]- **Evidence** — the challenge headers and the widget's `<iframe>` (decision 1)
 > Cloudflare documents `cf-mitigated: challenge` on every challenge page type, with `challenge` its only value; AWS WAF documents `x-amzn-waf-action: challenge` with status 202 and `captcha` with status 405. A fixture answering 403 with both headers reached `Network.responseReceived` for the main frame's `Document` request with the headers as sent (`cf-mitigated`, `X-Amzn-Waf-Action`), and its `loaderId` equal to the request id and to the commit's `frame.loaderId`. An `<iframe>` that page script put inside a closed shadow root answered `DOM.getFrameOwner` with its `backendNodeId` and `DOM.getBoxModel` with 304 × 69, both without `DOM.enable`, and `DOM.resolveNode` gave an object whose `getRootNode()` was the shadow root; a `display: none` `<iframe>` answered `DOM.getBoxModel` with `Could not compute box model`. A frame target under `waitForDebuggerOnStart` attached with an empty URL, which its own commit fills in.
 
-2. **Detection runs after every `page` read that renders and every acting call, on the working tab, once the page has settled; a challenge that may clear itself gets a wait first.** The acting calls are `navigate`, `click`, `scroll`, `type`, `press`, `select`, `history`, and `tabs new`. Every other call skips detection, and so does a paging read, which slices the retained render.
+2. **Detection runs after every `page` read that renders and every acting call, on the working tab, once the page has settled; a challenge that may clear itself gets a wait first.** The acting calls are `navigate`, `click`, `scroll`, `type`, `press`, `select`, `history`, and `tabs new`. Every other call skips detection, and so does a paging read, which slices the retained render. A `navigate`, `history`, or `tabs new` that the gate's pre-check refuses returns before it acts, so it skips detection too.
     1. After a challenge that may clear itself — Cloudflare's header challenge, AWS WAF's `challenge`, or DataDome's device check — an acting call waits up to 10 s for the check to reload the page as it passes, and follows the reload (UC40, self-clearing challenges). AWS's `captcha` isn't waited for, since a person has to solve it, and a read doesn't wait, since the action that landed on the page already did.
     2. The first detection of an unsolved widget on a document waits up to 3 s for its response field to fill, since Turnstile's non-interactive mode solves itself.
 
@@ -126,22 +126,21 @@ After a page read or an acting call, the daemon recognizes a page that a person 
 
 ### Capture
 
-8. **Console capture runs through Chrome's `Console` and `Log` domains, continuously, on every armed tab; the `Runtime` domain stays off.** `Console` delivers each `console.*` call as it happens, as flat text with its source location; `Log` delivers Chrome's own messages, such as failed loads and blocked content. A `console` read also has Chrome replay the working tab's stored messages, since only the replay reports an uncaught exception. The replay gives an exception as `Uncaught` or `Uncaught (in promise)` with its location and without its message, and the read's `Exceptions:` head line counts the current document's exceptions by location (UC43).
+8. **Console capture runs through Chrome's `Console` and `Log` domains, continuously, on every armed tab; the `Runtime` domain stays off.** `Console` delivers each `console.*` call as it happens, as flat text with its source location; `Log` delivers Chrome's own messages, such as failed loads and blocked content. Capture leaves out uncaught exceptions. Chrome 157 reports them only through `Runtime`: its `Console` replay of a document's stored messages, which carried them on Chrome 156, now holds only the page's `console.*` calls, and a listener in the isolated world doesn't see an exception thrown in the page's world (UC43).
 
-> [!example]- **Alternatives considered** — `Runtime` continuously, a `Runtime` replay on demand, an isolated-world error listener, Chrome's own log, capture on demand, exceptions as numbered entries (the Console and Log domains, exceptions on a head line) (decision 8)
+> [!example]- **Alternatives considered** — `Runtime` continuously, a brief `Runtime` toggle on demand, an isolated-world error listener, Chrome's own log, capture on demand (the Console and Log domains) (decision 8)
 > The alternatives were:
 >
 > 1. Run `Runtime` continuously. This supplies full messages, object previews, and exception text and stacks. Chrome runs page code whenever it reports an error, which bot-detection scripts read, so every session tab would be detectable the whole time.
-> 2. Use `Console` and `Log`, plus a one-time `Runtime` replay when the agent asks for exception details. The page sees one burst of hook calls at that moment. This is in the future doc.
+> 2. Use `Console` and `Log`, plus a brief `Runtime.enable` and `Runtime.disable` when the agent asks for uncaught exceptions; the enable replays the document's stored exceptions as `Runtime.exceptionThrown`. Page script can detect `Runtime` while it is on, since Chrome then runs the page's stack hook for each error it reports and the page's getters for object previews, so the page would see each such read. This is in the future doc.
 > 3. Add a `window` `error` listener in the isolated world. Chrome dispatches a script error only to the world it was thrown in, so the listener saw nothing.
-> 4. Launch Chrome with `--enable-logging` and parse the `CONSOLE` lines it writes for messages and exceptions. This supplies exception text without any protocol domain, but the stream is browser-wide without a target id, so a line would be matched to its tab by URL and timing. A logging flag's format isn't a protocol contract. This is unchecked on Chrome 156 and is in the future doc.
+> 4. Launch Chrome with `--enable-logging` and parse the `CONSOLE` lines it writes for messages and exceptions. This supplies exception text without any protocol domain, but the stream is browser-wide without a target id, so a line would be matched to its tab by URL and timing. A logging flag's format isn't a protocol contract. Whether Chrome writes the exceptions there is unchecked on 156 and 157, and the route is in the future doc.
 > 5. Capture only while the agent investigates a failure. Ordinary browsing records nothing, and the first failure's evidence is lost, while reproducing a submission may be unsafe.
-> 6. Number each replayed exception as an entry, counted against the replay so that a second read doesn't add it again. This puts exceptions among the messages, but Chrome's store keeps at most 1,000 messages a document, and `console.clear()` empties it. A page throwing from a loop therefore floods the list once and then stops adding, and an exception numbered at the read that found it prints after messages logged later.
 
 > [!abstract]- **Evidence** — what each domain reports and what the page can see (decision 8)
-> A page set `Error.prepareStackTrace` to a counting hook and logged an `Error` every 50 ms. With `Runtime.enable` the hook ran 92 times in 1.5 s; without it, 0 times. An `Error` whose `stack` was a getter didn't trip either way on Chrome 156, which is how earlier detection worked. With `Console.enable` sent before the page loaded, the hook ran 0 times, and `Console.messageAdded` delivered every call (`source: 'console-api'`, `level`, `text`, `url`, `line`, `column`; no timestamp), with objects as `[object Object]` and `%s` unsubstituted. It didn't deliver any uncaught exception live. `Console.disable` then `Console.enable` replayed the document's stored messages ahead of the enable's answer, among them `Uncaught` (a thrown `RangeError` and `TypeError`) and `Uncaught (in promise)`, each with `level: 'log'` and the throw's location, and still ran the hook 0 times. A `Runtime.enable` replay of the same storage ran it twice. After a navigation the replay was empty. `Log.entryAdded` delivered `Failed to load resource: the server responded with a status of 404 (Not Found)` with the resource's URL and a timestamp. An `error` and an `unhandledrejection` listener added in the isolated world saw neither of two main-world throws.
+> A page set `Error.prepareStackTrace` to a counting hook and logged an `Error` every 50 ms. With `Runtime.enable` the hook ran 92 times in 1.5 s; without it, 0 times. An `Error` whose `stack` was a getter didn't trip either way on Chrome 156, which is how earlier detection worked. With `Console.enable` sent before the page loaded, the hook ran 0 times, and `Console.messageAdded` delivered every call (`source: 'console-api'`, `level`, `text`, `url`, `line`, `column`; no timestamp), with objects as `[object Object]` and `%s` unsubstituted. It didn't deliver any uncaught exception live. On Chrome 156, `Console.disable` then `Console.enable` replayed the document's stored messages ahead of the enable's answer, among them `Uncaught` (a thrown `RangeError` and `TypeError`) and `Uncaught (in promise)`, each with `level: 'log'` and the throw's location, and still ran the hook 0 times. A `Runtime.enable` replay of the same storage ran it twice. After a navigation the replay was empty. On Chrome 157.0.8103.38, a raw-protocol probe of the same toggle replayed the page's `console.*` calls alone, `hello [object Object]` and `Error: save failed: 500`, without the thrown `RangeError: boom` or the rejection; `Runtime.enable` still replayed both as `Runtime.exceptionThrown`. `Log.entryAdded` delivered `Failed to load resource: the server responded with a status of 404 (Not Found)` with the resource's URL and a timestamp. An `error` and an `unhandledrejection` listener added in the isolated world saw neither of two main-world throws.
 
-9. **The daemon discards a request's body and headers, and keeps only the values of two challenge headers from a main-frame document's response; response bodies stay in Chrome's buffer and are read when a `network` read asks for them.** A record keeps the request id, the method, URL, resource type, status, MIME type, transferred size, timing, and failure, so `Cookie`, `Set-Cookie`, `Authorization`, and `Proxy-Authorization` never enter the daemon's buffer, and neither does a form's post, which carries any password the human typed during a handoff (UC45). Detection reads those two, `cf-mitigated` and `x-amzn-waf-action`, and neither carries a credential. The URL is kept verbatim, as the HLD's secrets decision accepts.
+9. **The daemon discards a request's body and headers, and keeps only the values of two challenge headers from a main-frame document's response; response bodies stay in Chrome's buffer and are read when a `network` read asks for them.** A record keeps the request id, the method, URL, resource type, status, MIME type, transferred size, timing, and failure, so `Cookie`, `Set-Cookie`, `Authorization`, and `Proxy-Authorization` never enter the daemon's buffer, and neither does a form's post, which carries any password the human typed during a handoff (UC45). Detection reads those two, `cf-mitigated` and `x-amzn-waf-action`, and neither carries a credential. The URL is kept verbatim up to its first 2,000 characters, as the HLD's secrets decision accepts; the cap bounds what a `data:` URL holds in memory.
 
 > [!example]- **Alternatives considered** — a short allowlist of response headers (only the two challenge headers) (decision 9)
 > Keep `content-type`, `cache-control`, `retry-after`, and `x-ratelimit-*` from responses — an agent debugging an API wants the rate-limit and cache headers, and an allowlist has to grow by hand while `location`, the header that a redirect line would print, carries OAuth codes and tokens; a redirect's target already shows as its next hop's record.
@@ -195,7 +194,7 @@ After a page read or an acting call, the daemon recognizes a page that a person 
 > [!abstract]- **Evidence** — a fetch from the isolated world (decision 13)
 > On a page of 127.0.0.1 that had set `sid` (`SameSite=Lax`) and `strict` (`SameSite=Strict`), a fetch from the isolated world with `credentials: 'include'` reached the server with `Cookie: sid=abc123; strict=s1` and `Sec-Fetch-Site: same-origin`. A fetch to 127.0.0.2 without CORS headers failed with `TypeError: Failed to fetch`; with `Access-Control-Allow-Origin` set to the page's origin and `Access-Control-Allow-Credentials`, it answered, carrying `Origin: http://127.0.0.1:<port>`. A 302 to the other site was followed under the default `redirect`, and under `redirect: 'manual'` the answer was `type: 'opaqueredirect'`, status 0, with nothing sent to the redirect's target. The page's `performance.getEntriesByType('resource')` listed none of these fetches.
 
-14. **`fetch` isn't an acting call: it doesn't settle, print `Changed:`, or detect.** It only reads, though it sits on `claudesurf_act`. Its body is cut at 40,000 characters, a binary body prints its type and size alone, and it fails with `error` past 20 s.
+14. **`fetch` isn't an acting call: it doesn't settle, print `Changed:`, or detect.** It only reads, though it sits on `claudesurf_act`. Its body is cut at 40,000 characters, a binary body prints its type and size alone, and it fails with `error` past 20 s, or before sending when less than 0.5 s of the call would be left.
 
 > [!info]- **Rationale** — `fetch` on the act tool (decision 14)
 > `fetch` spends the profile's cookies against a host of the agent's choosing (HLD, the two tools).
@@ -220,8 +219,8 @@ After a page read or an acting call, the daemon recognizes a page that a person 
 
 The following items remain out of scope:
 
-1. Detection excludes **challenges inside a frame of another origin**, such as a sign-in form embedded from another origin, same-site or not. Detection scans the working tab's document and its same-origin frames, and reads its frames' `<iframe>` elements for widgets. Embedded sign-in frames are rare next to full-page sign-ins. A CAPTCHA widget whose `<iframe>` sits inside a same-process child frame of the page isn't found either, since detection resolves the element in the parent's main-frame world alone. The registry's per-frame worlds could reach such an element, but this phase keeps detection to that one world.
-2. Capture excludes **exception messages and stacks**. Only the `Runtime` domain reports them (decision 8, console capture domains); a one-time replay is in the future doc.
+1. Detection excludes **challenges inside a frame of another origin**, such as a sign-in form embedded from another origin, same-site or not. Detection scans the working tab's document and the same-origin frames whose `<iframe>` or `<frame>` counts as visible, and finds widgets through the tab's frame targets and the visible `<iframe>` and `<frame>` elements that the scan reports. Embedded sign-in frames are rare next to full-page sign-ins. Detection misses two kinds of CAPTCHA widget frame. It misses a widget frame that lacks a frame target and sits inside a closed shadow root, since the scan doesn't enter closed shadow roots. It also misses a widget frame inside a same-site but cross-origin child frame, since the scan can't read that frame's document and detection resolves a frame target's `<iframe>` in the parent's main-frame world alone. The registry's per-frame worlds could reach the second, but this phase keeps that check to the one world. The scan matches a frame by its element's `src`, which can differ from the URL of the document that the frame holds, as after a script navigates the frame.
+2. Capture excludes **uncaught exceptions** entirely. On Chrome 157 only the `Runtime` domain reports them (decision 8, console capture domains); a brief `Runtime` toggle on demand is in the future doc.
 3. Capture excludes **cross-site frames**. A cross-site frame's target runs without `Network`, `Console`, or `Log`, as phase 3's settling left it, so its requests and messages aren't listed.
 4. **An Allow button on a refusal's notification** (decision 7, refusal notifications) and **a protocol-level fetch** (decision 13, page-world fetch) are deferred; both are in the future doc.
 5. Chrome draws **the passkey and security-key dialogs** outside the page; a page waiting on one reads as ordinary content.
@@ -232,7 +231,7 @@ The following items remain out of scope:
 
 1. It reads the main document's response headers, which the network capture module records.
 2. It reads the tab's frame targets, which the registry holds.
-3. It scans the document once through a page script.
+3. It scans the document through a page script, which also lists the frames that may hold a widget. The scan runs with each widget check, so the widgets that it lists get the widget wait too.
 
 A match becomes the result's `challenge`: `finishAction` and `readPage` print its `Challenge:` line, and `respond` makes the outcome `needs_human`. The daemon[^src-daemon] then opens the session's handoff in `Handoff`[^src-handoff], which notifies through `Notifier`[^src-notify], sets the urgency hint, and announces the gate's refusals in that session until the session's next call closes the handoff.
 
@@ -252,28 +251,29 @@ flowchart TD
 
 ### Detection
 
-`challenge.detect(sessions, t, opts)` resolves with `{ challenge, generation }`. `challenge` is `{ type, signal, title, clears }` or null, and `generation` is the tab's generation as detection began. A commit that lands before detection ends makes `challenge` null. The challenge fields are:
+`challenge.detect(sessions, t, opts)` resolves with `{ challenge, generation, once }`. `challenge` is `{ type, signal, title, clears }` or null, `generation` is the tab's generation as detection began, and `once` is whether the challenge is a widget without a response field. A commit that lands before detection ends makes `challenge` null. A caller that keeps the challenge for a result that can open a handoff passes the answer to `challenge.keep(t, detected)`, which returns the challenge and, for `once`, records the generation in `t.widgetReported`. `finishAction` prints the challenge without calling `keep` on a call with refusals of its own, since `respond` makes that call `needs_confirmation`, so the widget is reported again after the host question. The challenge fields are:
 
 1. `type` is `bot check`, `two-factor`, or `sign-in`.
 2. `signal` is the daemon's text for the `Challenge:` line.
 3. `title` is the document's title, for the urgency hint.
 4. `clears` is true for a challenge that may clear itself: Cloudflare's header challenge, AWS WAF's `challenge`, or DataDome's device check (decision 2, self-clearing wait).
 
-Detection runs these steps, stopping at the first match in decision 1's signal order:
+Detection runs these steps, stopping at the first match in decision 1's signal order; each widget check runs the page scan, whose answer the later signals then read. After a header match, the page scan doesn't run; `pageState` reads the document's title, and a read that fails leaves the title empty, which skips the urgency hint, and the match stands. A widget match takes its title from the scan that ran with its last check, so a scan that fails fails the whole detection, the widget match included.
 
 1. **Headers.** `network.documentSignal(t)` returns the challenge header of the response whose `loaderId` matches the one that the tab's current document committed with. The session registry[^src-sessions] records `t.loaderId` from the main frame's `Page.frameNavigated`, or, for a first commit that arrives without that event, from `Page.getFrameTree` in `readFrameTree`. The network capture module keeps, per tab, the last 10 main-frame `Document` responses by loader id, each with the values of `cf-mitigated` and `x-amzn-waf-action`, whose names it looks up without regard to case. A back-forward cache restore commits under its document's old loader id, so detection finds that document's response while the tab still holds it.
-2. **Widgets.** For each frame target under the tab (`sessions.frameTargets`) whose URL matches a vendor row below, detection checks the widget as follows:
+2. **Widgets.** A widget check judges the tab's frame targets, then runs the page scan (step 3) and judges the frames that it lists. For each frame target under the tab (`sessions.frameTargets`) whose URL matches a vendor row below, detection checks the widget as follows:
 
-    1. It asks the frame's parent target for the `<iframe>` element through `DOM.getFrameOwner` with the frame's target id, resolves it into the parent's main-frame isolated world under the object group `claudesurf-detect`, and runs the visibility script[^src-visible] on it with the vendor's response-field selector.
-    2. The script applies the visibility helper's hidden rule and the 20 × 20 minimum. It also walks up from the `<iframe>` to the closest ancestor that holds a match of the selector; that ancestor's matches are the response fields nearest the `<iframe>`, and the script reports them as one state: `filled` when every match is filled, `empty` when any isn't, and `absent` when the walk finds none. The walk climbs at most five levels, and a step from a shadow root to its host counts as one, so a field in the light DOM around a closed shadow root is found. The widget is unsolved unless the state is `filled`, so a reCAPTCHA v3 badge's token doesn't solve a v2 checkbox beside it.
-    3. An element that the world can't resolve, such as an `<iframe>` inside a same-process child frame of the parent, doesn't count and produces a debug line. The group is released in a `finally`.
-    4. `detect` takes the vendor rows as `opts.vendors`, with `VENDORS` as the default. The live test extends the rows with a row for its second site.
-3. **Page scan.** The detection script[^src-detect] runs once in the working tab's main-frame isolated world, over the document, its open shadow roots, and the documents of its same-origin child frames. It returns the title, whether a password field, a two-factor field, and a `#px-captcha` element exist, and which two-factor form matched. A field counts when the visibility helper judges it visible, it measures at least 10 × 10 CSS pixels, and its box doesn't lie wholly left of or above the document's origin, where pages park autofill honeypots. The `#px-captcha` element counts by the widgets' rule, visible and at least 20 × 20, and on every detection: HUMAN's press-and-hold is a block page, which goes away once the human passes it.
+    1. It asks the frame's parent target for the `<iframe>` element through `DOM.getFrameOwner` with the frame's target id, resolves it into the parent's main-frame isolated world under the object group `claudesurf-detect`, and runs the visibility script[^src-visible] on it with the vendor's response-field selector. It runs the script, without a selector, on the `<iframe>` of each frame between the widget's and the page as well, and a widget counts only when every one of them counts, so a widget inside a hidden outer frame doesn't.
+    2. The script applies the visibility helper's hidden rule and the 20 × 20 minimum. It also applies the nearest-field rule[^src-nearest], which walks up from the `<iframe>` to the closest ancestor that holds a match of the selector; that ancestor's matches are the response fields nearest the `<iframe>`, and the script reports them as one state: `filled` when every match is filled, `empty` when any isn't, and `absent` when the walk finds none. The walk climbs at most five levels, and a shadow root and its host count as one level each, so a field beside the `<iframe>`'s parent in the same shadow tree, or in the light DOM around a closed shadow root, is found. The widget is unsolved unless the state is `filled`, so a reCAPTCHA v3 badge's token doesn't solve a v2 checkbox beside it.
+    3. An element that the world can't resolve, such as an `<iframe>` inside a same-process child frame of the parent, doesn't count through its frame target and produces a debug line; the page scan may still count it, when the child frame is same-origin. The group is released in a `finally`.
+    4. Each frame in the scan's `frames` whose `src` matches a vendor row's frame pattern, and not the row's `notWidget`, is a visible widget, since the scan lists only visible frames. Its response field's state is the scan's entry for the row's selector, which the nearest-field rule computes in the document that embeds the `<iframe>` or `<frame>`; a row without a response field reads `absent`.
+    5. `detect` takes the vendor rows as `opts.vendors`, with `VENDORS` as the default. The live test extends the rows with a row for its second site.
+3. **Page scan.** The detection script[^src-detect] runs in the working tab's main-frame isolated world with each widget check, over the document, its open shadow roots, and the documents of its same-origin child frames whose `<iframe>` or `<frame>` passes the field rule below, so a field or a widget in a hidden or off-screen frame doesn't count. It returns the title, whether a password field and a `#px-captcha` element count, which two-factor form matched, and `frames: [{ src, fields }]`. `frames` lists each `<iframe>` or `<frame>` in the documents that it walks that is visible, at least 20 × 20, and of an `http` or `https` `src`, whatever its origin; `fields` maps each vendor row's response-field selector to the state that the nearest-field rule gives for the element. A field counts when the visibility helper judges it visible, it measures at least 10 × 10 CSS pixels, and its box doesn't lie wholly left of or above the document's origin, where pages park autofill honeypots. The `#px-captcha` element counts by the widgets' rule, visible and at least 20 × 20, and on every detection: HUMAN's press-and-hold is a block page, which goes away once the human passes it.
 
 > [!question]- **Anticipated questions** — why an `<iframe>` that the world can't resolve doesn't fall back to its box
 > `DOM.getBoxModel` measures an element's box and can't see `visibility: hidden`, which reCAPTCHA's and hCaptcha's standby frames use, so a box alone would read a hidden standby frame as a visible widget.
 
-The following vendor rows define the widgets. Add a row to support a new vendor:
+The following vendor rows define the widgets. A row's frame URL and its "not a widget" mark are matched against a frame target's URL or a scanned frame's `src`. Add a row to support a new vendor:
 
 | Vendor | Frame URL | Not a widget | Response field |
 |---|---|---|---|
@@ -283,7 +283,7 @@ The following vendor rows define the widgets. Add a row to support a new vendor:
 | DataDome | host `captcha-delivery.com` or a subdomain | — | — |
 | Arkose | host `arkoselabs.com` or `funcaptcha.com`, or a subdomain | — | — |
 
-A row without a response field lacks a solved state, so its visible frame counts once per document: the first detection on a document reports it, and later ones on that document don't, since the daemon can't tell when the human solved it. `t.widgetReported` holds the generation it was reported on. Such a row skips the widget wait. Arkose's row leaves out its `fc-token` field. DataDome's frame under the path `/interstitial/` is its device check, which reloads the page once it passes, so it counts with `clears`, as a header challenge does (decision 2, self-clearing wait).
+A row without a response field lacks a solved state, so its visible frame counts once per document: the first result on a document that keeps it reports it, and later detections on that document don't, since the daemon can't tell when the human solved it. `t.widgetReported` holds the generation it was reported on, which `challenge.keep` sets. Such a row skips the widget wait. Arkose's row leaves out its `fc-token` field. DataDome's frame under the path `/interstitial/` is its device check, which reloads the page once it passes, so it counts with `clears`, as a header challenge does (decision 2, self-clearing wait).
 
 > [!info]- **Rationale** — Arkose's response field
 > Arkose's `fc-token` field may fill as the widget loads, before anyone solves it.
@@ -291,13 +291,13 @@ A row without a response field lacks a solved state, so its visible frame counts
 The two-factor field takes two forms besides `autocomplete="one-time-code"`:
 
 1. The field is an `input` of type `text`, `tel`, or `number`, or with `inputmode="numeric"`. Its text names a sign-in code, and its `maxlength`, when it has one, is from 4 to 8. A `number` input doesn't have a `maxlength`. Its `Challenge:` signal is `a verification-code field`.
-2. A run of 4 to 8 single-character inputs (`maxlength="1"`) that follow one another in document order with no other input between them forms the split-box code prompt. Its text needn't name a code; only the exclusions below read it. Its signal is `a row of code boxes`.
+2. A run of 4 to 8 single-character inputs (`maxlength="1"`) that follow one another in document order with no other input between them, all in one document or shadow root, forms the split-box code prompt. Its text needn't name a code; only the exclusions below read it. Its signal is `a row of code boxes`.
 
 A field's text is its `name`, `id`, `placeholder`, `aria-label`, and label; a row's is its first box's `name`, `id`, and `aria-label`, with the `aria-label` or `<legend>` of the nearest element holding every box. The text splits into lowercase words at each character other than a letter or a digit and at each change from lower to upper case, so `app_otp`, `mfaCode`, and `totpPin` yield `otp`, `mfa`, and `totp`. It names a sign-in code when one of its words starts with `otp`, `2fa`, `mfa`, or `totp` or is `passcode`, or when its words hold one of the runs `one time`, `two factor`, `two step`, `verification code`, `authentication code`, and `sign in code`. Neither form counts for a field, or a row with a box, whose `autocomplete` is `postal-code` or starts with `cc-`, or whose words also hold `postal`, `zip`, `card`, `cvc`, `cvv`, `csc`, `promo`, `coupon`, or `gift`, so a checkout's postal code and card security code don't read as two-factor.
 
-The **waits** of decision 2 (self-clearing and widget waits) run in `finishAction` and in `detect`. `finishAction` detects inside its wait and settle loop, once settling ends, with a deadline 3 s short of the request's to reserve time for the summary. For a result with `clears` on a document whose generation differs from `t.clearWaited`, it records the generation and waits through `Sessions.waitUntil` for the tab's navigation count to pass the count that settling covered, for up to 10 s cut to that deadline. `detect` runs the widget wait: on a document whose generation differs from `t.widgetWaited`, it records the generation and runs the widget check again every 500 ms, for up to 3 s cut to `opts.deadline`, until each unsolved widget with a response field has it filled, or a navigation starts. A navigation that starts during either wait sends `finishAction` round its loop again, as one that starts during settling does. `readPage` passes a deadline 2 s short of the request's.
+The **waits** of decision 2 (self-clearing and widget waits) run in `finishAction` and in `detect`. `finishAction` detects inside its wait and settle loop, once settling ends, with a deadline 3 s short of the request's to reserve time for the summary. For a result with `clears` on a document whose generation differs from `t.clearWaited`, with at least 500 ms left before that deadline, it records the generation and waits through `Sessions.waitUntil` for the tab's navigation count to pass the count that settling covered, for up to 10 s cut to that deadline. `detect` runs the widget wait, which ends 500 ms before `opts.deadline` so its last check, whose page scan reads the title, has time to answer. On a document whose generation differs from `t.widgetWaited`, and while at least one 500 ms check fits before that end, it records the generation and runs the widget check again every 500 ms, for up to 3 s, until each unsolved widget with a response field has it filled, or a navigation starts; a wait that a navigation ends checks the widgets once more, so a field that filled before it reads as solved. A navigation that starts during either wait sends `finishAction` round its loop again, as one that starts during settling does. `readPage` passes a deadline 2 s short of the request's.
 
-`finishAction` and `readPage` each note the tab's generation as they read their state lines. They keep the result's `challenge`, with its `Challenge:` line, only when that generation equals the one `detect` judged, so a `needs_human` outcome and its line describe the document that the state lines print. The caller catches a detection that throws and logs it at info. A closed pipe and a working tab gone from the registry take the caller's existing paths.
+`finishAction` notes the tab's generation after it reads its state lines, and `readPage` relies on `requireSameDocuments`, which fails a read whose documents changed. Each keeps the result's `challenge`, with its `Challenge:` line, only when the generation equals the one `detect` judged, so a `needs_human` outcome and its line describe the document that the state lines print. `readPage` calls `challenge.keep` once it has built the payload, so a read that fails after detection, as one whose offset is past the end, doesn't spend a widget without a response field. The caller catches a detection that throws and logs it at info. A closed pipe and a working tab gone from the registry take the caller's existing paths.
 
 ### The handoff and notifications
 
@@ -307,7 +307,7 @@ The daemon calls `handoff.closed(sessionId)` at the start of each queue slot but
 
 1. The open handoff `{ windowId }`, per session id.
 2. The hosts and times of refusal notices, per session id.
-3. The time of each notification by session, type, and the URL's origin and path, daemon-wide. Entries older than 10 minutes are pruned on each use.
+3. The time of each notification by session, type, and the URL's origin and path, daemon-wide. Entries older than 10 minutes are pruned on each use, and each `opened` and `refused` prunes every session's refusal notices the same way.
 
 `opened` notifies unless the key is fresh, then looks for the window (decision 6, window marks) and marks it, remembering the window id for `closed`. It marks the window only when the same handoff is still open as the search resolves, so a `closed` that ran first leaves the window unmarked. It runs a window's mark commands one after another, so a clear lands after a set that began before it. `refused(session, entry)` runs for every refusal that the handler and the backstop record. It notifies when the session's handoff is open, the session's refusal notices of the last 10 minutes don't name the entry's host, and fewer than three such notices exist, then records the host and the time.
 
@@ -336,11 +336,7 @@ The notification texts use `<label>` and `<host>`. `<label>` is the session's la
 
 ### Console capture
 
-The console capture module enables `Console` and `Log` on a tab from `arming.arm` and disables both from `arming.disarm`, dropping the tab's list and its replay mark; `Sessions.forget` drops the list too. It records each `Console.messageAdded` and `Log.entryAdded` as an entry `{ n, kind, level, text, url, line, column }` on a tab whose `armingSent` holds; arming sets that flag as it sends, and disarming clears it. `kind` is `console` for a page's call and `chrome <source>` for a `Log` entry.
-
-A `console` read of the working tab first replays its stored messages: it marks the tab as replaying, sends `Console.disable` and then `Console.enable`, and takes every message that arrives before the enable's answer as the replay rather than as an entry. It counts the replay's messages whose text starts with `Uncaught`, so the count holds if Chrome appends the exception's message to the text. It groups them by location and by a fixed label: `Uncaught (in promise)` for a text with that start, and `Uncaught` for the rest. The head's `Exceptions:` line prints up to 10 locations with their labels and counts, then `… and N more locations`; a message's own text never prints there. The line covers the current document as far as Chrome's store holds it; the store keeps at most 1,000 messages, and `console.clear()` and a navigation empty it. A page's own `console.log` whose text starts with `Uncaught` reads as an exception there, since the replay can't tell the two apart. A replay without such a message prints `Exceptions: none in the messages Chrome stores for this document`.
-
-The replaying mark clears when the enable answers. An enable that fails or times out leaves the mark in place, so the tab's console capture stays off and a late replay is dropped. The `Exceptions:` line then reads `Exceptions: not checked (the replay failed)`, with a warn line, and the tab's next `console` read tries the replay again, which turns capture back on once its enable answers.
+The console capture module enables `Console` and `Log` on a tab from `arming.arm` and disables both from `arming.disarm`, dropping the tab's list; `Sessions.forget` drops the list too. It records each `Console.messageAdded` and `Log.entryAdded` as an entry `{ n, kind, level, text, url, line, column }` on a tab whose `armingSent` holds; arming sets that flag as it sends, and disarming clears it. Chrome answers each enable after replaying the document's stored console calls and `Log` entries, so a tab that is armed again after a disarm records them as new entries. `kind` is `console` for a page's call and `chrome <source>` for a `Log` entry. Chrome doesn't cap a message's text, so an entry stores its text in its printed form, collapsed and cut at 1,000 characters, and the first 1,000 characters of its URL, which prints through `cappedUrl`. A `console` read lists the working tab's entries after its cursor (Reading after a cursor).
 
 ### Network capture
 
@@ -353,7 +349,7 @@ The request tracker calls the sink after its own bookkeeping, under a try/catch 
 
 Each entry that the request tracker holds for a request in flight carries its record. The tracker calls the sink at these points and passes how the request ended as an argument to `ended`:
 
-1. `requestWillBeSent` starts an entry, and `sink.started` builds its record from the request id, the method, the URL, the resource type, and the start time, leaving out the headers and the post data. When the event carries a `redirectResponse`, the earlier hop's record takes that status and ends as `redirect`, and the new hop's entry starts a record of its own under the same request id; only the new hop's record can take a body.
+1. `requestWillBeSent` starts an entry, and `sink.started` builds its record from the request id, the method, the URL's first 2,000 characters, the resource type, and the start time, leaving out the headers and the post data. When the event carries a `redirectResponse`, the earlier hop's record takes that status and ends as `redirect`, and the new hop's entry starts a record of its own under the same request id; only the new hop's record can take a body.
 2. The request tracker now takes `responseReceived` too and passes it to `sink.response`, which adds the status and the MIME type. For a main-frame `Document` response, the network capture module also keeps the loader id and the values of the two challenge headers, which detection reads.
 3. `loadingFinished` ends the entry as `finished`, and `sink.ended` adds the transferred size (`encodedDataLength`, which on HTTP/1.1 counts the response's headers too); `loadingFailed` ends it as `failed`, and `sink.ended` adds `errorText`, `canceled`, and `blockedReason`.
 4. A main-frame commit ends the earlier documents' entries as `ended by a navigation`, and a frame's document request ends as `continued in a cross-site frame` when its frame attaches as its own target. Settling already ends entries at both points.
@@ -361,9 +357,9 @@ Each entry that the request tracker holds for a request in flight carries its re
 
 A record holds those fields and how it ended, and nothing else. The network capture module numbers each record from the daemon-wide counter as it arrives and keeps it in the tab's `Ring` of 500, and keeps the last 10 document responses per tab by loader id for `documentSignal`. `arming.disarm` and `Sessions.forget` drop the ring with the request tracker's store.
 
-A `network` read lists the working tab's ended records numbered above `after`, then the requests still in flight from the request tracker's store, filtered case-insensitively when `filter` is given. Under a filter it reads each eligible body (decision 12, bodies under a filter) with `Network.getResponseBody` as it prints the record, while the request deadline and the 40,000-character budget last. When either runs out before a body is read, the list is cut at that record, so the cut's `after` continues with it.
+A `network` read lists the working tab's ended records numbered above `after`, then the requests still in flight from the request tracker's store, filtered case-insensitively when `filter` is given, against the URL both as stored and in its percent-encoded form. Under a filter it reads each eligible body (decision 12, bodies under a filter) with `Network.getResponseBody` as it prints the record, while the request deadline and the 40,000-character budget last. When either runs out before a body is read or printed, the list is cut at that record, so the cut's `after` continues with it.
 
-A body is eligible when its record is an XHR, fetch, or document request that finished and its MIME type is textual: `text/*`, `application/json`, `application/xml`, `application/javascript`, `application/x-www-form-urlencoded`, or a type ending in `+json` or `+xml`. The type is judged on its part before any `;`, trimmed and lowercased. The MIME module[^src-mime] holds that rule as the source of a pattern: the network capture module matches types against the pattern, and the fetch script[^src-page-fetch] takes the source as an argument. The pattern doesn't match an empty type. The network capture module counts an empty type as textual, since Chrome's `base64Encoded` settles a binary body; the fetch script sends an untyped body to its decoder, so `fetch` prints the body as text when it decodes as UTF-8, and as binary otherwise. A base64 answer prints `(binary body, <n> bytes)`, and a `ProtocolError` prints `(body not kept)`.
+A body is eligible when its record is an XHR, fetch, or document request that finished and its MIME type is textual: `text/*`, `application/json`, `application/xml`, `application/javascript`, `application/x-www-form-urlencoded`, or a type ending in `+json` or `+xml`. The type is judged on its part before any `;`, trimmed and lowercased. The MIME module[^src-mime] holds that rule as a pattern's `{ source, flags }`: the network capture module matches types against the pattern, and the fetch script[^src-page-fetch] takes both as an argument. The pattern doesn't match an empty type. The network capture module counts an empty type as textual, since Chrome's `base64Encoded` settles a binary body; the fetch script sends an untyped body to its decoder, so `fetch` prints the body as text when it decodes as UTF-8, and as binary otherwise. A base64 answer prints `(binary body, <n> bytes)`, a text body that is empty once the reserved characters are stripped prints `(empty body)`, and a `ProtocolError` prints `(body not kept)`.
 
 Neither the network capture module nor the console capture module, nor any module that either loads, requires the session registry. Both take the registry from their callers' arguments and avoid the read, response, and reference modules[^src-capture-deps].
 
@@ -385,17 +381,21 @@ The `Requests:` line echoes the agent's `filter` through `cappedText(filter, 100
 
 `fetch(ctx, session, { url }, deadline)` takes the working tab and runs the request in these steps:
 
-1. It refuses a tab off `http` and `https` with the existing `navigate first` error, then runs `navigation.precheck` with the kind `fetch`. A refusal returns the working tab's state lines and the entry as `blocked`.
-2. It calls the fetch script in the tab's main-frame isolated world with the URL, the 40,000-character cap, and a timeout of 20 s cut to the deadline less 2 s, under a protocol timeout 2 s longer than the script's. The call runs once, through `sessions.world` and `sessions.callFunction` rather than `callInWorld`, whose `withWorld` retries a missing context. A commit during the fetch discards the world, and the call answers `error` saying that the page navigated during the fetch and the request may have been sent.
-3. The page script fetches with `credentials: 'include'`, `redirect: 'manual'`, and `cache: 'no-store'`. It reads a textual body through a stream reader until the cap and cancels the rest, counts a binary body's bytes up to 10 MiB and cancels the rest, and aborts at its timeout. It reads an untyped body as text through a fatal UTF-8 decoder until the cap; at the first invalid sequence it counts the bytes instead, as it does a binary body's. An untyped body's `Status:` gives `no type` in place of the MIME type.
-4. It answers `{ status, statusText, contentType, bytes, body, cut }`, `{ redirected: true }`, or `{ failed: 'network' | 'timeout' }`; `bytes` counts the body's bytes that it read after `Content-Encoding` is undone, including a binary body's bytes and those counted after a switch from the decoder.
+1. It resolves `url` to its absolute form, `new URL(url).href`, and uses that form for the gate, the script, `Fetched:`, and the failure text. The page's `fetch()` resolves a URL such as `http:host/path` against the document's base URL, which a page-set `<base href>` changes, while the gate parses it without a base; the absolute form resolves the same against any base.
+2. It refuses a tab off `http` and `https` with the existing `navigate first` error, then runs `navigation.precheck` with the kind `fetch`. A refusal returns the working tab's state lines and the entry as `blocked`.
+3. Once the world resolves, it calls the fetch script in the tab's main-frame isolated world with the absolute URL, the 40,000-character cap, and a timeout of 20 s cut to the deadline less 2 s, under a protocol timeout 2 s longer than the script's and the request's deadline. With less than 0.5 s for the script, it answers `error` without sending. The call runs once, through `sessions.world` and `sessions.callFunction` rather than `callInWorld`, whose `withWorld` retries a missing context. A commit while the world resolves fails the call before sending, with `error` saying that nothing was sent. A commit during the fetch discards the world, and so does one that the generation shows after a successful answer; either way the call answers `error` saying that the page navigated during the fetch and the request may have been sent.
+4. The page script fetches with `credentials: 'include'`, `redirect: 'manual'`, and `cache: 'no-store'`. It reads a textual body through a stream reader until the cap and cancels the rest, counts a binary body's bytes up to 10 MiB and cancels the rest, and aborts at its timeout. It reads an untyped body as text through a fatal UTF-8 decoder until the cap; at the first invalid sequence it counts the bytes instead, as it does a binary body's. The cap applies after the decoder's final flush too, so a body that passes the cap only when the flush turns an unfinished sequence into a character is cut. An untyped body's `Status:` gives `no type` in place of the MIME type.
+5. It answers `{ status, statusText, contentType, bytes, body, cut }`, `{ redirected: true }`, or `{ failed: 'network' | 'timeout' }`; `bytes` counts the body's bytes that it read after `Content-Encoding` is undone, including a binary body's bytes and those counted after a switch from the decoder.
 
 > [!info]- **Rationale** — a single fetch attempt
 > A retry would send the request again from another document.
 
+> [!abstract]- **Evidence** — a URL that the page resolves against its base
+> Live on Chrome 157, a fetch of `http:127.0.0.2:<port>/echo` from a page of 127.0.0.1, sent as given, went to the page's own host, and with a `<base href>` naming another host it went to that host, which the gate never checked. The live capture test checks that the absolute form reaches the host that the gate read.
+
 A `network` failure of a cross-origin URL reads `the request to <url> failed: its server didn't allow this page's origin to read it (CORS), the page's content security policy refused it, or the network failed; to read it with that origin's cookies, navigate to its origin and fetch there`. A `network` failure of a same-origin URL reads `the request to <url> failed: the page's content security policy refused it, or the network failed`.
 
-`Gate.check` takes the kind `fetch`, and `blockedLine` prints it as `fetch of <url> (not sent)`. The envelope module's[^src-envelope] before-acting message changes from "The navigation was not started" to "The call didn't start", since it now answers `fetch` too.
+`Gate.check` takes the kind `fetch`, and `blockedLine` prints it as `fetch of <url> (not sent)`. The envelope module's[^src-envelope] before-acting message changes from "The navigation was not started" to "The call didn't start", since it now answers `fetch` too. Both `needs_confirmation` messages spell out the `policy` call (`claudesurf_act` with `action: policy`, `op`, and `host` set to the host on the `Blocked:` line), since a session whose tool schema predates the `policy` action still reads them; the host itself stays on its `Blocked:` line, inside the untrusted-content markers.
 
 ### Downloads
 
@@ -409,7 +409,6 @@ The page or a server chooses every field below. Each field prints on a line of i
 |---|---|---|
 | A console message's text | `console` entry line | `cappedText(text, 1000)` |
 | A `Log` entry's text | `console` entry line | `cappedText(text, 1000)` |
-| An exception's location | `Exceptions:` line | `cappedUrl`, with the line and column as numbers |
 | A console or `Log` entry's URL | `console` entry line | `cappedUrl` |
 | A request's URL | `network` entry line | `safeUrl`, cut at 1,000 characters |
 | A request's method | `network` entry line | an HTTP token of at most 20 characters, else `?` |
@@ -426,7 +425,7 @@ The protocol supplies line and column numbers, statuses, sizes, resource types, 
 
 ### Time budget
 
-A navigation onto a challenge that may clear itself spends its load wait and settling as before, then waits up to 10 s, once per document, for the challenge to clear, cut so that 3 s of the 33 s deadline remain for the change summary. A navigation that starts in that wait gets phase 3's 10 s load wait and settling again. A widget's wait takes up to 3 s once per document. `fetch` gets up to 20 s, and a `network` read's bodies share what is left of the deadline. The page scan and the frame-owner checks are a few protocol round trips per call.
+A navigation onto a challenge that may clear itself spends its load wait and settling as before, then waits up to 10 s, once per document, for the challenge to clear, cut so that 3 s of the 33 s deadline remain for the change summary. A navigation that starts in that wait gets phase 3's 10 s load wait and settling again. A widget's wait takes up to 3 s once per document. `fetch` gets up to 20 s, and a `network` read's bodies share what is left of the deadline. The page scan and the frame-owner checks are a few protocol round trips per widget check, and the widget wait repeats that check every 500 ms.
 
 ## API / Schema
 
@@ -436,11 +435,13 @@ A navigation onto a challenge that may clear itself spends its load wait and set
 |---|---|---|
 | `claudesurf_read` | `console` | `after` (integer ≥ 0, default 0) |
 | | `network` | `filter` (string, non-empty), `after` (integer ≥ 0, default 0) |
-| `claudesurf_act` | `fetch` | **`url`** (http or https) |
+| `claudesurf_act` | `fetch` | **`url`** (http or https, without a user name or password) |
+
+`dispatch` answers `schema_error` for a `fetch` URL that carries a user name or password, since the page's `fetch()` throws on such a URL.
 
 The verb index adds these entries:
 
-1. `console`(after) — the working tab's console messages and Chrome's own messages, numbered, oldest first, with an Exceptions: line counting the document's uncaught exceptions by location; after=N returns those numbered above N.
+1. `console`(after) — the working tab's console messages and Chrome's own messages, numbered, oldest first, without uncaught exceptions; after=N returns those numbered above N.
 2. `network`(filter, after) — the working tab's requests, numbered; filter=text keeps those whose URL contains it and prints their text response bodies; after=N returns those numbered above N.
 3. `fetch`(url) — GET an http(s) URL from the working tab with its cookies, as the page's own script would: same-origin, or a server that allows the page's origin; redirects are not followed.
 
@@ -469,7 +470,6 @@ The other `Challenge:` forms: `bot check — Cloudflare (the page's cf-mitigated
 URL: https://app.example/settings
 Title: Settings
 Console: 3 entries after 0; the tab keeps its last 500
-Exceptions: Uncaught at https://app.example/main.js:1:20334 (×2), from the messages Chrome stores for this document
 Next: after=64
 
 [41] log https://app.example/main.js:12:5 saving \[object Object\]
@@ -502,7 +502,7 @@ Status: 200 OK (application/json, 3214 bytes)
 {"orders":[{"id":17,"state":"shipped"}]}
 ```
 
-A redirect prints `Redirected: not followed; navigate to the URL to follow it through the domain gate` in place of `Status:`, without a body. A cut adds `Body: the first 40000 characters; the response is longer`, and its `Status:` gives the size as `at least <n> bytes`. A binary body prints `Status: 200 OK (application/pdf, 48211 bytes; binary, not shown)`, or `over 10 MiB` in place of the size. A refusal prints `Blocked: [t1] api.other.example — fetch of https://api.other.example/v1/me (not sent)`.
+A redirect prints `Redirected: not followed; navigate to the URL to follow it through the domain gate` in place of `Status:`, without a body. A cut adds `Body: the first 40000 characters; the response is longer`, or 39999 when the cut would split a surrogate pair, and its `Status:` gives the size as `at least <n> bytes`. A binary body prints `Status: 200 OK (application/pdf, 48211 bytes; binary, not shown)`, or `over 10 MiB` in place of the size. A refusal prints `Blocked: [t1] api.other.example — fetch of https://api.other.example/v1/me (not sent)`.
 
 An acting call that started a download:
 
@@ -524,7 +524,8 @@ needsHuman(payload, { notes, type, label })  // outcome 'needs_human'; the messa
 
 ```js
 // challenge.js — detection over the working tab
-detect(sessions, t, { deadline, vendors })  // → { challenge: { type, signal, title, clears } | null, generation }; challenge is null when a commit landed meanwhile; rejects as the page's commands do
+detect(sessions, t, { deadline, vendors })  // → { challenge: { type, signal, title, clears } | null, generation, once }; challenge is null when a commit landed meanwhile; rejects as the page's commands do
+keep(t, detected)                           // → detected's challenge or null; spends a once-per-document widget on detected.generation
 VENDORS                             // the vendor rows (Design, detection)
 
 // handoff.js
@@ -550,6 +551,9 @@ class Ring {
   after(n)                          // → { entries numbered above n, missedThrough: the highest dropped number above n, or null }
 }
 issued()                            // → the highest number the daemon-wide counter has given
+readAfter(ring, after)              // → { entries, missed, next }: the entries listed, the Missed: line or null, and an uncut answer's Next:
+printEntries(entries, next, textOf) // → { lines, printed, used, next }: lines within READ_CHARS (40,000), cut at the first entry whose text doesn't fit or is null, whose number less 1 is then next
+cursorHead({ state, label, printed, after, filter, kept, missed, next })  // → the head: state lines, the count line, Missed:, Next:
 
 // console-capture.js
 attachConsole(conn, sessions)       // Console.messageAdded, Log.entryAdded → the tab's list
@@ -568,7 +572,7 @@ attachRequests(conn, sessions, sink) // gains the sink, which it calls at each s
 inFlight(t)                         // → the records of the tab's requests in flight
 
 // mime.js — loaded by network.js and fetch.js; page/fetch.js takes the source as an argument
-TEXTUAL                             // the source of the pattern that a textual MIME type matches
+TEXTUAL                             // { source, flags } of the pattern that a textual MIME type matches
 
 // fetch.js
 fetch(ctx, session, { url }, deadline)  // the fetch handler
@@ -586,10 +590,10 @@ A handler's result, which `respond` takes, gains `challenge`, which `readPage` a
 
 The fake browser implements these protocol responses and page-script answers:
 
-1. It answers `Console.enable`, `Console.disable`, `Log.enable`, and `Log.disable`. It replays `page.console`, a list of messages, ahead of each `Console.enable`'s answer, and raises a message live when a test calls `logConsole`.
+1. It answers `Console.enable`, `Console.disable`, `Log.enable`, and `Log.disable`. It raises a `Console` message live when a test calls `logConsole`, and a `Log` entry when it calls `logEntry`, each on a target with that domain enabled.
 2. `Network.responseReceived` carries `site[url].headers` and `status` for a document. `Network.getResponseBody` answers from `site[url].bodies` by request URL, or with `evicted`.
 3. `DOM.getFrameOwner` answers from a frame target's `owner`, `{ backendNodeId, visible, field, unresolvable }`. `DOM.resolveNode` fails for an `unresolvable` owner, and `claudesurfVisible` answers `visible` and the response field's state `field`.
-4. `claudesurfDetect` answers `site[url].detect`, quiet by default, and `claudesurfFetch` answers `site[url].fetch[url]`.
+4. `claudesurfDetect` answers `site[url].detect`, quiet and with an empty `frames` list by default, and `claudesurfFetch` answers `site[url].fetch[url]`.
 5. `Page.downloadWillBegin` carries `site[url].download`'s `file`.
 6. `Page.getFrameTree` carries the committed document's loader id.
 
@@ -611,10 +615,10 @@ The existing files need these changes:
 10. `server/sessions.js` — Record `loaderId` at a main-frame commit and in `readFrameTree`, and `downloadLog` in `onDownload`. Add `clearWaited`, `widgetWaited`, and `widgetReported`. Call `network.drop` and `console-capture.js`'s drop in `forget`. Call `attachConsole` in `attach`, and pass `network.js`'s sink to `attachRequests`. Add the new fields to `targetRecord`'s comment.
 11. `server/gate.js` — Add `onRefusal`, called from `refuse` in a microtask with its throw caught, and add the `fetch` kind in `check`.
 12. `server/browser.js` — Have `reapOrphan` resolve `{ found, reaped }`. Stop `launch` from clearing the record when the pipe closes, so the next launch overwrites it and `reapOrphan` clears a record whose process is gone.
-13. `server/action-support.js` — Add `DETECT_SOURCE`, `VISIBLE_SOURCE`, and `FETCH_SOURCE`, with `state.js` spliced into the first two.
+13. `server/action-support.js` — Add `DETECT_SOURCE`, `VISIBLE_SOURCE`, and `FETCH_SOURCE`, with `state.js` and `page/nearest.js` spliced into the first two. Add `cutText`, the code-point-safe cut that the capped fields share, and `pipeClosed` and `pipeClosedOrTabGone`, which `challenge.js`, `changes.js`, `region.js`, and `act-result.js` share. Add `collapsedText`, the printed form that console capture stores, and `letters`, which console and network capture share, and `SPACES`, the collapse that one-line fields share, which counts U+0085 as a line break. `page/collapse.js` takes U+0085 the same way, and `page/render.js` and `page/walk.js` now include it. `paths.js` takes `dropUnreadableXauthority` from `browser.js`, and `envelope.js`'s `oneLineLabel` is the label's collapse for both the `needs_human` message and the notifications.
 14. `server/package.json`, `server/package-lock.json` — Change the version to 2.3.0.
 15. `README.md` — Add the three actions to the tool table and the outcomes paragraph. Add a section on challenges and the handoff, with the notifications, the urgency hint, and the second OS user's chat fallback. Add a section on capture, with what is kept and what isn't, and add `fetch`'s rules. Add the `Download:` and `Challenge:` lines among the head lines, and add Troubleshooting for notifications that don't appear and a `needs_human` that keeps coming back.
-16. `.claude/context/architecture.md` — Add the modules and sections on detection, the handoff, and capture. Add `needs_human` in Responses, the handoff close in the request flow, and object group `claudesurf-detect`. Update Storage's browser record, which now stays when the pipe closes. Add gotchas for the `Runtime` hook, the `Console` replay, `getFrameOwner` through a closed shadow root, header case, and post data in `requestWillBeSent` whatever `maxPostDataSize` says.
+16. `.claude/context/architecture.md` — Add the modules and sections on detection, the handoff, and capture. Add `needs_human` in Responses, the handoff close in the request flow, and object group `claudesurf-detect`. Update Storage's browser record, which now stays when the pipe closes. Add gotchas for the `Runtime` hook; Chrome 157 reporting an uncaught exception only through `Runtime`, which a listener in the isolated world doesn't see either; the replay of a document's stored messages at `Console.enable` and `Log.enable`, which a tab armed again after a disarm records as new entries; `getFrameOwner` through a closed shadow root; header case; and post data in `requestWillBeSent` whatever `maxPostDataSize` says.
 17. `.claude/context/docs.md` — List the README's new sections.
 
 ### New
@@ -625,13 +629,14 @@ The new files provide these functions:
 2. `server/handoff.js` — Implement the handoff per session, the notification limit, and the urgency hint's lifetime.
 3. `server/notify.js` — Run `notify-send`, `xdotool`, and `wmctrl`, with their environment and failure logging.
 4. `server/ring.js` — Implement a capped list of numbered entries, read after a cursor.
-5. `server/console-capture.js` — Implement `Console` and `Log` capture, the replay, and the `console` read.
+5. `server/console-capture.js` — Implement `Console` and `Log` capture and the `console` read.
 6. `server/network.js` — Handle the records that `requests.js` passes over, the document responses' challenge headers, and the `network` read with its bodies.
 7. `server/fetch.js` — Implement the `fetch` action.
 8. `server/mime.js` — Implement the rule for a textual MIME type, shared by `network.js` and `page/fetch.js`.
-9. `server/page/detect.js` — Implement the page scan.
+9. `server/page/detect.js` — Implement the page scan, with the frames that may hold a widget.
 10. `server/page/visible.js` — Determine whether an element is visible and at least 20 × 20, and the state of the response fields nearest it.
-11. `server/page/fetch.js` — Implement the request, its body, and its timeout.
+11. `server/page/nearest.js` — Implement the nearest-field rule, one file spliced into `page/visible.js` and `page/detect.js`. It tests node types rather than `instanceof`, so it works on the nodes of a same-origin frame, which belong to that frame's realm. `page/state.js`'s aria-hidden walk crosses a shadow boundary by the same node-type test, for the same reason.
+12. `server/page/fetch.js` — Implement the request, its body, and its timeout.
 
 ## Tests
 
@@ -643,24 +648,26 @@ The new and modified tests cover the following behavior:
 
         1. Test both headers, in any case, and AWS's two values.
         2. Test each vendor row with and without its "not a widget" mark.
-        3. Test a hidden, a too-small, and an unresolvable `<iframe>`.
-        4. Test a filled, an empty, and an absent response field nearest the widget while another of its vendor's fields sits elsewhere on the page. Test an ancestor holding two fields, which reads as solved only when both are filled.
-        5. Test a widget in a closed shadow root whose field sits in the host's light DOM.
-        6. Test that a row without a field counts once per document.
-        7. Test the word split of identifiers and labels.
-        8. Test press-and-hold.
-        9. Test the three two-factor forms and their exclusions.
-        10. Test a password field.
+        3. Test a hidden, a too-small, and an unresolvable `<iframe>`. Test that a widget frame whose parent frame goes during detection doesn't count while the page's own signals still do.
+        4. Test an `<iframe>` that the page scan lists without a frame target, matched by its `src` against the vendor rows and their "not a widget" marks, under each state of its nearest response field.
+        5. Test a filled, an empty, and an absent response field nearest the widget while another of its vendor's fields sits elsewhere on the page. Test an ancestor holding two fields, which reads as solved only when both are filled.
+        6. Test a widget in a closed shadow root whose field sits in the host's light DOM.
+        7. Test that a row without a field counts once per document.
+        8. Test the word split of identifiers and labels.
+        9. Test press-and-hold.
+        10. Test the three two-factor forms and their exclusions.
+        11. Test a password field.
     2. Test a generation that moves during detection.
     3. Test a DataDome interstitial's `clears`.
     4. Test a header found by a back-forward cache restore's loader id.
-    5. Test that the widget wait is spent once per document, and a field that fills within it.
-    6. Test a scan that throws.
+    5. Test that the widget wait is spent once per document, and a field that fills within it, a scanned widget's included. Test that a visible widget whose response field reads absent gets the wait, as an empty one does, and that a hidden widget leaves the wait unspent. Test that the wait's last check waits only for what is left before the wait ends.
+    6. Test a scan that throws. Test that a widget check that fails other than as the protocol's, as when a frame owner doesn't answer in time or the visibility script throws, rejects `detect`, and that `detectOrLog` logs it at info and answers null.
+    7. Test that the title comes from the page-state read after a header match and from the scan after a widget match.
 2. **New** `test/handoff.test.js` — Test the following cases:
 
     1. Test that `opened` notifies once per session, type, and URL origin and path in 10 minutes, even when the query changes, and notifies again after the 10 minutes.
     2. Test that a refusal notifies while the handoff is open, once per host and three times at most per session in 10 minutes across handoffs, and not after `closed`.
-    3. Test that a `closed` during the window search leaves the window unmarked, and that a clear is queued behind a set.
+    3. Test that a `closed` during the window search leaves the window unmarked, and that a clear is queued behind a set. Test that a mark command waits for the window's last one, which a command that ended before it doesn't stand in for.
     4. Test that the mark is set on the one matching window and cleared on `closed`.
     5. Test that the mark is skipped for two matches, none, an empty title, and Wayland.
     6. Test the texts and the markup escape through a fake `Notifier`.
@@ -668,7 +675,7 @@ The new and modified tests cover the following behavior:
 
     1. Test the arguments of `notify-send`, `xdotool`, and both marks' commands.
     2. Test `--` before the summary.
-    3. Test the environment's merge.
+    3. Test the environment's merge, and that an empty value in the request doesn't add its variable.
     4. Test that a missing binary is logged once.
     5. Test that a missing `wmctrl` leaves the urgency bit.
     6. Test that a failure's stderr is logged at info once.
@@ -676,60 +683,63 @@ The new and modified tests cover the following behavior:
 4. **New** `test/ring.test.js` — Test the cap, the daemon-wide numbering, `after`, `missedThrough`, and `issued()`.
 5. **New** `test/console-capture.test.js` — Test the following cases:
 
-    1. Test live entries of both domains.
-    2. Test the `Exceptions:` line from a replay:
+    1. Test live entries of both domains, each on a line of its own:
 
-        1. Test its prefix match on `Uncaught` and its two fixed labels: a replayed `Uncaught TypeError: <page text>` and an `Uncaught (in promise) …` print their label, location, and count, and none of their text.
-        2. Test its counts by location and its 10-location cap.
-        3. Test its `none` and `not checked` forms.
-    3. Test that a failed or timed-out enable leaves capture off, a late replay is dropped, and the next read's replay turns capture back on.
-    4. Test that replayed messages aren't recorded as entries.
-    5. Test the read's head, cursor, and cut.
-    6. Test enable and disable from arming and disarming.
-    7. Test that the list is dropped on disarm and on `forget` and kept across a navigation.
-    8. Test that nothing is recorded on a tab whose `armingSent` doesn't hold.
+        1. Test that an entry's text prints as one capped line with its brackets escaped, and its level and source as lowercase letters alone.
+        2. Test that an entry's URL prints escaped and cut at 200 characters from a URL longer than the 1,000 that the entry keeps.
+        3. Test that an entry without a level of letters prints as `log`, that a location prints only the numbers that the protocol supplied after its URL, and that a location without a URL doesn't print.
+    2. Test that an entry keeps its text collapsed and cut as it prints, so a long text's cut lands where the whole text's would.
+    3. Test the read's head, cursor, and cut, and its `Missed:` lines for a drop past the tab's 500 and for a restart.
+    4. Test enable and disable from arming and disarming.
+    5. Test that a `Console.enable` or `Log.enable` that Chrome refuses leaves the tab armed with a warn line, and that one refused after its tab went logs at debug, without an unhandled rejection.
+    6. Test that the list is dropped on disarm and on `forget` and kept across a navigation.
+    7. Test that nothing is recorded on a tab whose `armingSent` doesn't hold.
 6. **New** `test/network.test.js` — Test the following cases:
 
-    1. Test a record's lifecycle through redirect, finish, failure, a main-frame commit, and a frame's own attach, and that it is numbered as it ends.
-    2. Test that a record in flight is unnumbered and prints after the numbered ones on each read, at most 20 of them, and that once it ends it is numbered above an earlier read's `Next:`.
+    1. Test a record's lifecycle through redirect, finish, failure, a main-frame commit, and a frame's own attach, and that it is numbered as it ends. Test that a request sent again under its id without a redirect response ends its first hop as a redirect, without a log line.
+    2. Test that a record in flight is unnumbered and prints after the numbered ones on each read, at most 20 of them, and that once it ends it is numbered above an earlier read's `Next:`. Test that a request that started before the tab's arming went out is neither listed in flight nor recorded as it ends.
     3. Test that a record lacks headers and post data.
     4. Test that `requests.js` passes records at each way a request ends, except for an evicted or dropped entry, and that the request id is kept for a body.
     5. Test the drop on `forget`.
     6. Test the textual rule, with an empty type counting as textual.
-    7. Test the cut at a record whose body the deadline left unread.
+    7. Test the cut at a record whose body the deadline left unread. Test that a filtered read whose body deadline has already passed cuts at the first body without asking Chrome for it.
     8. Test that an uncut answer's `Next:` is `issued()`, so that it passes a filter's unprinted entries and comes back below a stale cursor from before a restart, and that a cut answer's `Next:` is the cut's `after`.
     9. Test that a record that ends while the read waits on a body is numbered above that answer's `Next:` and printed by the next read.
-    10. Test that in-flight lines fold into their `… and N more` line without cutting the answer.
+    10. Test that in-flight lines fold into their `… and N more` line without cutting the answer, and that an in-flight line that fills the budget to its last character prints.
     11. Test `Missed:` against the ring's highest dropped number and for an `after` from before a restart.
     12. Test the drop on disarm.
     13. Test the `filter` echo's sanitizing.
     14. Test that each line terminator in a body is followed by indentation.
     15. Test the document responses kept per loader id.
     16. Test `filter` and its bodies, including binary, evicted, and cut bodies, and bodies past the read's budget.
-    17. Test the line forms and each sanitizer of the page-controlled text table.
+    17. Test the line forms and each sanitizer of the page-controlled text table. Test a status of 0, a transferred size rounded to whole bytes, and a line without a size when Chrome doesn't send one.
 7. **New** `test/fetch.test.js` — Test the following cases:
 
     1. Test the `no type` form of `Status:`.
     2. Test the pre-check's `needs_confirmation` with the `fetch` line.
     3. Test `navigate first`.
     4. Test that a commit during the fetch answers `error` without a second request.
-    5. Test that a binary body's bytes are counted, and a binary body past 10 MiB.
-    6. Test each answer form of `page/fetch.js`.
-    7. Test the cross-origin and same-origin failure messages.
-    8. Test the timeout.
-    9. Test the body's cut.
+    5. Test that a URL such as `http:host/path` is gated, sent, and printed in its absolute form.
+    6. Test that a binary body's bytes are counted, and a binary body past 10 MiB.
+    7. Test each answer form of `page/fetch.js`. Run the script against Node's `Response` to test that it answers a response without a body, as the Fetch standard gives a 204, with an empty text body; Chrome 157 gives a 204 a body stream, so a live test can't reach that answer.
+    8. Test the cross-origin and same-origin failure messages.
+    9. Test the timeout, and, under a frozen clock, that the script's timeout counts from once its world resolves.
+    10. Test the body's cut.
 8. **New** `test/live/capture.test.js` — Use fixture pages to test the following:
 
-    1. Test that `console` lists a page's calls, a `Log` 404, and a replayed exception, while a page's `Error.prepareStackTrace` hook stays at 0 calls.
+    1. Test that `console` lists a page's calls and a `Log` 404, but neither its uncaught exception nor its unhandled rejection, while the page's `Error.prepareStackTrace` hook never runs; and that arming a tab whose capture is already on records nothing again.
     2. Test that `network` lists a fetch and prints its body under a filter, and records a form post without its body.
-    3. Test that `fetch` cuts a long text body at 40,000 characters.
-    4. Test that `fetch` counts a typed binary body (`application/octet-stream`) and an untyped one, stops past 10 MiB, and counts a body that switches from the decoder partway, including its valid prefix.
-    5. Test that `fetch` aborts both a response whose headers come late (`/delay`) and one whose body never ends (`/busy.json`) at its timeout.
-    6. Test that `fetch` reads as text both a body whose `Content-Type` carries parameters and an untyped UTF-8 body.
-    7. Test that `fetch` sends the page's cookies same-origin.
-    8. Test that `fetch` fails cross-origin without CORS and succeeds with it.
-    9. Test `fetch` on a page whose `connect-src` refuses its URL. The build first runs this case once to learn whether the isolated world is under the page's CSP, records the answer among `architecture.md`'s gotchas, and pins the assertion to it: the body, or `error` naming CSP among the causes.
-    10. Test that `fetch` doesn't follow a cross-site redirect and that the target server doesn't receive a request.
+    3. Test that `fetch` cuts a long text body at 40,000 characters and prints a text body of exactly 40,000 characters whole.
+    4. Test that `fetch` counts a typed binary body (`application/octet-stream`) and an untyped one, counts one of exactly 10 MiB and stops past it, and counts a body that switches from the decoder partway, including its valid prefix.
+    5. Test that `fetch` cuts a body of 40,000 characters that ends inside a character (`/long-partial`), whose final flush passes the cap.
+    6. Test that `fetch` answers a body that never ends once it passes the cap (`/endless-text`), or 10 MiB after it leaves the decoder (`/endless-mixed`), well before its timeout, and closes the rest.
+    7. Test that `fetch` aborts both a response whose headers come late (`/delay`) and one whose body never ends (`/busy.json`) at its timeout.
+    8. Test that `fetch` reads as text both a body whose `Content-Type` carries parameters and an untyped UTF-8 body, and that it decodes a text body by its `Content-Type`'s charset (`/latin1`).
+    9. Test that `fetch` sends the page's cookies same-origin.
+    10. Test that `fetch` fails cross-origin without CORS and succeeds with it.
+    11. Test that `fetch` sends `http:host/path` to the host that the gate read, on a page whose `<base href>` names another host, which doesn't receive a request.
+    12. Test `fetch` on a page whose `connect-src` refuses its URL. The build first runs this case once to learn whether the isolated world is under the page's CSP, records the answer among `architecture.md`'s gotchas, and pins the assertion to it: the body, or `error` naming CSP among the causes.
+    13. Test that `fetch` doesn't follow a cross-site redirect and that the target server doesn't receive a request.
 9. **New** `test/live/challenge.test.js` — Test the following cases:
 
     1. Test that a fixture answering with `cf-mitigated: challenge` returns `needs_human`.
@@ -740,12 +750,13 @@ The new and modified tests cover the following behavior:
 
         1. Test the two-factor word list and its exclusions.
         2. Test `maxlength` and `type="number"`.
-        3. Test the split boxes.
-        4. Test an offscreen and a 1 × 1 password field.
-        5. Test a field in an open shadow root and in a same-origin frame.
-        6. Test each response field's three states, and two response fields under one ancestor, which read as solved only when both are filled. Test a near field against one elsewhere on the page.
-    6. Test a widget frame served from the second site under a test vendor row, inside a closed shadow root. It counts when visible and not when hidden or under `visibility: hidden`, and reads as solved once a response field in the host's light DOM fills.
-    7. Run a headful case under `CLAUDESURF_LIVE_HEADFUL=1` that reads both marks back with `xprop -id <window> WM_HINTS _NET_WM_STATE` after a `needs_human` and after the next call, including a minimized window's marks.
+        3. Test the split boxes, including hidden boxes, boxes wrapped one per `<span>`, and a fieldset's own legend, which names the row however deep the boxes sit.
+        4. Test an offscreen, a 1 × 1, and a 100 × 5 password field, one whose right edge sits on the document's origin, and one partly left of it, which counts.
+        5. Test a field in an open shadow root and in a same-origin frame, and a field in a shadow root whose host, or an ancestor of it, is `aria-hidden`, in the page and in a same-origin frame.
+        6. Test each response field's three states, and two response fields under one ancestor, which read as solved only when both are filled. Test a near field against one elsewhere on the page. Test that a response field of spaces alone reads as unsolved.
+    6. Test a widget frame served from the second site under a test vendor row, inside a closed shadow root. It counts when visible and not when hidden or under `visibility: hidden`, and reads as solved once a response field in the host's light DOM fills. Test a widget nested in a cross-site frame, which counts only while the outer `<iframe>` counts: at 20 × 20 and not at 300 × 10.
+    7. Test a widget frame of the page's own origin under a test vendor row, which lacks a frame target, so the page scan alone finds it. It counts when visible and at least 20 × 20, whether in the page or inside a same-origin frame, and not under `visibility: hidden`, inside a hidden same-origin frame, or once a response field nearest it fills; a filled field past the fifth level up leaves it unsolved.
+    8. Run a headful case under `CLAUDESURF_LIVE_HEADFUL=1` that reads both marks back with `xprop -id <window> WM_HINTS _NET_WM_STATE` after a `needs_human` and after the next call, including a minimized window's marks.
 10. **New** `test/fakes/bin/notify-send`, `test/fakes/bin/xdotool`, `test/fakes/bin/wmctrl` — Record their arguments and environment to the file that `CLAUDESURF_TEST_TOOL_LOG` names, and answer as the test's `CLAUDESURF_TEST_TOOL_ANSWER` says.
 11. **Modified** `test/fakes/fake-browser.js` — Add the fake browser behavior that API / Schema, Fake browser, describes.
 12. **Modified** `test/fixtures/serve.js` — Add these fixtures on both listeners:
@@ -753,7 +764,7 @@ The new and modified tests cover the following behavior:
     1. Serve `/challenge` with 403 and both headers.
     2. Serve `/clears` as a page answering with `cf-mitigated: challenge` that navigates to `/` after 1 s.
     3. Serve `/csp` as a page whose `connect-src` is `'self'`.
-    4. Serve `/long` as a text body over 40,000 characters.
+    4. Serve `/long` as a text body of the number of characters that `?chars=` gives, 50,000 by default.
     5. Serve `/binary?mib=<n>&type=<t>` as a body of `0xFF` bytes, which never decode as UTF-8, untyped unless `type` is given; `/mixed` as an untyped body of valid UTF-8 text followed by `0xFF` bytes; and `/untyped` as an untyped UTF-8 text body.
     6. Serve `/px` as a `#px-captcha` element at a size the query gives.
     7. Serve `/signin` and `/otp`.
@@ -761,8 +772,11 @@ The new and modified tests cover the following behavior:
     9. Serve `/echo`, which returns the request's cookie and origin as JSON.
     10. Serve `/cors-echo`.
     11. Serve `/post` as a form target.
-13. **Modified** `test/dispatch.test.js` — Test the three actions, `after`'s and `filter`'s checks, and the merged `url` and `after`.
-14. **Modified** `test/envelope.test.js`, `test/respond.test.js` — Test `needsHuman`, the precedence of decision 3 (outcome ranking), and the `fetch` refusal line.
+    12. Serve `/long-emoji` as a text body whose 40,000th character is the first half of a surrogate pair, and `/long-partial` as 40,000 characters followed by the first two bytes of a three-byte UTF-8 sequence.
+    13. Serve `/endless-text` as a text body past 40,000 characters that then grows until the client closes it, and `/endless-mixed` as an untyped body of text followed by bytes that aren't UTF-8 until the client closes it.
+    14. Serve `/latin1` as a text body in ISO-8859-1, which its `Content-Type` names.
+13. **Modified** `test/dispatch.test.js` — Test the three actions, `after`'s and `filter`'s checks, including that `network`'s `after` must not be negative, `fetch`'s refusal of a URL with a user name or password, and the merged `url` and `after`.
+14. **Modified** `test/envelope.test.js`, `test/respond.test.js` — Test `needsHuman`, the precedence of decision 3 (outcome ranking), and the `fetch` refusal line. Test that `needsHuman` trims the label, and that a label of only whitespace or control characters leaves the window unnamed.
 15. **Modified** `test/settle.test.js` — Test the following cases:
 
     1. Test that `requests.js` passes each ended entry, with settling's counts unchanged.
@@ -770,20 +784,20 @@ The new and modified tests cover the following behavior:
     3. Test that nothing is passed for a tab whose `armingSent` doesn't hold.
 16. **Modified** `test/daemon.test.js` — Test the following cases:
 
-    1. Test that every call but `policy` that reaches its queue slot closes the handoff at the slot's start, while `policy` and a `schema_error` leave it open; that a `needs_human` envelope opens it at the slot's end; and that two overlapping calls close and open in their order.
+    1. Test that every call but `policy` that reaches its queue slot closes the handoff at the slot's start, while `policy` and a `schema_error` leave it open; that a `needs_human` envelope opens it at the slot's end; and that a call queued behind one that holds the slot closes the handoff that the first opened.
     2. Test that `gate.onRefusal` reaches the handoff.
     3. Test that a record triggers the restart announcement and a missing record doesn't.
-    4. Run every case with `test/fakes/bin` first on `PATH`, so a run as the human's user doesn't send anything to her desktop.
-17. **Modified** `test/navigation.test.js`, `test/input.test.js` — Test the following cases:
+    4. Run every case with a `PATH` holding node and the fakes of `test/fakes/bin` alone, so a run as the human's user doesn't send anything to her desktop.
+17. **Modified** `test/navigation.test.js`, `test/input.test.js`, `test/tabs.test.js` — Test the following cases:
 
     1. Test detection in `finishAction`.
-    2. Test the self-clearing wait's loop and its budget, and that it is spent once per document.
-    3. Test that a `Challenge:` line is left out when the generation moved after detection.
-    4. Test the `Download:` lines with their cap.
+    2. Test the self-clearing wait's loop and its budget, and that it is spent once per document. Test that a reload that starts during the wait and commits later is waited for.
+    3. Test that a `Challenge:` line is left out when the generation moved after detection, and when the working tab closes after detection matched, which leaves the call its `Tab:` line.
+    4. Test the `Download:` lines with their cap, and that the line of `tabs new` counts the new tab's own downloads.
     5. Test that `tabs new` detects on its new tab.
 18. **Modified** `test/tabs.test.js` — Test the before-acting message's new first sentence.
-19. **Modified** `test/action-support.test.js` — Test the `state.js` splice into `page/detect.js` and `page/visible.js`.
-20. **Modified** `test/read.test.js` — Test detection on a rendering read and a `since` read, its absence on a paging read, and the `Challenge:` line's place.
+19. **Modified** `test/action-support.test.js` — Test the `state.js` and `page/nearest.js` splices into `page/detect.js` and `page/visible.js`, the `collapse.js` splice into `page/walk.js` and `page/render.js`, and the collapse of U+0085 in every one-line field.
+20. **Modified** `test/read.test.js` — Test detection on a rendering read and a `since` read, its absence on a paging read, and the `Challenge:` line's place. Test that a read that fails after detection, as one whose offset is past the end, leaves a widget without a response field unspent.
 21. **Modified** `test/sessions.test.js` — Test the following cases:
 
     1. Test that capture's enables are queued with arming at attach and in `repair`, and that arming's `Network.enable` asks for 10 MiB and 1 MiB.
@@ -791,7 +805,7 @@ The new and modified tests cover the following behavior:
     3. Test `loaderId` at commit and from `readFrameTree` for a silent first commit.
     4. Test `network.drop` and `console-capture.js`'s drop in `forget`.
     5. Test `downloadLog`.
-22. **Modified** `test/gate.test.js` — Test `onRefusal` for the handler's and the backstop's refusals, and its absence for the pre-check's. Verify that it is called after the gate has answered or acted, and that a throwing callback leaves the gate's action in place. Test the `fetch` kind.
+22. **Modified** `test/gate.test.js` — Test `onRefusal` for the handler's and the backstop's refusals, and its absence for the pre-check's. Verify that it is called after the gate has answered or acted, and that a throwing callback leaves the gate's action in place. Test the `fetch` kind. Test that a gate without `onRefusal` records its refusals without logging about announcing them.
 23. **Modified** `test/browser.test.js`, `test/live/browser.test.js` — Test the following cases:
 
     1. Test `reapOrphan`'s `{ found, reaped }` for a live, a stale, and a missing record.
@@ -805,7 +819,7 @@ npm --prefix server test
 CLAUDESURF_LIVE_HEADFUL=1 npm --prefix server test
 ```
 
-The headful run opens Chrome windows on the human's display, so it runs once, at the full-suite step, after the human is asked whether the display is free; each fix pass runs the headless suite alone.
+The headful run opens Chrome windows on the human's display, so it runs once, at the full-suite step, after the human is asked whether the display is free; each fix pass runs the headless suite alone. The headful cases of `test/live/act.test.js`, `test/live/windows.test.js`, and `test/live/challenge.test.js` hold `holdDisplay` of `test/helpers.js`, a lock across processes, so the files that the runner starts in parallel don't take window focus from each other.
 
 Run the following manual checks as the human's own user after `systemctl --user restart claudesurf`:
 
@@ -819,11 +833,11 @@ Run the following manual checks as the human's own user after `systemctl --user 
 
 The implementation has these risks and limitations:
 
-1. **`Console` is a deprecated domain.** A Chrome version that drops it leaves console capture with `Log` alone; the console capture module logs the enable's rejection at warn, and the live capture test catches it on the next Chrome.
+1. **`Console` is a deprecated domain.** A Chrome version that drops it leaves console capture with `Log` alone; the console capture module logs the enable's rejection at warn, and the live capture test catches it on the next Chrome. Chrome 157 already dropped uncaught exceptions from the domain's replay of stored messages (decision 8, console capture domains).
 2. **Vendor widgets change.** If a vendor moves its frame to another host or its response field into a closed shadow root, detection misses the widget or reads it as unsolved after the human solved it. The agent then hears `needs_human` again on that page; the 10-minute limit keeps the desktop quiet, and UC6 (false alarms) lets the agent go on. Update the vendor table when this happens.
-3. **The urgency hint is untested on the human's window manager.** Cinnamon may read either mark, and Chrome may rewrite its window hints; the headful case reads both marks back, manual step 2 checks that the taskbar entry flashes, and the notification carries the handoff alone if neither shows. A working tab that is inactive in its window either lacks a hint or gets the wrong one (decision 6, window marks). A `chromium` wrapper that spawns the browser rather than `exec`ing it gives Chrome a pid other than `child.pid`, so the search finds nothing and the hint is skipped.
+3. **The urgency hint is untested on the human's window manager.** Cinnamon may read either mark, and Chrome may rewrite its window hints; the headful case reads both marks back, and showed that Muffin, like Mutter, keeps demands-attention off a window in plain view, so a visible session window carries the urgency bit alone and only a minimized one takes both, manual step 2 checks that the taskbar entry flashes, and the notification carries the handoff alone if neither shows. A working tab that is inactive in its window either lacks a hint or gets the wrong one (decision 6, window marks). A `chromium` wrapper that spawns the browser rather than `exec`ing it gives Chrome a pid other than `child.pid`, so the search finds nothing and the hint is skipped.
 4. **Post data reaches the daemon.** Chrome puts a form's body in `requestWillBeSent` whatever `maxPostDataSize` says, so the request tracker and the network capture module receive passwords in memory and must keep discarding them; the network test[^src-network-test] asserts that a record lacks post data.
-5. **Exceptions come from Chrome's store.** The `Exceptions:` line counts what Chrome still holds for the current document, so an exception thrown before a navigation, past the store's 1,000 messages, or before a `console.clear()` is missing, and a page's own `console.log` whose text starts with `Uncaught` counts as one. Messages already on the pipe when the replay's `Console.disable` goes out are taken as replay, so a message logged in that moment is lost. A tab armed again after it left a session gets a fresh `Console.enable` and `Log.enable`, which replay the document's earlier messages and entries as live entries. A late answer to a timed-out replay can land inside the next read's replay and double its counts.
+5. **A re-armed tab records earlier messages again.** A tab armed again after it left a session gets a fresh `Console.enable` and `Log.enable`, which replay the document's earlier messages and entries, and capture records them as new entries.
 6. **A response body may not survive its tab's navigation.** The spike didn't check whether Chrome keeps a body across a navigation; a body that is gone prints `(body not kept)`.
 7. **Sign-up and password-change pages read as sign-ins.** That is UC6's false alarm, which costs one notification per page in 10 minutes. The notification is `critical`, so it stays on screen after the agent has carried on, until the human dismisses it. Every later call on that page returns `needs_human` too, including a `scroll`. A site that carries a visible sign-in form on every page, in a header or a sidebar, sends one such notification per page.
 8. **The agent can read what the human's sign-in returned.** Capture records the human's own browsing in a session tab during a handoff. Response bodies and URLs, including an OAuth callback's, stay readable under the HLD's accepted risk 2 (any allowed domain exfiltrates). Request bodies, where her password travels, are never stored.
@@ -842,6 +856,7 @@ The implementation has these risks and limitations:
 [^src-arming]: `arming.js`
 [^src-state]: `state.js`
 [^src-visible]: `page/visible.js`
+[^src-nearest]: `page/nearest.js`
 [^src-detect]: `page/detect.js`
 [^src-page-fetch]: `page/fetch.js`
 [^src-fetch]: `fetch.js`

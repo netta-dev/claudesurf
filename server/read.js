@@ -1,11 +1,10 @@
-// The claudesurf_read actions: page, info, and screenshot. `page` settles the page for
-// up to two seconds, renders its region through region.js, and assembles the payload
-// around it: the overlay blocks ahead of the region, `find`, the links index, the
-// hidden list, and the paging cut under the header lines. A paging read slices the
-// tab's retained render instead, and a `since` read diffs a fresh render against it
-// through changes.js. Each returns { head, body?, images?, outcome? }; anything that
-// maps to a non-success outcome before the payload is assembled throws an OutcomeError
-// (action-support.js).
+// This module builds results for claudesurf_read. `page` settles the page for up to
+// two seconds, renders its region through region.js, and assembles the payload around
+// it; a paging read slices the tab's retained render instead, and a `since` read diffs
+// a fresh render against it through changes.js. Fresh reads and `since` reads check
+// for challenges after rendering. Handlers return a head with optional body, images,
+// outcome, and challenge fields, and throw OutcomeError for mapped failures before
+// payload assembly (action-support.js).
 
 const envelope = require('./envelope');
 const render = require('./render');
@@ -13,6 +12,7 @@ const retained = require('./retained');
 const { renderRegion, requireSameDocument, requireSameDocuments, RenderError, DocumentChangedError } = require('./region');
 const { renderChanges } = require('./changes');
 const { settle, settledLine, UNCHECKED } = require('./settle');
+const { detectOrLog, keep, challengeLine } = require('./challenge');
 const { ConnectionClosedError } = require('./cdp');
 const { TargetGoneError } = require('./sessions');
 const { OutcomeError, stateLines, workingTarget, requireHttp, pageState, currentStateLines, SETTLE_SOURCE } = require('./action-support');
@@ -20,6 +20,7 @@ const { OutcomeError, stateLines, workingTarget, requireHttp, pageState, current
 const MAX_SEGMENTS = 4;
 // The milliseconds that a fresh read settles for at most before it reads regardless.
 const READ_SETTLE_MS = 2_000;
+const DETECT_MARGIN_MS = 2_000;
 // What a Paged: line calls each source of a retained render.
 const PAGED_FROM = {
   read: 'the read',
@@ -94,35 +95,41 @@ async function sinceRead(sessions, session, t, params, opts) {
     return assembled(sessions, t, answer.render, { ...opts, since: answer.line, links: answer.render.params.links, resume: resumeWith(answer.render.params) });
   }
   const { render: rendered } = answer;
-  const state = await stateAfter(sessions, t, rendered, opts.deadline);
+  const { state, detected } = await stateAfter(sessions, t, rendered, opts.deadline);
+  const challenge = detected && detected.challenge;
   const cut = render.slice(answer.body, { maxChars: opts.maxChars, offset: 0, resume: () => ' Read without since for the whole page.' });
   const { header } = rendered;
   const head = render.header(state, {
-    truncation: cut.truncation, settled: opts.settled, since: answer.line,
+    challenge: challenge && challengeLine(challenge), truncation: cut.truncation, settled: opts.settled, since: answer.line,
     scope: header.scope, omissions: header.omissions, overlays: header.overlays, hidden: header.hidden, hiddenListed: false,
   });
-  return { head, body: cut.text };
+  return { head, body: cut.text, challenge: keep(t, detected) };
 }
 
 // Resolves with a fresh render's payload, under state lines read after it.
 async function assembled(sessions, t, rendered, { links, ...opts }) {
-  const state = await stateAfter(sessions, t, rendered, opts.deadline);
-  return assemble(rendered, { ...opts, state, links: links || rendered.params.links });
+  const { state, detected } = await stateAfter(sessions, t, rendered, opts.deadline);
+  const payload = assemble(rendered, { ...opts, state, challenge: detected && detected.challenge, links: links || rendered.params.links });
+  return { ...payload, challenge: keep(t, detected) };
 }
 
-// Resolves with the page state read after a render, and throws DocumentChangedError
-// when a document that the render describes has changed since: a navigation between the
-// two would leave the payload describing two documents.
+// Resolves { state, detected } with the page state after a render and detectOrLog's
+// answer for that document. The caller keeps the challenge after it builds the
+// payload, so a read that fails first doesn't mark a widget as reported. Throws
+// DocumentChangedError if a document that the render includes has changed. The
+// render's documents include the tab's, so a passing check also means that detection
+// judged the document that the state describes.
 async function stateAfter(sessions, t, rendered, deadline) {
+  const detected = await detectOrLog(sessions, t, { deadline: deadline === undefined ? undefined : deadline - DETECT_MARGIN_MS });
   const state = await pageState(sessions, t, { deadline });
   requireSameDocuments(rendered.documents);
-  return state;
+  return { state, detected };
 }
 
 // Returns { head, body } for a render. Everything after the header is one region: the
 // overlay blocks and the rendered region, narrowed to the matching blocks under
 // `find`, then the links index and the hidden list at its end, then the paging cut.
-function assemble(rendered, { state, links, find, maxChars, offset, settled, paged, since, resume }) {
+function assemble(rendered, { state, challenge, links, find, maxChars, offset, settled, paged, since, resume }) {
   let region = [...rendered.overlayBlocks, rendered.region].join('\n\n');
   let found = null;
   let kept = null;
@@ -147,6 +154,7 @@ function assemble(rendered, { state, links, find, maxChars, offset, settled, pag
   const cut = render.slice(region, { maxChars, offset, resume: find ? resumeFind(marks) : resume });
   const { header } = rendered;
   const head = render.header(state, {
+    challenge: challenge && challengeLine(challenge),
     truncation: cut.truncation,
     settled,
     paged,

@@ -1,49 +1,67 @@
-// A scripted browser speaking the pipe protocol over a stream pair: NUL-delimited JSON
-// in, replies and events out. It models just enough of Chrome for the daemon's window
-// and action paths — targets, windows, pages, the pause on attach — and records every
-// command so tests can assert what was sent. Usable in-process (`inProcess()`) and as
-// a child (fake-chrome.js).
+// This fake stands in for Chrome on the daemon's window and action paths. It reads
+// NUL-delimited JSON commands and writes replies and events over a stream pair.
+// It models targets, windows, pages, and the pause on attach, and records commands
+// for test assertions. Tests run it in-process through `inProcess()` or as a child
+// through fake-chrome.js.
 //
-// Tests customise it through `handle(method, fn)` to override a command (a promise
-// returned from fn answers late), `site[url]` to describe the page a URL serves, and
-// `emit()` to raise events.
+// Tests override commands with `handle(method, fn)`. A handler can return a promise
+// to delay its reply. Tests set `site[url]` to describe pages and use `emit()` to
+// send events.
 //
-// A target with Fetch enabled pauses each main-frame document request as Chrome does —
-// of Page.navigate, a page's own navigation, and a target's first document other than
-// about:blank — and goes on only once the daemon continues it; a failed request
-// doesn't commit. `site[url].redirect` names the URL that a request is redirected to,
-// which pauses again. Each Page.frameStartedNavigating that `announce` fires carries a
-// loader id of its own, as do Page.navigate's answer, the commit's Page.frameNavigated,
-// and the committed document's requests; `failNavigation` fails the navigation's
-// document request under it, as Chrome reports a navigation that it drops or that
-// fails on the network.
-// A navigation that reaches `site[url].download`, a denied download, or
-// `site[url].noContent`, a 204 answer, doesn't commit, and its document request fails
-// with net::ERR_ABORTED under its loader id, as does one whose request the daemon
-// failed; a download then fires Page.downloadWillBegin.
+// The fake pauses main-frame document requests when Fetch is enabled. This includes
+// Page.navigate, navigation started by the page, and a target's first document other
+// than about:blank. The fake continues a paused request after the daemon allows it;
+// a failed request doesn't commit. `site[url].redirect` names a redirect destination
+// that pauses again.
+// `announce` assigns a loader id to each navigation. The fake uses that id in
+// Page.frameStartedNavigating, the Page.navigate reply, Page.frameNavigated at commit,
+// and the document's requests. `failNavigation` reports the document request's
+// failure under that id to simulate a dropped navigation or a network failure.
+// `site[url].download` simulates a denied download; `site[url].noContent` simulates
+// a 204 response. Neither navigation commits. The fake fails the document request
+// with net::ERR_ABORTED under its loader id, as it does for a request that the daemon
+// fails. The fake then emits Page.downloadWillBegin for a download.
 //
-// Settling reads three things that a page describes: `site[url].network`, the requests
-// that its load makes ([{ type, at, ms }], `ms` null for one that never ends), which
-// reach a target with Network enabled; `site[url].busy`, what claudesurfSettle answers
-// ({ mutating, lastMutationAt, readyState, throws }, or a function of the target), quiet
-// and complete by default; and `networkRequest`, a request that a test starts itself.
-// `site[url].overlays[ref]` answers the render of an overlay block ({ text, hidden,
-// lost, tiny, throws }, or a function like `render`), and `site[url].lostRoot` makes a
-// region render report its scope root lost.
+// `site[url].network` lists load requests with `type`, `at`, and `ms` fields.
+// The fake sends their events to a target with Network enabled; `ms: null` keeps a
+// request open. Tests can start additional requests through `networkRequest`.
+// `site[url].busy` controls claudesurfSettle through `mutating`, `lastMutationAt`,
+// `readyState`, and `throws` fields, or a function of the target. The fake reports
+// a quiet, complete page by default.
+// `site[url].overlays[ref]` controls an overlay block's render. An entry can be an
+// object with `text`, `hidden`, `lost`, `tiny`, and `throws` fields, or a function
+// with the same arguments as `render`. `site[url].lostRoot` makes a region render
+// report that its scope root was lost.
 //
-// Input acts on page elements. claudesurfEdit and claudesurfSelect answer from the
-// element: a text field has `type` (one of the text input types, `text` for a
-// `textbox` kind) or `editable`, and `disabled`, `readonly`, `noFocus`,
-// `cancelsSelectAll`, and `stealsFocus` flags; a native select has `options`
-// ([{ label, value, disabled }]). The element that claudesurfEdit focused takes
-// Input.insertText and the text of each key event, into its `value`; `page.focused`
-// is the element that document.activeElement names (an element with `tag`, `attributes`,
-// `ownText`, and, for an <iframe>, `frameId`), and `page.onKey(event, fake, target)`
-// sees every key event. Each target keeps a history of the documents that it committed,
-// which Page.getNavigationHistory, Page.navigateToHistoryEntry, and Page.reload use;
-// `site[url].restored` makes a step onto that entry a back-forward cache restore,
-// which commits without a request or a load event, under the loader id that the
-// entry's document committed with.
+// claudesurfEdit and claudesurfSelect use page elements. A text field uses a text
+// input `type` or the `editable` flag; a `textbox` defaults to `type: 'text'`.
+// Fields support `disabled`, `readonly`, `noFocus`, `cancelsSelectAll`, and
+// `stealsFocus` flags. A native select has an `options` array with `label`, `value`,
+// and `disabled` fields in each entry.
+// Input.insertText and text from key events update the `value` of the element that
+// claudesurfEdit focused. `page.focused` represents document.activeElement with
+// `tag`, `attributes`, and `ownText` fields, plus `frameId` for an <iframe>.
+// `page.onKey(event, fake, target)` receives each key event.
+// Each target records its committed documents for Page.getNavigationHistory,
+// Page.navigateToHistoryEntry, and Page.reload. `site[url].restored` makes a history
+// step restore from the back-forward cache. The fake commits the entry under its
+// original loader id without a request or load event.
+//
+// `logConsole` emits Console messages; `logEntry` emits Log messages. Each requires
+// its domain to be enabled on the target. `site[url].headers` and `site[url].status`
+// set the document response. The fake reports a document request with those values
+// when Network is enabled.
+// `networkRequest` accepts response status, MIME type, and size. The fake answers
+// Network.getResponseBody from `site[url].bodies`, keyed by request URL, and reports
+// missing bodies as evicted.
+// A frame target's `owner` describes its <iframe> with `backendNodeId`, `visible`,
+// `field`, and `unresolvable` fields. DOM.getFrameOwner returns its backend node id;
+// DOM.resolveNode fails when `unresolvable` is set. claudesurfVisible returns the
+// visibility and response-field state from `visible` and `field`.
+// claudesurfDetect returns `site[url].detect` over defaults for an ordinary page.
+// claudesurfFetch returns `site[url].fetch[url]`.
+// Page.downloadWillBegin uses `site[url].download.file` as the filename, or else the
+// URL's last segment.
 
 const { PassThrough } = require('stream');
 const path = require('path');
@@ -97,6 +115,9 @@ class FakeBrowser {
     this.editing = null;
     // requestId → { target, resume(continued) } for each request paused at Fetch
     this.paused = new Map();
+    // requestId → { url, pageUrl } for each request that networkRequest started, which
+    // Network.getResponseBody answers by.
+    this.requestUrls = new Map();
     this.buffer = '';
     this.closed = false;
     this.installDefaults();
@@ -252,6 +273,8 @@ class FakeBrowser {
       setTimeout(() => this.request(target, url, (committed) => {
         if (committed !== null) {
           target.url = committed;
+          target.loaderId = `loader-${this.nextLoader++}`;
+          target.documentLoaderId = target.loaderId;
           this.record(target, committed);
         }
         delete target.pendingUrl;
@@ -322,7 +345,23 @@ class FakeBrowser {
   // for a download, fires Page.downloadWillBegin a few ms later.
   drop(target, url, loaderId) {
     this.failNavigation(target, 'net::ERR_ABORTED', loaderId);
-    if (this.siteOf(url).download) setImmediate(() => this.emit('Page.downloadWillBegin', { frameId: target.targetId, url }, target.sessionId));
+    if (this.siteOf(url).download) setImmediate(() => this.download(target, url));
+  }
+
+  download(target, url) {
+    const { download } = this.siteOf(url) || {};
+    const file = download && typeof download === 'object' && download.file ? download.file : url.split('/').pop();
+    this.emit('Page.downloadWillBegin', { frameId: target.targetId, guid: `G${this.nextRequest++}`, url, suggestedFilename: file }, target.sessionId);
+  }
+
+  logConsole(target, message) {
+    if (!target.consoleEnabled) return;
+    this.emit('Console.messageAdded', { message: { source: 'console-api', level: 'log', text: '', ...message } }, target.sessionId);
+  }
+
+  logEntry(target, entry) {
+    if (!target.logEnabled) return;
+    this.emit('Log.entryAdded', { entry: { source: 'network', level: 'error', text: '', timestamp: Date.now(), ...entry } }, target.sessionId);
   }
 
   announce(target, url, navigationType = 'differentDocument') {
@@ -361,7 +400,9 @@ class FakeBrowser {
     this.record(target, url, entry);
     const frame = { ...mainFrameOf(target, url), loaderId: target.loaderId };
     if (target.parentFrameId) frame.parentId = target.parentFrameId;
+    const finished = this.documentRequest(target, url);
     this.emit('Page.frameNavigated', { frame, type: 'Navigation' }, target.sessionId);
+    if (finished) finished();
     if (loaded) {
       target.loads += 1;
       this.emit('Page.domContentEventFired', { timestamp: target.loads }, target.sessionId);
@@ -372,26 +413,59 @@ class FakeBrowser {
     }
   }
 
-  // Starts a request of `type` on the target, as its page's script would, which ends
-  // after `ms` (never when null) or when the returned `finish` is called; the returned
-  // `redirect(to)` sends a redirect hop, which Chrome reports as another
-  // requestWillBeSent under the same id. Network events reach the daemon only once it
-  // has enabled the domain on the target.
-  networkRequest(target, { type = 'XHR', ms = null, url = 'http://fake.test/request' } = {}) {
+  documentRequest(target, url) {
+    const page = this.siteOf(url);
+    if (!target.networkEnabled || target.parentFrameId || !page || (!page.headers && !page.status)) return null;
+    const requestId = target.loaderId;
+    const common = { requestId, loaderId: requestId, frameId: target.targetId, type: 'Document', timestamp: 0 };
+    this.emit('Network.requestWillBeSent', { ...common, documentURL: url, request: { url, method: 'GET', headers: {} }, wallTime: Date.now() / 1000 }, target.sessionId);
+    this.emit('Network.responseReceived', { ...common, response: { url, status: page.status || 200, statusText: '', headers: page.headers || {}, mimeType: 'text/html' } }, target.sessionId);
+    return () => this.emit('Network.loadingFinished', { requestId, timestamp: 0, encodedDataLength: 100 }, target.sessionId);
+  }
+
+  // Returns { requestId, finish, redirect } for a simulated request of `type`.
+  // The request completes after `ms`, or waits for `finish` when `ms` is null.
+  // `finish()` sends `status`, `mimeType`, `responseHeaders`, and `encodedDataLength`;
+  // the default response headers include Set-Cookie.
+  // `finish(failed)` reports a failure when `failed` is true or an object containing
+  // { errorText, canceled, blockedReason }.
+  // Request options include `method`, `headers`, and `postData`.
+  // `frameId` defaults to the target's main frame, and `loaderId` defaults to its
+  // current document's loader id.
+  // `redirect(to)` emits another requestWillBeSent under the same request id.
+  // Events are emitted when Network is enabled on the target.
+  networkRequest(target, {
+    type = 'XHR', ms = null, url = 'http://fake.test/request', method = 'GET', headers = {}, postData, status = 200, mimeType = '',
+    responseHeaders = { 'Set-Cookie': 'sid=secret' }, encodedDataLength = 0, frameId = target.targetId, loaderId = target.documentLoaderId,
+  } = {}) {
     const requestId = `N${this.nextRequest++}`;
+    this.requestUrls.set(requestId, { url, pageUrl: target.url });
     let done = false;
+    let at = url;
     const finish = (failed = false) => {
       if (done || !target.networkEnabled) return;
       done = true;
       const params = { requestId, timestamp: 0, type };
-      if (failed) this.emit('Network.loadingFailed', { ...params, errorText: 'net::ERR_FAILED' }, target.sessionId);
-      else this.emit('Network.loadingFinished', { requestId, timestamp: 0, encodedDataLength: 0 }, target.sessionId);
+      if (failed) {
+        const failure = typeof failed === 'object' ? failed : {};
+        this.emit('Network.loadingFailed', { ...params, errorText: failure.errorText || 'net::ERR_FAILED', canceled: failure.canceled, blockedReason: failure.blockedReason }, target.sessionId);
+        return;
+      }
+      this.emit('Network.responseReceived', {
+        ...params, loaderId, frameId, response: { url: at, status, statusText: '', headers: responseHeaders, mimeType },
+      }, target.sessionId);
+      this.emit('Network.loadingFinished', { requestId, timestamp: 0, encodedDataLength }, target.sessionId);
     };
     const send = (to, extra = {}) => this.emit('Network.requestWillBeSent', {
-      requestId, loaderId: target.documentLoaderId, documentURL: target.url, request: { url: to, method: 'GET', headers: {} }, timestamp: 0, wallTime: Date.now() / 1000, type, ...extra,
+      requestId, loaderId, documentURL: target.url, frameId,
+      request: { url: to, method, headers, ...(postData === undefined ? {} : { postData, hasPostData: true }) }, timestamp: 0, wallTime: Date.now() / 1000, type, ...extra,
     }, target.sessionId);
     const redirect = (to = `${url}/hop`) => {
-      if (!done && target.networkEnabled) send(to, { redirectResponse: { url, status: 302, statusText: 'Found', headers: { Location: to } } });
+      if (done || !target.networkEnabled) return;
+      const from = at;
+      at = to;
+      this.requestUrls.set(requestId, { url: to, pageUrl: target.url });
+      send(to, { redirectResponse: { url: from, status: 302, statusText: 'Found', headers: { Location: to }, mimeType: '' } });
     };
     if (target.networkEnabled) {
       send(url);
@@ -557,6 +631,29 @@ class FakeBrowser {
       return {};
     });
     this.handle('Network.setBypassServiceWorker', afterFirstCommit(() => ok));
+    this.handle('Network.getResponseBody', ({ requestId }) => {
+      const request = this.requestUrls.get(requestId);
+      const bodies = (request && (this.siteOf(request.pageUrl) || {}).bodies) || {};
+      const body = request ? bodies[request.url] : undefined;
+      if (body === undefined) throw { code: -32000, message: 'Request content was evicted from inspector cache' };
+      if (typeof body === 'function') return body();
+      return typeof body === 'string' ? { body, base64Encoded: false } : body;
+    });
+    const toggle = (flag, on) => (p, sid) => {
+      const t = this.bySession(sid);
+      if (t) t[flag] = on;
+      return {};
+    };
+    this.handle('Console.enable', (p, sid) => this.afterRelease(this.bySession(sid), () => toggle('consoleEnabled', true)(p, sid)));
+    this.handle('Console.disable', toggle('consoleEnabled', false));
+    this.handle('Log.enable', (p, sid) => this.afterRelease(this.bySession(sid), () => toggle('logEnabled', true)(p, sid)));
+    this.handle('Log.disable', toggle('logEnabled', false));
+    // A frame target's `owner` is its <iframe> in the parent's document.
+    this.handle('DOM.getFrameOwner', ({ frameId }) => {
+      const frame = this.targets.get(frameId);
+      if (!frame || !frame.owner) throw { code: -32000, message: 'Frame with the given id was not found.' };
+      return { backendNodeId: frame.owner.backendNodeId };
+    });
     // Fetch.enable answers while the tab is held, before its first request.
     this.handle('Fetch.enable', (p, sid) => {
       const t = this.bySession(sid);
@@ -591,7 +688,7 @@ class FakeBrowser {
     });
     this.handle('Page.getFrameTree', (p, sid) => {
       const t = this.bySession(sid);
-      const frame = mainFrameOf(t, t.url);
+      const frame = { ...mainFrameOf(t, t.url), loaderId: t.documentLoaderId };
       const children = t.url ? (this.page(t).childFrames || []) : [];
       return { frameTree: { frame, childFrames: children.map((f) => ({ frame: { id: f.id, url: f.url, parentId: t.targetId } })) } };
     });
@@ -661,6 +758,11 @@ class FakeBrowser {
     });
     this.handle('DOM.resolveNode', ({ backendNodeId, executionContextId }, sid) => {
       const t = this.bySession(sid);
+      const framed = [...this.targets.values()].find((f) => f.owner && f.owner.backendNodeId === backendNodeId && f.parentFrameId === t.targetId);
+      if (framed) {
+        if (framed.owner.unresolvable) throw { code: -32000, message: 'Node with given id does not belong to the document' };
+        return { object: { type: 'object', objectId: this.object('owner', t, { owner: framed.owner }) } };
+      }
       const page = this.page(t, this.frameOf(t, executionContextId));
       const element = (page.elements || []).find((e) => e.backendNodeId === backendNodeId);
       if (element) {
@@ -894,6 +996,21 @@ class FakeBrowser {
     if (/function claudesurfSelect/.test(functionDeclaration)) {
       const { element } = this.objects.get(objectId);
       return value(chooseOption(element, values[0]));
+    }
+    if (/function claudesurfDetect/.test(functionDeclaration)) {
+      const detect = typeof page.detect === 'function' ? page.detect(t) : (page.detect || {});
+      if (detect.throws) return { exceptionDetails: { text: 'Uncaught', exception: { description: `Error: ${detect.throws}` } } };
+      return value({ title: page.title || '', password: false, px: false, twoFactor: null, frames: [], ...detect });
+    }
+    if (/function claudesurfVisible/.test(functionDeclaration)) {
+      const { owner } = this.objects.get(objectId);
+      const field = typeof owner.field === 'function' ? owner.field() : owner.field;
+      return value({ visible: owner.visible !== false, field: field || 'absent' });
+    }
+    if (/function claudesurfFetch/.test(functionDeclaration)) {
+      const answer = (page.fetch || {})[values[0]];
+      if (answer === undefined) return value({ failed: 'network' });
+      return Promise.resolve(typeof answer === 'function' ? answer(values, t, this) : answer).then(value);
     }
     if (/hit\.contains\(this\)/.test(functionDeclaration)) {
       const { element } = this.objects.get(objectId);

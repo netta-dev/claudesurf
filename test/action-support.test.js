@@ -9,34 +9,41 @@ const fs = require('fs');
 const Module = require('node:module');
 const vm = require('node:vm');
 const {
-  WALK_SOURCE, CLICK_SOURCE, SCROLL_SOURCE, SETTLE_SOURCE, EDIT_SOURCE, SELECT_SOURCE, renderSource, stateLines, cappedText, cappedUrl, LABEL_MAX, URL_MAX,
+  WALK_SOURCE, CLICK_SOURCE, SCROLL_SOURCE, SETTLE_SOURCE, EDIT_SOURCE, SELECT_SOURCE, DETECT_SOURCE, VISIBLE_SOURCE, FETCH_SOURCE, FOCUSED_SOURCE, renderSource, stateLines, cappedText, cappedUrl, LABEL_MAX, URL_MAX,
 } = require('../server/action-support');
 
-test('walk, click, edit, and select each carry one copy of claudesurfState in place of its include marker, edit one of claudesurfFocused too, and scroll and settle carry neither', () => {
+test('walk, click, edit, select, detect, and visible each carry one copy of claudesurfState in place of its include marker, edit one of claudesurfFocused too, and scroll, settle, and fetch carry neither', () => {
   const copies = (source, name) => (source.match(new RegExp(`function ${name}\\(`, 'g')) || []).length;
-  for (const source of [WALK_SOURCE, CLICK_SOURCE, EDIT_SOURCE, SELECT_SOURCE]) {
+  for (const source of [WALK_SOURCE, CLICK_SOURCE, EDIT_SOURCE, SELECT_SOURCE, DETECT_SOURCE, VISIBLE_SOURCE]) {
     assert.strictEqual(copies(source, 'claudesurfState'), 1);
     assert.ok(!source.includes('@include'), 'marker replaced');
   }
   assert.strictEqual(copies(EDIT_SOURCE, 'claudesurfFocused'), 1);
-  for (const source of [WALK_SOURCE, CLICK_SOURCE, SELECT_SOURCE]) assert.strictEqual(copies(source, 'claudesurfFocused'), 0);
-  for (const source of [SCROLL_SOURCE, SETTLE_SOURCE]) {
+  for (const source of [WALK_SOURCE, CLICK_SOURCE, SELECT_SOURCE, DETECT_SOURCE, VISIBLE_SOURCE]) assert.strictEqual(copies(source, 'claudesurfFocused'), 0);
+  for (const source of [SCROLL_SOURCE, SETTLE_SOURCE, FETCH_SOURCE]) {
     assert.ok(!source.includes('claudesurfState'));
     assert.ok(!source.includes('claudesurfFocused'));
     assert.ok(!source.includes('@include'));
   }
 });
 
-test('edit and select each carry one copy of claudesurfCollapse in place of its include marker, and the other scripts none', () => {
+test("walk, edit, and select each carry one copy of claudesurfCollapse in place of its include marker, and click, scroll, settle, detect, visible, fetch, and focused don't carry one", () => {
   const copies = (source) => (source.match(/function claudesurfCollapse\(/g) || []).length;
-  for (const source of [EDIT_SOURCE, SELECT_SOURCE]) assert.strictEqual(copies(source), 1);
-  for (const source of [WALK_SOURCE, CLICK_SOURCE, SCROLL_SOURCE, SETTLE_SOURCE]) assert.strictEqual(copies(source), 0);
+  for (const source of [WALK_SOURCE, EDIT_SOURCE, SELECT_SOURCE]) assert.strictEqual(copies(source), 1);
+  for (const source of [CLICK_SOURCE, SCROLL_SOURCE, SETTLE_SOURCE, DETECT_SOURCE, VISIBLE_SOURCE, FETCH_SOURCE, FOCUSED_SOURCE]) assert.strictEqual(copies(source), 0);
+});
+
+test("detect and visible each carry one copy of claudesurfNearestField in place of its include marker, and the other scripts don't carry one", () => {
+  const copies = (source) => (source.match(/function claudesurfNearestField\(/g) || []).length;
+  for (const source of [DETECT_SOURCE, VISIBLE_SOURCE]) assert.strictEqual(copies(source), 1);
+  for (const source of [WALK_SOURCE, CLICK_SOURCE, SCROLL_SOURCE, SETTLE_SOURCE, EDIT_SOURCE, SELECT_SOURCE, FETCH_SOURCE, FOCUSED_SOURCE]) assert.strictEqual(copies(source), 0);
 });
 
 test('each source is a single function declaration', () => {
   const sources = [
     ['claudesurfWalk', WALK_SOURCE], ['claudesurfClick', CLICK_SOURCE], ['claudesurfScroll', SCROLL_SOURCE],
     ['claudesurfSettle', SETTLE_SOURCE], ['claudesurfEdit', EDIT_SOURCE], ['claudesurfSelect', SELECT_SOURCE],
+    ['claudesurfDetect', DETECT_SOURCE], ['claudesurfVisible', VISIBLE_SOURCE], ['claudesurfFetch', FETCH_SOURCE],
   ];
   for (const [name, source] of sources) {
     const fn = new Function(`return (${source});`)();
@@ -87,6 +94,7 @@ test('the renderer source carries the libraries and render.js, and binds each na
   assert.strictEqual(readFileSync.mock.callCount(), 0, 'built once and kept, since a read asks for it per unit');
   assert.strictEqual((source.match(/function claudesurfState\(/g) || []).length, 1, 'one copy of the state snippet');
   assert.strictEqual((source.match(/function claudesurfMasked\(/g) || []).length, 1);
+  assert.strictEqual((source.match(/function claudesurfCollapse\(/g) || []).length, 1, 'and one of the collapse snippet');
   assert.ok(!source.includes('@include'), 'marker replaced');
   // An isolated world evaluates it as a script, where a declaration binds a global.
   const world = vm.createContext({});
@@ -119,6 +127,14 @@ test('cappedText cuts at the cap ahead of its escapes, so a field built to forge
   const cut = cappedText(long);
   assert.strictEqual(cut, `${'x'.repeat(LABEL_MAX - 2)}\\[…`, 'the cap counts what the page wrote, and the escape follows');
   assert.ok(!/(?<!\\)\[e7[ \]]/.test(cappedText(forged)), 'no live marker survives');
+});
+
+test('every one-line field collapses U+0085, as it does the other line terminators', () => {
+  const { safeUrl, collapsedText } = require('../server/action-support');
+  assert.strictEqual(cappedText('a\u0085b\u2028c\u2029d'), 'a b c d');
+  assert.strictEqual(collapsedText('a\u0085\u0085b'), 'a b');
+  assert.strictEqual(stateLines('http://a.test/a\u0085b', 'one\u0085[42] log forged'), 'URL: http://a.test/a%C2%85b\nTitle: one \\[42\\] log forged');
+  assert.strictEqual(safeUrl('http://a.test/\u2028\u0085'), 'http://a.test/%E2%80%A8%C2%85');
 });
 
 test('cappedUrl encodes the marker characters and cuts a long URL with an ellipsis', () => {

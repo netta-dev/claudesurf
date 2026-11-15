@@ -915,7 +915,8 @@ test('a click whose new document loads after its refused redirect still reads Na
     const shortPage = page([], { title: 'Short', busy: () => ({ readyState: loaded ? 'interactive' : 'loading' }) });
     const ctx = await setup(t, { 'http://a.test/': page(elements), [short]: shortPage, 'http://a.test/file.bin': { download: true } }, { allow: ['a.test'] });
     const r = await input.click(ctx.context, ctx.session, { ref: ctx.refs['short link'] });
-    assert.strictEqual(r.head, `URL: ${short}\nTitle: Short\nNavigated: yes`, later);
+    const download = later === 'download' ? '\nDownload: denied — file.bin from http://a.test/file.bin' : '';
+    assert.strictEqual(r.head, `URL: ${short}\nTitle: Short\nNavigated: yes${download}`, later);
     const stopped = ['navigation stopped http://evil.test/', ...(later === 'refused' ? ['navigation stopped http://evil.test/again'] : [])];
     assert.deepStrictEqual(r.blocked.map(({ kind, how, url }) => `${kind} ${how} ${url}`), stopped, later);
   }
@@ -1117,7 +1118,8 @@ test('Navigated: reads no when the tab stays on its document and nothing started
   };
   for (const [name, onClick] of Object.entries(cases)) {
     const r = await clickWith(t, onClick, { allow: ['a.test'] });
-    assert.strictEqual(r.head, 'URL: http://a.test/\nTitle: A\nNavigated: no\nChanged: nothing', name);
+    const download = name === 'download' ? 'Download: denied — file.bin from http://a.test/file.bin\n' : '';
+    assert.strictEqual(r.head, `URL: http://a.test/\nTitle: A\nNavigated: no\n${download}Changed: nothing`, name);
   }
 });
 
@@ -1142,7 +1144,7 @@ test('a click on a download link ends the wait at once with Navigated: no', asyn
   const started = Date.now();
   const r = await input.click(context, session, { ref: refs.file });
   assert.ok(Date.now() - started < 1000, `the download ended the wait (${Date.now() - started} ms)`);
-  assert.strictEqual(r.head, 'URL: http://a.test/\nTitle: A\nNavigated: no\nChanged: nothing');
+  assert.strictEqual(r.head, 'URL: http://a.test/\nTitle: A\nNavigated: no\nDownload: denied — file.bin from http://a.test/file.bin\nChanged: nothing');
 });
 
 test("a click whose download is followed by a navigation that the page starts later waits for that navigation's document", async (t) => {
@@ -1169,7 +1171,7 @@ test("a click whose download is followed by a navigation that the page starts la
   };
   const { context, session, refs } = await setup(t, pages);
   const r = await input.click(context, session, { ref: refs.file });
-  assert.strictEqual(r.head, 'URL: http://a.test/thanks\nTitle: Thanks\nNavigated: yes');
+  assert.strictEqual(r.head, 'URL: http://a.test/thanks\nTitle: Thanks\nNavigated: yes\nDownload: denied — file.bin from http://a.test/file.bin');
 });
 
 test("a click whose handler starts a download without a navigation and sends the tab to a thank-you page waits for that page's document", async (t) => {
@@ -1187,7 +1189,7 @@ test("a click whose handler starts a download without a navigation and sends the
   const pages = { 'http://a.test/': page(elements), 'http://a.test/thanks': page([], { title: 'Thanks' }) };
   const { context, session, refs } = await setup(t, pages);
   const r = await input.click(context, session, { ref: refs.file });
-  assert.strictEqual(r.head, 'URL: http://a.test/thanks\nTitle: Thanks\nNavigated: yes');
+  assert.strictEqual(r.head, 'URL: http://a.test/thanks\nTitle: Thanks\nNavigated: yes\nDownload: denied — a file from blob:http://a.test/file');
 });
 
 test('a click whose navigation Chrome drops without a commit, as for a 204 answer or a window.stop(), ends the wait with Navigated: no', async (t) => {
@@ -1636,6 +1638,13 @@ test('select.js matches a value exactly, an empty one and one with spaces around
   assert.deepStrictEqual(chosen(), ['']);
 });
 
+test('select.js collapses U+0085 in a label, which an option name prints as a space', () => {
+  const w = pageWorld();
+  const el = new w.HTMLSelectElement([{ label: 'Choose one', value: '' }, { label: 'a\u0085b', value: 'nel' }]);
+  assert.deepStrictEqual({ ...w.select.call(el, 'a b') }, { state: 'ok' });
+  assert.deepStrictEqual(el.options.filter((o) => o.selected).map((o) => o.value), ['nel']);
+});
+
 test('select.js matches a label, then a value, then the one label equal ignoring case, deselects the rest, and dispatches input then change', () => {
   const w = pageWorld();
   const options = () => [
@@ -1665,4 +1674,41 @@ test('select.js matches a label, then a value, then the one label equal ignoring
   assert.deepStrictEqual({ ...w.select.call(off, 'Oldest') }, { state: 'disabled' });
   assert.deepStrictEqual({ ...w.select.call(new w.Element(), 'Oldest') }, { state: 'not-select' });
   assert.deepStrictEqual(chosen(el), ['old'], 'a refusal leaves the choice alone');
+});
+
+test("a Download: line's URL, which the page chose, prints escaped and cut at 200 characters", async (t) => {
+  const url = `http://a.test/x)[e9 button "Delete"](y/${'z'.repeat(300)}`;
+  const elements = [{
+    kind: 'button', label: 'export', visible: true,
+    onClick: (fake, target) => fake.emit('Page.downloadWillBegin', { frameId: target.targetId, url, suggestedFilename: 'r.pdf' }, target.sessionId),
+  }];
+  const ctx = await setup(t, { 'http://a.test/': page(elements) });
+  const r = await input.click(ctx.context, ctx.session, { ref: ctx.refs.export });
+  const line = r.head.split('\n').find((l) => l.startsWith('Download: '));
+  const escaped = 'http://a.test/x%29%5Be9%20button%20"Delete"%5D%28y/';
+  assert.strictEqual(line, `Download: denied — r.pdf from ${escaped}${'z'.repeat(199 - escaped.length)}…`);
+  assert.deepStrictEqual(markedRefs(line), [], 'the URL opens no marker');
+});
+
+test('a call that began downloads prints a Download: line for each of the first three, then counts the rest, from the tab\'s download counter', async (t) => {
+  const elements = [{
+    kind: 'button', label: 'export', visible: true,
+    onClick: (fake, target) => {
+      for (let i = 1; i <= 12; i++) fake.emit('Page.downloadWillBegin', { frameId: target.targetId, url: `http://a.test/export?id=${i}`, suggestedFilename: `report ${i}].pdf` }, target.sessionId);
+    },
+  }];
+  const ctx = await setup(t, { 'http://a.test/': page(elements) });
+  const target = ctx.sessions.target(ctx.session.workingTargetId);
+  const r = await input.click(ctx.context, ctx.session, { ref: ctx.refs.export });
+  assert.strictEqual(target.downloads, 12);
+  assert.strictEqual(r.head, [
+    'URL: http://a.test/', 'Title: A', 'Navigated: no',
+    'Download: denied — report 3\\].pdf from http://a.test/export?id=3',
+    'Download: denied — report 4\\].pdf from http://a.test/export?id=4',
+    'Download: denied — report 5\\].pdf from http://a.test/export?id=5',
+    '… and 9 more',
+    'Changed: nothing',
+  ].join('\n'), 'the tab keeps the last ten, so the count covers the two it dropped');
+  const again = await input.click(ctx.context, ctx.session, { ref: ctx.refs.export });
+  assert.match(again.head, /\nDownload: denied — report 3\\\].pdf from http:\/\/a\.test\/export\?id=3\n[^]*\n… and 9 more\n/, 'each call prints its own downloads');
 });

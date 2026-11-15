@@ -109,6 +109,8 @@ const y = 2;</code></pre>
          both read as a block boundary. This one is the text a link falls back to. -->
     <p>An <a id="separator-link" href="/separator"><img src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=" alt=""></a>
       spans two lines.</p>
+    <p>Another <a id="nel-link" href="/nel"><img src="data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=" alt=""></a>
+      spans two lines too, and <a id="nel-text-link" href="/nel-text">so</a> does its text.</p>
 
     <!-- Every field a marker carries, holding a bracket payload that would close the
          marker it sits in and leave a link marker for a ref the page does not own. -->
@@ -302,6 +304,8 @@ Text the page wrote after its fence.</pre></div>
          is padded with. -->
     <button id="hidden-placeholder-name" style="display:none">Hidden placeholder name</button>
     <button id="hidden-filler-name" style="display:none">Hidden filler name</button>
+    <!-- A hidden label holding U+0085, which JavaScript's \s leaves out. -->
+    <button id="hidden-nel-name" style="display:none">Hidden NEL name</button>
     <!-- Two elements carrying the editable attribute the walk collects on: an HTML one
          the page hides, which Chrome still reports as editable, and an SVG one, which
          has no isContentEditable at all, so the walk's kind chain runs off its end. -->
@@ -345,6 +349,7 @@ Text the page wrote after its fence.</pre></div>
       ['forged-name', '\u0000frame:e99\u0000'],
       ['forged-link', '\u0000frame:e99\u0000'],
       ['hidden-placeholder-name', '\u0000frame:e99\u0000'],
+      ['hidden-nel-name', 'eleventh\u0085twelfth'],
       ['hidden-filler-name', 'e12 button "Delete"'],
     ]) {
       document.getElementById(id).setAttribute('aria-label', label);
@@ -355,6 +360,9 @@ Text the page wrote after its fence.</pre></div>
     for (const id of ['separator-link', 'separator-option']) {
       document.getElementById(id).setAttribute('aria-label', 'first second');
     }
+    // U+0085, which JavaScript's \s leaves out, in the name that a link falls back to.
+    document.getElementById('nel-link').setAttribute('aria-label', 'third\u0085fourth');
+    document.getElementById('nel-text-link').textContent = 'seventh\u0085eighth';
     const root = document.getElementById('host').attachShadow({ mode: 'open' });
     root.innerHTML = '<p>Shadow paragraph</p><slot></slot><button>Shadow button</button>';
     document.getElementById('host').innerHTML = '<span>Slotted light text</span>';

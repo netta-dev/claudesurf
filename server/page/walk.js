@@ -52,7 +52,8 @@ function claudesurfWalk(hiddenOnly, labelMax) {
   // pads a blank control with — are the two the daemon strips from every payload.
   const plain = (value) => (value || '').replace(/[\0\uE000]/g, '');
 
-  function text(s) { return plain(s).replace(/\s+/g, ' ').trim(); }
+  // @include collapse.js
+  function text(s) { return claudesurfCollapse(plain(s)); }
 
   const escapeField = (value) => value.replace(/[\\[\]]/g, '\\$&');
 

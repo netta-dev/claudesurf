@@ -258,7 +258,7 @@ test('new refused by its pre-check opens nothing and prints the new tab as not o
   const { fake } = ctx;
   const answer = await tabsCall(ctx, { op: 'new', target: 'http://evil.test/' });
   assert.strictEqual(answer.outcome, 'needs_confirmation');
-  assert.match(answer.message, /^The navigation was not started/);
+  assert.match(answer.message, /^The call didn't start: its host needs the human's approval\./);
   assert.strictEqual(answer.payload, 'URL: http://fake.test/\nTitle: Home\nBlocked: [t1] evil.test — a new tab to http://evil.test/ (not opened)');
   assert.ok(!fake.calls.some((c) => c.method === 'Runtime.evaluate' && isWindowOpen(c.params)));
 });
@@ -407,10 +407,20 @@ test('new whose navigation Chrome drops without a commit, for a 204 answer or a 
     const answer = await tabsCall(ctx, { op: 'new', target: url });
     const took = Date.now() - started;
     assert.strictEqual(answer.outcome, 'success', url);
-    assert.match(answer.payload, /^URL: about:blank#[0-9a-f]{16}\nTitle: [^\n]*\nNavigated: no\nNavigation error: net::ERR_ABORTED\nChanged: not tracked \(read the page first\)$/, url);
+    const download = served.download ? 'Download: denied — file\\.bin from http://fake\\.test/file\\.bin\\n' : '';
+    assert.match(answer.payload, new RegExp(`^URL: about:blank#[0-9a-f]{16}\\nTitle: [^\\n]*\\nNavigated: no\\nNavigation error: net::ERR_ABORTED\\n${download}Changed: not tracked \\(read the page first\\)$`), url);
     assert.ok(took < 2_000, `${url}: the drop ended the wait (${took} ms)`);
     assert.notStrictEqual(ctx.session.workingTargetId, ctx.working.targetId, url);
   }
+});
+
+test("new's Download: line counts the new tab's own downloads, whatever the working tab downloaded before", async (t) => {
+  const first = 'http://fake.test/first.bin';
+  const ctx = await setup(t, { site: { [first]: { download: true }, 'http://fake.test/second.bin': { download: true } } });
+  await act(ctx, (session, deadline) => navigation.navigate(ctx.context, session, { url: first, name: 'task' }, deadline));
+  await waitFor(() => ctx.sessions.target(ctx.working.targetId).downloads === 1);
+  const answer = await tabsCall(ctx, { op: 'new', target: 'http://fake.test/second.bin' });
+  assert.match(answer.payload, /\nNavigation error: net::ERR_ABORTED\nDownload: denied — second\.bin from http:\/\/fake\.test\/second\.bin\nChanged: /);
 });
 
 test('new closes the tab, keeps the working tab, and returns the after-acting needs_confirmation on it when the gate refuses a redirect hop, whatever Page.navigate answered', async (t) => {
@@ -1128,4 +1138,14 @@ test('when the whole window closes while a popup elsewhere sits on the stack, th
   assert.deepStrictEqual(answer.notes, ['session window was recreated under its retained name']);
   assert.match(answer.payload, /^Tabs: 2\n\[t4\] working /);
   assert.notStrictEqual(session.workingTargetId, popup.targetId);
+});
+
+test('new detects a challenge on the tab it opened, which is the one it reports on', async (t) => {
+  const ctx = await setup(t, { site: { 'http://fake.test/login': page('Sign in', { detect: { password: true } }) } });
+  const answer = await tabsCall(ctx, { op: 'new', target: 'http://fake.test/login' });
+  assert.strictEqual(answer.outcome, 'needs_human');
+  assert.match(answer.payload, /^URL: http:\/\/fake\.test\/login\nTitle: Sign in\nChallenge: sign-in — a password field\nNavigated: yes/);
+  assert.notStrictEqual(ctx.session.workingTargetId, ctx.working.targetId, 'the new tab is the working tab');
+  const scans = ctx.fake.callsTo('Runtime.callFunctionOn').filter((c) => /claudesurfDetect/.test(c.params.functionDeclaration));
+  assert.strictEqual(scans.at(-1).sessionId, ctx.fake.targets.get(ctx.session.workingTargetId).sessionId);
 });

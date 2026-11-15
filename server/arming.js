@@ -1,17 +1,25 @@
-// The commands that put a tab under the domain gate and take it back out, and the rule
-// for a tab whose arming failed. sessions.js arms a tab that a session's page opened
-// as the tab attaches, with the commands queued ahead of its release, and arms the
-// working tab in `repair`; it disarms a tab that leaves its session, which then
-// behaves as one of the human's own.
+// This module puts tabs under the domain gate, disarms them, and handles arming
+// failures. sessions.js arms a tab opened by a session page during attach, with the
+// commands queued before its release, and arms the working tab in `repair`.
+// sessions.js disarms a tab that leaves its session; the tab then behaves as one
+// of the human's own.
 //
-// Each arming and each disarm moves the target's arming epoch, so an outcome that
-// arrives after the tab was disarmed, or armed again, leaves `armed` alone.
+// Arming and disarming advance the target's arming epoch. A result from an earlier
+// epoch doesn't change `armed`. Arming also enables Console and Log capture, and
+// disarming disables them. Their outcomes are excluded from the arming result, so
+// capture failures can't close a tab or fail a call.
 
 const { TimeoutError } = require('./cdp');
 const requests = require('./requests');
+const network = require('./network');
+const consoleCapture = require('./console-capture');
 const tabRecords = require('./tab-records');
 
 const PRERENDER = 'Page.setPrerenderingAllowed';
+// Chrome's buffer of a tab's response bodies, in total and per response; a filtered
+// network read takes the bodies from it.
+const BODY_BUFFER = 10 * 1024 * 1024;
+const RESPONSE_BUFFER = 1024 * 1024;
 const FETCH = 'Fetch.enable';
 // The Fetch patterns that pause a tab's document requests, a child frame's included;
 // the gate's handler judges the main frame's and continues the rest.
@@ -26,12 +34,13 @@ function arm(sessions, t, { deadline } = {}) {
   const epoch = ++t.armingEpoch;
   t.armingSent = true;
   const commands = [
-    ['Network.enable', { maxTotalBufferSize: 0, maxResourceBufferSize: 0 }],
+    ['Network.enable', { maxTotalBufferSize: BODY_BUFFER, maxResourceBufferSize: RESPONSE_BUFFER }],
     ['Network.setBypassServiceWorker', { bypass: true }],
     [PRERENDER, { isAllowed: false }],
   ];
   if (sessions.interceptor) commands.push([FETCH, { patterns: DOCUMENT_REQUESTS }]);
   const sent = commands.map(([method, params]) => sessions.send(t.targetId, method, params, { deadline }));
+  consoleCapture.enable(sessions, t, { deadline });
   t.arming = Promise.allSettled(sent).then((settled) => {
     const outcomes = settled.map((s, i) => ({ method: commands[i][0], ok: s.status === 'fulfilled', error: s.reason }));
     const prerender = outcomes.find((o) => o.method === PRERENDER && !o.ok);
@@ -61,15 +70,12 @@ function onRejections(sessions, t, outcomes) {
   sessions.closeTab(t);
 }
 
-// Sends Fetch.disable, restores the bypass and the prerendering switch while Network
-// is still enabled, then sends Network.disable, without awaiting the commands. Drops
-// the tab's in-flight requests. Sends the commands only for a tab that arming
-// reached.
 function disarm(sessions, t) {
   t.armingEpoch += 1;
   t.armed = false;
   if (!t.armingSent) return;
   requests.drop(t);
+  network.drop(t);
   t.armingSent = false;
   const send = (method, params) => sessions.send(t.targetId, method, params)
     .catch((e) => sessions.log.debug(`disarming ${t.targetId}: ${e.message}`));
@@ -77,6 +83,7 @@ function disarm(sessions, t) {
   send('Network.setBypassServiceWorker', { bypass: false });
   send(PRERENDER, { isAllowed: true });
   send('Network.disable');
+  consoleCapture.disable(sessions, t);
 }
 
 // Returns the first outcome of Network.enable, the bypass, or Fetch.enable that failed,

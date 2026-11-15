@@ -11,6 +11,7 @@ const { FakeBrowser } = require('./fakes/fake-browser');
 
 const SERVER_DIR = path.join(__dirname, '..', 'server');
 const FAKE_CHROME = path.join(__dirname, 'fakes', 'fake-chrome.js');
+const FAKE_TOOLS = path.join(__dirname, 'fakes', 'bin');
 
 const silentLog = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -117,6 +118,13 @@ function fakeSession({ t, log = silentLog, allow, quietMs = 20 } = {}) {
   return { fake, conn, sessions, log, gate, policy, policyFile, context: { sessions, gate, policy, log } };
 }
 
+async function frameAt({ fake, sessions }, tab, url, owner = {}) {
+  const frame = fake.createTarget({ type: 'iframe', parent: tab, url });
+  frame.owner = { backendNodeId: 900 + fake.nextTarget, visible: true, field: 'empty', ...owner };
+  await waitFor(() => sessions.frameTargets(tab.targetId).some((f) => f.url === url));
+  return frame;
+}
+
 // Resolves with fakeSession()'s context over `options`, plus session s1 as `session`
 // and its working tab's registry record as `target`, once that tab has navigated to
 // `url`. `site` maps each URL to the fixture that the fake serves there.
@@ -127,6 +135,16 @@ async function navigatedSession({ url, site, ...options }) {
   const session = await ctx.sessions.ensure('s1');
   await require('../server/navigation').navigate(ctx.context, session, { url, name: 'n' });
   return { ...ctx, session, target: ctx.sessions.target(session.workingTargetId) };
+}
+
+async function failure(promise) {
+  try {
+    await promise;
+  } catch (e) {
+    if (e instanceof require('../server/action-support').OutcomeError) return e.envelope;
+    throw e;
+  }
+  throw new Error('the call did not fail');
 }
 
 // Replaces the fake's handler for `method` with one that answers a call on a
@@ -169,7 +187,73 @@ function markedRefs(text) {
   return [...require('../server/render').markedRefs(text)];
 }
 
+// Returns { env, runs } for the recording tools in test/fakes/bin.
+// `env` uses a PATH containing only node and the fakes named by `tools`, so a run
+// can't reach a real tool. It passes `answer` through CLAUDESURF_TEST_TOOL_ANSWER.
+// `runs()` reads recorded tool invocations. The temporary directory is removed
+// when test `t` ends.
+function fakeTools(t, { tools = ['notify-send', 'xdotool', 'wmctrl'], answer = {} } = {}) {
+  const dir = tmpDir('claudesurf-tools');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const logFile = path.join(dir, 'tools.jsonl');
+  const env = { PATH: toolBin(dir, tools), CLAUDESURF_TEST_TOOL_LOG: logFile, CLAUDESURF_TEST_TOOL_ANSWER: JSON.stringify(answer) };
+  return { env, runs: () => readToolLog(logFile) };
+}
+
+// Returns a bin directory under `dir` containing node and the recording tools named
+// by `tools`. Use it as the process's PATH to restrict desktop commands to the fakes.
+// The fakes and fake-chrome.js find node there.
+function toolBin(dir, tools = ['notify-send', 'xdotool', 'wmctrl']) {
+  const bin = path.join(dir, 'bin');
+  fs.mkdirSync(bin);
+  fs.symlinkSync(process.execPath, path.join(bin, 'node'));
+  for (const tool of tools) fs.symlinkSync(path.join(FAKE_TOOLS, tool), path.join(bin, tool));
+  return bin;
+}
+
+// Returns the runs that the recording tools appended to `file`, [{ tool, args, env }].
+// A line that a run is still appending lacks its newline and is left out.
+function readToolLog(file) {
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, 'utf8').split('\n').slice(0, -1).map((line) => JSON.parse(line));
+}
+
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Resolves with a release once this process holds the display, so the headful cases of
+// different test files, which the runner starts in parallel, don't take window focus
+// from each other. A lock whose holder has exited is taken over.
+async function holdDisplay() {
+  const file = path.join(os.tmpdir(), `claudesurf-display-${process.getuid()}.lock`);
+  for (;;) {
+    try {
+      fs.writeFileSync(file, String(process.pid), { flag: 'wx' });
+      return () => fs.rmSync(file, { force: true });
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+    }
+    const holder = Number.parseInt(fs.readFileSync(file, 'utf8'), 10);
+    if (holder > 0 && !alive(holder)) fs.rmSync(file, { force: true });
+    else await sleep(100);
+  }
+}
+
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
+
+// Resolves once every event that the in-process fake has sent so far has reached the
+// handlers on `conn`, and every command sent on `conn` before it has reached the fake:
+// the fake reads commands in order and writes events and replies to one stream, in
+// order.
+function flush(conn) {
+  return conn.send('Browser.getVersion');
+}
 
 // Polls until `pred` holds; throws at the timeout, so a test that waited for something
 // that never happened fails there rather than on the assertion after it.
@@ -200,15 +284,20 @@ function request({ socketPath, method = 'GET', path: p = '/health', body, timeou
   });
 }
 
-// Spawns the real daemon against the fake browser on a temp socket; resolves once
-// /health answers. `env` overrides the child's environment.
-async function spawnDaemon({ env = {} } = {}) {
+// Resolves with a daemon running against the fake browser on a temporary socket,
+// after /health answers. The child's PATH contains only node and the recording
+// desktop tools, so a run under the human's own user doesn't reach her desktop.
+// `env` overrides the child's environment. `record`, when supplied, initializes the
+// browser record as a previous daemon would have left it.
+async function spawnDaemon({ env = {}, record } = {}) {
   const dir = tmpDir('claudesurf-daemon');
   const socketPath = path.join(dir, 'cs.sock');
   const profile = path.join(dir, 'profile');
+  if (record) fs.writeFileSync(path.join(dir, 'cs.browser.json'), JSON.stringify(record));
   const child = spawn(process.execPath, [path.join(SERVER_DIR, 'daemon.js')], {
     env: {
       ...process.env,
+      PATH: toolBin(dir),
       CLAUDESURF_SOCKET: socketPath,
       CLAUDESURF_PROFILE_DIR: profile,
       CLAUDESURF_POLICY_FILE: writeAllowlist(dir, ['fake.test', 'frame.test']),
@@ -330,4 +419,4 @@ async function liveBrowser({ headless = true, allow } = {}) {
   };
 }
 
-module.exports = { silentLog, modesIgnored, recordingLog, tmpDir, tmpSocket, setEnv, withEnv, isolatedPaths, fakeSession, navigatedSession, handleOpened, readPayload, refsIn, markedRefs, sleep, waitFor, request, spawnDaemon, mockDaemon, callBridge, liveBinary, liveBrowser, FAKE_CHROME };
+module.exports = { holdDisplay, silentLog, modesIgnored, recordingLog, tmpDir, tmpSocket, setEnv, withEnv, isolatedPaths, fakeSession, frameAt, navigatedSession, failure, handleOpened, readPayload, refsIn, markedRefs, fakeTools, readToolLog, sleep, flush, waitFor, request, spawnDaemon, mockDaemon, callBridge, liveBinary, liveBrowser, FAKE_CHROME, FAKE_TOOLS };

@@ -8,8 +8,8 @@ const { renderRegion, RenderError, DocumentChangedError } = require('./region');
 const { BLOCK_CHARS } = require('./overlays');
 const retained = require('./retained');
 const { diffLines, formatDiff } = require('./diff');
-const { TimeoutError, ConnectionClosedError } = require('./cdp');
-const { OutcomeError } = require('./action-support');
+const { TimeoutError } = require('./cdp');
+const { OutcomeError, pipeClosedOrTabGone } = require('./action-support');
 
 // The edit count past which a diff gives up and says how much differs instead.
 const MAX_EDITS = 1_000;
@@ -100,7 +100,7 @@ function untracked(reason, since) {
 // exception's text, which a page can shape, goes to the journal and stays out of the
 // summary's line.
 function failed(e, { sessions, session, t, scope, since }) {
-  if (e instanceof ConnectionClosedError || sessions.conn.closed || sessions.target(t.targetId) !== t) throw e;
+  if (pipeClosedOrTabGone(sessions, t, e)) throw e;
   // The retained render's scope is gone: its ref no longer resolves, or its frame is gone.
   if (e instanceof OutcomeError && !e.unreadable) {
     retained.drop(session, t);

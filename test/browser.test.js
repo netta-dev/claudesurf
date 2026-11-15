@@ -15,7 +15,7 @@ function fakeLaunch(profileDir, env = {}) {
   return browser.launch({ binary: FAKE_CHROME, profileDir, env, log: silentLog });
 }
 
-test('launch completes the handshake and writes the record; the record is cleared when the pipe closes', async (t) => {
+test('launch completes the handshake and writes the record; the record stays when the pipe closes, and the next launch overwrites it', async (t) => {
   const { profileDir, record } = isolate(t);
   const log = { ...silentLog, info: (m) => log.lines.push(m), lines: [] };
   const { conn, child } = await browser.launch({ binary: FAKE_CHROME, profileDir, env: {}, log });
@@ -28,8 +28,11 @@ test('launch completes the handshake and writes the record; the record is cleare
   } finally {
     conn.close();
   }
-  await waitFor(() => !fs.existsSync(record));
-  assert.ok(!fs.existsSync(record), 'record cleared when the pipe closes');
+  await waitFor(() => child.exitCode !== null || child.signalCode !== null);
+  assert.strictEqual(JSON.parse(fs.readFileSync(record, 'utf8')).pid, child.pid, 'the record stays when the pipe closes');
+  const next = await browser.launch({ binary: FAKE_CHROME, profileDir, env: {}, log: silentLog });
+  t.after(() => next.conn.close());
+  assert.strictEqual(JSON.parse(fs.readFileSync(record, 'utf8')).pid, next.child.pid, 'the next launch overwrites the record');
 });
 
 test('enableTargets sends a flattened, paused auto-attach for page and iframe targets, then download denial', async () => {
@@ -66,17 +69,22 @@ test('any other pre-handshake exit is a BrowserError carrying stderr', async (t)
   });
 });
 
-test('reapOrphan clears a record whose process is gone', async (t) => {
+test('reapOrphan finds nothing without a record', async (t) => {
+  isolate(t);
+  assert.deepStrictEqual(await browser.reapOrphan(silentLog), { found: false, reaped: false });
+});
+
+test('reapOrphan finds and clears a record whose process is gone', async (t) => {
   const { record } = isolate(t);
   browser.writeRecord({ pid: 2 ** 22 - 7, startTime: '1' });
-  assert.strictEqual(await browser.reapOrphan(silentLog), false);
+  assert.deepStrictEqual(await browser.reapOrphan(silentLog), { found: true, reaped: false });
   assert.ok(!fs.existsSync(record));
 });
 
-test('reapOrphan ignores a live pid whose start time differs', async (t) => {
+test('reapOrphan finds a record of a live pid whose start time differs, and clears it without a kill', async (t) => {
   const { record } = isolate(t);
   browser.writeRecord({ pid: process.pid, startTime: 'not-this-process' });
-  assert.strictEqual(await browser.reapOrphan(silentLog), false);
+  assert.deepStrictEqual(await browser.reapOrphan(silentLog), { found: true, reaped: false });
   assert.ok(!fs.existsSync(record), 'stale record cleared');
 });
 
@@ -85,7 +93,7 @@ test('reapOrphan terminates a live fake matching the record', async (t) => {
   const child = spawn(process.execPath, [FAKE_CHROME], { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
   await sleep(200);
   browser.writeRecord({ pid: child.pid, startTime: browser.processStartTime(child.pid) });
-  assert.strictEqual(await browser.reapOrphan(silentLog), true);
+  assert.deepStrictEqual(await browser.reapOrphan(silentLog), { found: true, reaped: true });
   await waitFor(() => child.exitCode !== null || child.signalCode !== null);
   assert.ok(!fs.existsSync(record));
 });

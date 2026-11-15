@@ -9,7 +9,13 @@
 // its children, which a read walks rather than the element.
 function claudesurfState(el) {
   function hiddenByAria(node) {
-    for (let n = node; n; n = n.parentElement || (n.getRootNode() instanceof ShadowRoot ? n.getRootNode().host : null)) {
+    // The test reads the node type rather than the class, since the nodes of a
+    // same-origin frame's document belong to that frame's realm.
+    const host = (n) => {
+      const root = n.getRootNode();
+      return root.nodeType === Node.DOCUMENT_FRAGMENT_NODE && root.host ? root.host : null;
+    };
+    for (let n = node; n; n = n.parentElement || host(n)) {
       if (n.getAttribute && n.getAttribute('aria-hidden') === 'true') return true;
     }
     return false;

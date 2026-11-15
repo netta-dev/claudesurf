@@ -1,17 +1,11 @@
-// Serves the fixture pages to the live tests over http, since navigate accepts http(s)
-// only. Two listeners: one on 127.0.0.1 and one on 127.0.0.2, which Chrome treats as
-// another site, so a frame served from it runs in its own process and gets a target of
-// its own. `__CROSS_SITE__` in a fixture is replaced with the cross-site base as the
-// page is served, so a fixture can name a port only known at run time.
-//
-// Routes: /download answers with Content-Disposition: attachment; /slow answers a form
-// post after a delay; /data.json a JSON document; /page.pdf a one-page PDF;
-// /bulk.html?n=<n> a page whose prose is longer than the per-frame cap on a read;
-// /redir?to=<url> a 302 to that URL; /sw.js the service worker that worker.html
-// registers, which answers /sw-only itself, a path that this server answers 404; /delay?ms=<n> a JSON
-// document after n milliseconds, 1,000 by default and at most 30,000; /busy.json a
-// JSON response that never ends; /no-content a 204, to any method. close() destroys the
-// open connections, so a response that never ends doesn't hold the test process open.
+// This server exposes live-test fixtures over HTTP because navigate accepts only
+// http(s) URLs. The listeners on 127.0.0.1 and 127.0.0.2 act as separate sites so
+// Chrome gives cross-site frames their own processes and targets.
+// Fixtures use `__CROSS_SITE__` for the second listener's base URL and runtime port.
+// worker.html's service worker answers /sw-only itself; this server answers 404 there.
+// `served.site` and `served.cross` record requested paths; `served.aborted` records
+// responses that the client closed before completion.
+// close() destroys open connections so unfinished responses don't hold tests open.
 
 const http = require('http');
 const fs = require('fs');
@@ -49,9 +43,115 @@ self.addEventListener('fetch', (event) => {
 });
 `;
 
-function handler(crossBase) {
+function html(res, body, headers = {}, status = 200) {
+  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', ...headers });
+  res.end(`<!doctype html>${body}`);
+}
+
+function json(req, res, body, { cors = false, credentials = true } = {}) {
+  const headers = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' };
+  if (cors && req.headers.origin) headers['Access-Control-Allow-Origin'] = req.headers.origin;
+  if (cors && credentials && req.headers.origin) headers['Access-Control-Allow-Credentials'] = 'true';
+  res.writeHead(200, headers);
+  res.end(JSON.stringify(body));
+}
+
+let counted = 0;
+
+const CAPTURE_ROUTES = {
+  '/': (req, res) => html(res, '<title>Home</title><p>An ordinary page.</p>'),
+  '/challenge': (req, res) => html(res, '<title>Just a moment...</title><p>Checking your browser.</p>', { 'cf-mitigated': 'challenge', 'X-Amzn-Waf-Action': 'captcha' }, 403),
+  '/clears': (req, res) => html(res, "<title>Just a moment...</title><p>Checking your browser.</p><script>setTimeout(() => { location.href = '/'; }, 1000);</script>", { 'cf-mitigated': 'challenge' }, 403),
+  '/csp': (req, res) => html(res, '<title>CSP</title><p>connect-src is self.</p>', { 'Content-Security-Policy': "connect-src 'self'" }),
+  '/long': (req, res, url) => {
+    const chars = Number(url.searchParams.get('chars') || '50000');
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('0123456789'.repeat(Math.ceil(chars / 10)).slice(0, chars));
+  },
+  // The 40,000th UTF-16 unit is the first half of an emoji.
+  '/long-emoji': (req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(`${'x'.repeat(39_999)}${'\u{1F600}'.repeat(10)}`);
+  },
+  '/binary': (req, res, url) => {
+    const bytes = Math.round(Number(url.searchParams.get('mib') || '1') * 1024 * 1024);
+    const type = url.searchParams.get('type');
+    res.writeHead(200, type ? { 'Content-Type': type } : {});
+    res.end(Buffer.alloc(bytes, 0xff));
+  },
+  '/mixed': (req, res) => {
+    res.writeHead(200);
+    res.end(Buffer.concat([Buffer.from('valid text first, '.repeat(100)), Buffer.alloc(4096, 0xff)]));
+  },
+  '/long-partial': (req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(Buffer.concat([Buffer.from('x'.repeat(40_000)), Buffer.from([0xe2, 0x82])]));
+  },
+  '/endless-text': (req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.write('0123456789'.repeat(5_000));
+    const timer = setInterval(() => res.write('y'), 50);
+    res.on('close', () => clearInterval(timer));
+  },
+  '/endless-mixed': (req, res) => {
+    res.writeHead(200);
+    res.write('valid text first, '.repeat(100));
+    const chunk = Buffer.alloc(256 * 1024, 0xff);
+    const more = () => {
+      let room = true;
+      while (room && !res.destroyed) room = res.write(chunk);
+    };
+    res.on('drain', more);
+    const timer = setTimeout(more, 200);
+    res.on('close', () => clearTimeout(timer));
+  },
+  '/untyped': (req, res) => {
+    res.writeHead(200);
+    res.end('héllo, untyped wörld');
+  },
+  // "café" in ISO-8859-1, whose é is the byte 0xE9 that UTF-8 can't decode.
+  '/latin1': (req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=iso-8859-1' });
+    res.end(Buffer.from('café', 'latin1'));
+  },
+  '/typed-text': (req, res, url) => {
+    res.writeHead(200, { 'Content-Type': url.searchParams.get('type') || 'text/plain; charset=utf-8' });
+    res.end('typed text with a charset');
+  },
+  '/px': (req, res, url) => {
+    const size = Number(url.searchParams.get('size') || '100');
+    html(res, `<title>Press and hold</title><div id="px-captcha" style="width:${size}px;height:${size}px;background:#ccc"></div>`);
+  },
+  '/signin': (req, res) => html(res, '<title>Sign in</title><form action="/post" method="post"><label>User <input name="user"></label><label>Password <input type="password" name="pw"></label><button>Sign in</button></form>'),
+  '/otp': (req, res) => html(res, '<title>Verify</title><label>Code <input name="code" autocomplete="one-time-code"></label>'),
+  '/throws': (req, res) => html(res, `<title>Throws</title><script>
+window.hookCalls = 0;
+Error.prepareStackTrace = (error) => { window.hookCalls += 1; return String(error); };
+console.log('hello', { a: 1 });
+console.error('Error: save failed: 500');
+setTimeout(() => { throw new RangeError('boom'); }, 0);
+Promise.reject(new Error('rejected'));
+</script><img src="/missing.png">`),
+  '/cookie': (req, res) => html(res, '<title>Cookie</title><p>Set.</p>', { 'Set-Cookie': ['strict=s1; SameSite=Strict; Path=/', 'sid=abc123; SameSite=Lax; Path=/'] }),
+  '/echo': (req, res) => json(req, res, { cookie: req.headers.cookie || null, origin: req.headers.origin || null }),
+  '/cors-echo': (req, res) => json(req, res, { cookie: req.headers.cookie || null, origin: req.headers.origin || null }, { cors: true }),
+  '/cors-uncredentialed': (req, res) => json(req, res, { origin: req.headers.origin || null }, { cors: true, credentials: false }),
+  '/counted': (req, res) => {
+    counted += 1;
+    res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'max-age=3600' });
+    res.end(`request ${counted}`);
+  },
+  '/post': (req, res) => {
+    req.resume();
+    req.on('end', () => html(res, '<title>Posted</title><p>Thanks.</p>'));
+  },
+};
+
+function handler(crossBase, served, aborted) {
   return (req, res) => {
     const url = new URL(req.url, 'http://x');
+    served.push(url.pathname);
+    res.on('close', () => { if (!res.writableFinished) aborted.push(url.pathname); });
     if (url.pathname === '/download') {
       res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment; filename="fixture.bin"' });
       res.end('binary');
@@ -118,6 +218,11 @@ function handler(crossBase) {
       res.end(onePagePdf());
       return;
     }
+    const routed = CAPTURE_ROUTES[url.pathname];
+    if (routed) {
+      routed(req, res, url);
+      return;
+    }
     const file = path.join(__dirname, path.basename(url.pathname));
     if (!file.endsWith('.html') || !fs.existsSync(file)) {
       res.writeHead(404);
@@ -138,12 +243,14 @@ function listen(server, host) {
 async function serve() {
   const cross = http.createServer();
   const crossBase = await listen(cross, '127.0.0.2');
-  cross.on('request', handler(crossBase));
-  const site = http.createServer(handler(crossBase));
+  const served = { site: [], cross: [], aborted: [] };
+  cross.on('request', handler(crossBase, served.cross, served.aborted));
+  const site = http.createServer(handler(crossBase, served.site, served.aborted));
   const base = await listen(site, '127.0.0.1');
   return {
     base,
     crossBase,
+    served,
     close: () => {
       for (const server of [site, cross]) {
         server.close();

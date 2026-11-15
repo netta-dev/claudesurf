@@ -21,13 +21,13 @@ const { OutcomeError, WORKING_TAB_GONE, safeUrl, cappedText, cappedUrl } = requi
 // The most Blocked: and Blocked by the page: lines that print, the call's own first.
 const MAX_BLOCKED_LINES = 5;
 
-// Returns { envelope, carried, url } for a handler's `result`, { head, body?, images?,
-// outcome?, blocked? }. A non-empty `blocked`, the refusals that the call led to, makes
-// the outcome needs_confirmation; otherwise it is result.outcome, 'unsettled' or absent
-// for success. `notes` are ensureWithNotes's, joined by the notes that the session took
-// during the slot and one per dismissed dialog. `carried` lists every refusal that the
-// response took, printed or not, each with `own`; `url` is the working tab's as the
-// registry holds it, undefined without one.
+// Returns { envelope, carried, url } for a handler's `result`:
+// { head, body?, images?, outcome?, blocked?, challenge? }.
+// `notes` contains ensureWithNotes's notes. The response adds the session's notes
+// from the queue slot and a note for each dismissed dialog.
+// `carried` includes refusals incorporated into the response, including those omitted
+// from the printed lines, with an `own` flag on each.
+// `url` is the working tab's URL from the registry, or undefined without a working tab.
 function respond(sessions, session, result, { notes = [] } = {}) {
   const dialogs = takeDialogs(sessions, session);
   const own = result.blocked || [];
@@ -38,6 +38,7 @@ function respond(sessions, session, result, { notes = [] } = {}) {
   const images = result.images || [];
   let built;
   if (own.length) built = envelope.needsConfirmation(payload, { notes: merged, acted: !own.every((e) => e.how === 'not started') });
+  else if (result.challenge) built = envelope.needsHuman(payload, { notes: merged, type: result.challenge.type, label: session.name });
   else if (result.outcome === 'unsettled') built = envelope.unsettled(payload, { notes: merged, images });
   else built = envelope.success(payload, { notes: merged, images });
   return { envelope: built, carried: carried(own, rest.entries), url: workingUrl(sessions, session) };
@@ -74,6 +75,8 @@ function blockedLine(entry, own) {
     what = `the tab reached ${url} without a request the gate could see, so it ${entry.how === 'closed' ? 'was closed' : 'went to about:blank'}`;
   } else if (entry.kind === 'new tab') {
     what = entry.how === 'not started' ? `a new tab to ${url} (not opened)` : `a new tab to ${url}, closed`;
+  } else if (entry.kind === 'fetch') {
+    what = `fetch of ${url} (not sent)`;
   } else {
     what = `navigation to ${url}${entry.how === 'not started' ? ' (not started)' : ''}`;
   }

@@ -7,7 +7,7 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const navigation = require('../../server/navigation');
 const { Snapshot, resolveScope } = require('../../server/snapshot');
-const { renderUnit } = require('../../server/render');
+const { renderUnit, linksIndex } = require('../../server/render');
 const { LABEL_MAX } = require('../../server/action-support');
 const { liveBinary, liveBrowser, markedRefs } = require('../helpers');
 const { serve } = require('../fixtures/serve');
@@ -399,8 +399,10 @@ test('a line separator in a name is collapsed, so every marker it reaches stays 
   await open('render.html');
   const { markdown } = await render();
   assert.match(markdown, /\[first second\]\(\/separator\)\[e\d+\]/, 'the name a link falls back to for its text');
+  assert.match(markdown, /\[third fourth\]\(\/nel\)\[e\d+\]/, 'and U+0085 there');
+  assert.match(markdown, /\[seventh eighth\]\(\/nel-text\)\[e\d+\]/, "and in a link's own text, which the page script collapses");
   assert.match(markdown, /\[e\d+ combobox "Two-line option" = "plain" \(collapsed\) \(options: first second, second\)\]/, 'and the option name the value list prints unquoted');
-  assert.ok(!markdown.includes(' '), 'the separator Chrome hands through reaches no line of the payload');
+  assert.ok(!markdown.includes('\u2028') && !markdown.includes('\u0085'), 'neither break that Chrome hands through reaches a line of the payload');
 });
 
 test("an element the page stamped with a ref of the daemon's renders as the prose it is", { skip }, async () => {
@@ -501,6 +503,28 @@ test('links=index leaves the ref in the prose and returns the URLs keyed by it',
   const dup = links.filter((link) => link.url === `${site.base}/dup`);
   assert.strictEqual(dup.length, 2, 'both refs point at the one URL, absolute');
   assert.ok(links.some((link) => link.url === 'https://example.test/elsewhere'));
+});
+
+test("a link's target prints alike inline and on its index line, a run of whitespace that the parser keeps in an opaque path included", { skip }, async () => {
+  await open('render.html');
+  const hrefs = [['Spaced mail', 'mailto:a  b@x.test'], ['Spaced script', 'javascript:void(0);  x\u0085y']];
+  await sessions.callInWorld(session.workingTargetId, `function (hrefs) {
+    for (const [text, href] of hrefs) {
+      const link = document.createElement('a');
+      link.textContent = text;
+      link.setAttribute('href', href);
+      document.querySelector('main').appendChild(link);
+    }
+  }`, [hrefs]);
+  const inline = await render();
+  const index = linksIndex([await render({ links: 'index' })]).text.split('\n');
+  const expected = { 'Spaced mail': 'mailto:a%20%20b@x.test', 'Spaced script': 'javascript:void%280%29;%20%20x%C2%85y' };
+  for (const [text, target] of Object.entries(expected)) {
+    const marker = inline.markdown.match(new RegExp(`\\[${text}\\]\\(([^)]*)\\)\\[(e\\d+)\\]`));
+    assert.ok(marker, `${text}:\n${inline.markdown}`);
+    assert.strictEqual(marker[1], target, `${text}: the marker keeps both spaces and encodes U+0085 as the parser does`);
+    assert.ok(index.includes(`[${marker[2]}] ${target}`), `${text}: the index line prints the same URL:\n${index.join('\n')}`);
+  }
 });
 
 test('the auto chain takes Readability on a readerable document and the body on one it declines', { skip }, async () => {

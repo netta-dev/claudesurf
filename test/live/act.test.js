@@ -17,7 +17,7 @@ const input = require('../../server/input');
 const navigation = require('../../server/navigation');
 const read = require('../../server/read');
 const { tabs } = require('../../server/tabs');
-const { liveBinary, liveBrowser, readPayload, refsIn, sleep } = require('../helpers');
+const { holdDisplay, liveBinary, liveBrowser, readPayload, refsIn, sleep } = require('../helpers');
 const { serve } = require('../fixtures/serve');
 
 const skip = liveBinary() ? false : 'no Chrome binary found';
@@ -232,7 +232,7 @@ test('history goes back, forward, and reloads, and back from the first web page 
   await h.open(session, 'other');
 
   const back = await h.history(session, 'back');
-  assert.match(back.head, new RegExp(`^URL: ${literal(form)}\nTitle: Form fixture\nNavigated: yes$`), back.head);
+  assert.match(back.head, new RegExp(`^URL: ${literal(form)}\nTitle: Form fixture\nChallenge: sign-in — a password field\nNavigated: yes$`), back.head);
   assert.deepStrictEqual(await refusal(h.history(session, 'back')), { outcome: 'error', message: 'The working tab has no earlier web page to go back to; navigate instead' });
   const forward = await h.history(session, 'forward');
   assert.match(forward.head, new RegExp(`^URL: ${literal(other)}\nTitle: Other\nNavigated: yes$`), forward.head);
@@ -370,7 +370,9 @@ describe('headful', { skip: headful }, () => {
   let hf;
   let headed;
   let parked;
+  let release;
   before(async () => {
+    release = await holdDisplay();
     parked = activeWindow();
     headed = await liveBrowser({ headless: false, allow: ALLOW });
     hf = over(headed);
@@ -378,6 +380,7 @@ describe('headful', { skip: headful }, () => {
   after(async () => {
     if (headed) await headed.close();
     if (parked !== null) activate(parked);
+    if (release) release();
   });
 
   // Resolves with a new session on `page` in a tab that isn't its window's active one:

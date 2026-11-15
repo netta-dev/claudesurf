@@ -74,7 +74,7 @@ async function open({ sessions, gate }, session, url, deadline) {
     fail(envelope.error(UNGATED_TAB));
   }
 
-  const from = { generation: tab.generation, navigations: tab.navigations, sameDocument: tab.sameDocument };
+  const from = { generation: tab.generation, navigations: tab.navigations, sameDocument: tab.sameDocument, downloads: tab.downloads };
   let answer = null;
   try {
     answer = await sessions.send(tab.targetId, 'Page.navigate', { url }, opts);

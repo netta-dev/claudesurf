@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const { Connection } = require('./cdp');
-const { browserRecordPath, GRAPHICAL_VARS } = require('./paths');
+const { browserRecordPath, GRAPHICAL_VARS, dropUnreadableXauthority } = require('./paths');
 
 // A misconfigured environment the human has to fix; renders as setup_error.
 class SetupError extends Error {
@@ -52,10 +52,7 @@ function graphicalEnv(processEnv, requestEnv = {}) {
   if (!picked.DISPLAY && !picked.WAYLAND_DISPLAY) {
     throw new SetupError('No graphical session: neither the daemon nor the request carries DISPLAY or WAYLAND_DISPLAY. Add a drop-in with Environment=DISPLAY=... to the claudesurf unit, or run Claude Code from a desktop session.');
   }
-  if (picked.XAUTHORITY) {
-    try { fs.accessSync(picked.XAUTHORITY, fs.constants.R_OK); } catch { delete picked.XAUTHORITY; }
-  }
-  return picked;
+  return dropUnreadableXauthority(picked);
 }
 
 function launchArgs(profileDir, headless) {
@@ -117,7 +114,6 @@ async function launch({ binary, profileDir, env, headless = false, log }) {
   exited.then(({ code, signal, spawnError }) => {
     if (!spawnError) log.info(`browser pid ${child.pid} exited (${signal || `code ${code}`})`);
   });
-  conn.onClose(() => clearRecord());
   let version;
   try {
     version = await conn.send('Browser.getVersion', {}, { timeout: HANDSHAKE_TIMEOUT_MS });
@@ -170,17 +166,18 @@ function alive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
 
-// Runs at daemon start, before the socket is bound. Resolves true when a browser
-// was reaped; a record whose process is gone or was reused is only cleared.
+// Runs at daemon start, before the socket is bound. Resolves { found, reaped }: whether
+// a record was read, and whether a browser was reaped; a record whose process is gone
+// or was reused is only cleared.
 async function reapOrphan(log) {
   const record = readRecord();
-  if (!record) return false;
+  if (!record) return { found: false, reaped: false };
   const { pid, startTime } = record;
   const same = alive(pid) && processStartTime(pid) === startTime;
   if (!same) {
     log.info(`browser record for pid ${pid} is stale; cleared`);
     clearRecord();
-    return false;
+    return { found: true, reaped: false };
   }
   log.warn(`reaping browser pid ${pid} left by a previous daemon`);
   process.kill(pid, 'SIGTERM');
@@ -188,7 +185,7 @@ async function reapOrphan(log) {
   while (Date.now() < deadline && alive(pid)) await new Promise((r) => setTimeout(r, 100));
   if (alive(pid)) process.kill(pid, 'SIGKILL');
   clearRecord();
-  return true;
+  return { found: true, reaped: true };
 }
 
 module.exports = {

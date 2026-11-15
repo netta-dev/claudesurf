@@ -1,13 +1,10 @@
-// settle.js against the in-process fake: the three signals — counted requests, the
-// document's readyState, and the mutation observer — the quiet window, the budget, and
-// what the Settled: line names when it runs out, and the frame that an input action touched.
-
 const { test } = require('node:test');
 const assert = require('node:assert');
 const input = require('../server/input');
 const requests = require('../server/requests');
+const network = require('../server/network');
 const { settle, settledLine } = require('../server/settle');
-const { navigatedSession, readPayload, refsIn, sleep, waitFor } = require('./helpers');
+const { navigatedSession, readPayload, recordingLog, refsIn, sleep, waitFor } = require('./helpers');
 const { FRAME_URL, oneFrame, attachFrame, silenceFrame } = require('./frame-setup');
 
 const URL = 'http://a.test/';
@@ -318,4 +315,67 @@ test("a probe sent at the budget's end still gets the time to answer, so the lin
     const answer = await settle(sessions, target, { budget: 120 });
     assert.deepStrictEqual([answer.settled, answer.reason], [false, 'the document is still changing'], `run ${i}`);
   }
+});
+
+function spySink(t, { throwsAt = null } = {}) {
+  const calls = [];
+  for (const stage of ['started', 'response', 'ended']) {
+    const original = network.sink[stage];
+    t.after(() => { network.sink[stage] = original; });
+    network.sink[stage] = (target, ...rest) => {
+      calls.push([stage, target.targetId, stage === 'ended' ? rest[1] : undefined]);
+      if (stage === throwsAt) throw new Error(`the sink threw at ${stage}`);
+      return original(target, ...rest);
+    };
+  }
+  return calls;
+}
+
+test("requests.js hands each request's stages to the sink as it ends, and settling's counts come out as they would without it", async (t) => {
+  const { fake, sessions, target, tab } = await setup(t);
+  const calls = spySink(t);
+  const finished = fake.networkRequest(tab, { type: 'Fetch' });
+  const failed = fake.networkRequest(tab, { type: 'XHR' });
+  const hopped = fake.networkRequest(tab, { type: 'Script' });
+  hopped.redirect();
+  await waitFor(() => requests.busy(target).count === 3);
+  finished.finish();
+  failed.finish(true);
+  await waitFor(() => requests.busy(target).count === 1);
+  fake.navigateTarget(tab, 'http://a.test/next');
+  await waitFor(() => requests.busy(target).count === 0);
+  const ends = calls.filter(([stage]) => stage === 'ended').map(([, , how]) => how);
+  assert.deepStrictEqual(ends, ['redirect', 'finished', 'failed', 'ended by a navigation']);
+  assert.strictEqual(calls.filter(([stage]) => stage === 'started').length, 4, 'a redirect hop starts a record of its own');
+  assert.strictEqual(calls.filter(([stage]) => stage === 'response').length, 1, 'only the finished request had a response');
+  assert.deepStrictEqual(await settle(sessions, target, { budget: 1000 }), { settled: true });
+});
+
+test("a sink that throws at a commit and at a frame's attach leaves settling's counts, the backstop's refusal, and the frame's registration in place", async (t) => {
+  const { fake, sessions, session, target, tab, log } = await setup(t, { allow: ['a.test'], log: recordingLog() });
+  const calls = spySink(t, { throwsAt: 'ended' });
+  fake.networkRequest(tab, { type: 'Script', url: 'http://a.test/old.js' });
+  fake.networkRequest(tab, { type: 'Document', url: 'http://frame.test/', frameId: `T${fake.nextTarget}` });
+  await waitFor(() => requests.busy(target).count === 2);
+  fake.createTarget({ type: 'iframe', parent: tab, url: 'http://frame.test/' });
+  await waitFor(() => sessions.frameTargets(target.targetId).length === 1);
+  assert.strictEqual(requests.busy(target).count, 1, "the frame's document request ended at its attach");
+  fake.emit('Page.frameNavigated', { frame: { id: tab.targetId, url: 'http://evil.test/', loaderId: 'restored' }, type: 'BackForwardCacheRestore' }, tab.sessionId);
+  await waitFor(() => session.refusals.some((e) => e.kind === 'restore'));
+  assert.strictEqual(requests.busy(target).count, 0, "the old document's request ended at the commit");
+  assert.strictEqual(target.url, 'http://evil.test/', 'the commit was recorded');
+  assert.deepStrictEqual(calls.filter(([stage]) => stage === 'ended').map(([, , how]) => how), ['continued in a cross-site frame', 'ended by a navigation']);
+  assert.strictEqual(log.lines.warn.filter((l) => /network capture of T\d+ at ended: Error: the sink threw at ended/.test(l)).length, 2, 'each throw is logged at warn');
+});
+
+test("nothing reaches the sink for a tab whose arming didn't go out", async (t) => {
+  const { fake, target, tab } = await setup(t);
+  const calls = spySink(t);
+  target.armingSent = false;
+  const request = fake.networkRequest(tab, { type: 'Fetch' });
+  await waitFor(() => requests.busy(target).count === 1);
+  request.finish();
+  await waitFor(() => requests.busy(target).count === 0);
+  target.armingSent = true;
+  assert.deepStrictEqual(calls, []);
 });

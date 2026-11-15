@@ -1,0 +1,4 @@
+#!/usr/bin/env node
+
+// The recording notify-send of test/fakes/tool.js.
+require('../tool')('notify-send');
