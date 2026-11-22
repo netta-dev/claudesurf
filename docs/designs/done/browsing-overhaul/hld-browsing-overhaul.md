@@ -1,8 +1,8 @@
 # browsing-overhaul
 
 **Last reviewed**: 2026-09-10
-**Status**: Phase 4 complete
-**Companions**: [use cases](../use-cases-browsing-overhaul.md) · [future](../future-claudesurf.md)
+**Status**: Project complete
+**Companions**: [use cases](../../use-cases-browsing-overhaul.md) · [future](../../future-claudesurf.md)
 
 ## Overview
 
@@ -90,6 +90,7 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
   - Generating the nonce after the browser responds means the content predates it, so a page cannot contain the marker and no escaping is needed.
   - Every action's payload is wrapped, not only the reads. An acting result echoes a page-controlled title, a tab list carries page-controlled titles and URLs, and a change summary is page-derived markdown of arbitrary length, so an act-side exemption would leave the largest untrusted payloads bare. A screenshot's image blocks are the one exception, since a delimiter is text; its URL and title lines are wrapped like any other payload.
   - The delimiter makes the boundary between the human's instructions and page content unforgeable. The domain allowlist and the profile's narrow login set do the enforcing.
+  - The daemon escapes page text inside the delimiter so that it can't close a ref marker or forge one. Turndown escapes brackets in prose. The daemon collapses marker fields, headers, and list lines to single lines, escapes their brackets and backslashes, and percent-encodes their URLs. Response bodies from `network` and `fetch` print unescaped.
 
 - **The domain allowlist is the only gate, it lives entirely in the daemon, and it gates document navigation to `http` and `https` hosts.**
   - Classifying a control as destructive from its label misses "Yes, I'm sure" and unlabelled trash icons while firing on every "Submit" and "Confirm". A gate that misfires often enough to be dismissed reflexively is worse than none.
@@ -115,7 +116,7 @@ A pipe rides the browser process's own file descriptors, so isolation becomes pr
 
 - **No tool call blocks waiting on the human, and a challenge reaches her through the desktop.**
   - A challenge returns `needs_human` and the agent ends its turn. A blocking wait would hold the session against a human who has walked away.
-  - `notify-send` carries what is blocking; `xdotool` and `wmctrl` mark which of many open windows to go to, with the urgency hint and the demands-attention state that taskbars read. The mark is X11-only and every binary is optional — a missing one is logged and skipped, so the handoff degrades to chat.
+  - `notify-send` carries what is blocking; `xdotool` and `wmctrl` mark which of many open windows to go to, with the urgency hint and the demands-attention state that taskbars read. The mark is X11-only and every binary is optional — a missing one is logged and skipped, so the handoff degrades to chat. Mutter and Muffin, the GNOME and Cinnamon window managers, refuse to set demands-attention on a window in plain view, so such a window carries the urgency hint alone.
   - Neither steals focus in steady state; window and browser creation still take focus.
 
 > [!example]- **Alternatives considered** — chat alone, MCP elicitation (a non-blocking handoff with a desktop notification)
@@ -259,7 +260,7 @@ The second OS user is the case this serves, and the identical-shape requirement 
 2. `test/daemon-isolation.test.js` — covers the WebSocket peer-uid path this project deletes, and is rewritten against the surviving Unix-socket boundary.
 3. `test/daemon-retry.test.js` — drives `get_page_info`, a tool name the two-tool contract removes, so it is updated to the new surface.
 
-Beyond those, the CDP client, tree pruning, and settle detection need a recorded-protocol fake so most cases run without a live browser.
+Beyond those, the CDP client, tree pruning, and settle detection need a protocol fake so most cases run without a live browser.
 
 **Migration for an existing install.**
 
@@ -334,7 +335,7 @@ Every phase ends with claudesurf usable. Between phases the capability set only 
 
 Two deliberate narrowings sit inside that. Phase 3's domain gate stops an unlisted host that navigated freely in phase 2, which is a reduction in reach. Phase 3's settle detection also returns `unsettled` where an action previously returned success, which is a stricter success criterion rather than a lost capability.
 
-### Phase 1 — Foundation (27%)
+### Phase 1 — Foundation (27%) · 5281dd3
 
 The daemon gains a CDP client, launches and owns a dedicated Chrome, takes over the window, tab, and session management the extension does today, and the extension is deleted. The MCP surface becomes the two tools with the result envelope and the nonce delimiter. Reads return text, title, URL, and a flat list of interactive elements carrying refs, link targets, and labels, so clicking is ref-addressed from the start. `navigate`, `scroll`, `screenshot`, and `info` come across with it, and `max_chars` and `offset` replace today's silent character cut. `navigate` waits for the load event as it does today and accepts `http` and `https` only, ahead of the allowlist; the schemes it now refuses are ones today's reads already fail on.
 
@@ -346,12 +347,41 @@ Against today, this phase adds buttons and `[role]` controls where reads returne
 4. A fresh profile has no clearance cookies, so login walls and challenges come up more often than they do today, while detection and the desktop handoff arrive in phase 4. Until then the agent reports a page it cannot get past and the human clears it in the window directly.
 
 **Key decisions:**
-- **The phase lands as a named sequence, not one commit.** Transport and browser lifecycle first, then session windows and targets, then the tool contract, then the read and click path — each verifiable before the next. The alternative, splitting transport from contract into two phases, would need a throwaway adapter serving six doomed tools over CDP.
-- **The extension is deleted in the same commit that completes the CDP path.** Deleting it earlier would leave the tree with no working transport, and the window model is proven before that commit lands, so the cutover has a fallback until it is known to work.
+- **The phase lands as a named sequence, not one commit.** Transport and browser lifecycle land first, then session windows and targets, then the tool contract with the read and click path, then the switch to CDP, and last the extension's deletion; each step is verifiable before the next lands. The alternative, splitting transport from contract into two phases, would need a throwaway adapter serving six doomed tools over CDP.
+- **The extension is deleted in the commit after the switch to CDP.** Deleting it earlier would leave the tree without a working transport, and the switch leaves the extension idle on disk, so the cutover has a fallback until the CDP path is known to work.
 - **This phase's reads come from a flat DOM walk in an isolated world, not the accessibility tree.** Phase 2 replaces the source. What stays fixed across that swap is the action signature and the ref semantics, not the output, which phase 2 changes materially.
 - **Clicks run as a scripted click in the isolated world by default, and `trusted: true` resolves the ref to coordinates and dispatches real pointer events.** A pointer press raises the session window to the front, so the trusted path is opt-in for the handlers that need a genuine event sequence.
 - **The profile directory persists across reboots.** Logins and cleared challenges are the point of a dedicated profile, so it lives in the user's home rather than the runtime directory.
-- **The working tab is identified by recorded target id**, since pinning is gone and the identity tab can no longer be excluded by a flag.
+- **The daemon uses environment overrides to locate the browser and profile and returns `setup_error` when another Chrome holds that profile.** It launches the binary named by `CLAUDESURF_BROWSER`, falling back to the first Chrome or Chromium on `PATH`. It opens the profile at `CLAUDESURF_PROFILE_DIR`, falling back to `$XDG_DATA_HOME/claudesurf/profile`. It accepts any version; the handshake logs it, and the README names the tested one. Chrome signals a held profile with exit code 21 before the handshake.
+- **Chrome launches windowless, with its first-run, default-browser, crash-restore, and keyring prompts suppressed and `navigator.webdriver` cleared; `--enable-automation` stays off.** The pipe alone sets `navigator.webdriver`, and Google sign-in and several other login flows refuse a browser where it is set. Bypassing the keyring keeps saved passwords in the profile beside its cookies.
+- **The CDP client is implemented directly over the pipe, and the daemon's code doesn't depend on any npm package.** The three libraries added in phase 2 run in the page.
+
+> [!info]- **Rationale** — implementing the CDP client directly
+> Framing, correlation, and event routing need little code. A library such as `puppeteer-core` would add a dependency tree to the process that holds the human's sessions and hide the attach and window handling that the daemon needs.
+
+- **A session window opens on its working tab, and every later tab opens from a page already in that window.** The identity tab joins in the background with a distinctive favicon and the session name set by `navigate` as its title. A closed identity tab stays closed until the window is recreated.
+
+> [!info]- **Rationale** — grouping tabs without raising the window
+> `Target.createTarget` can't name a window, and a tab opened by a page lands in that page's window. Reopening a closed identity tab would raise the window for a tab that the human closed on purpose.
+
+- **The daemon launches Chrome under its own graphical environment when that environment has a display, and otherwise under the display variables that the bridge forwards with each request.** The bridge inherits them from Claude Code, so a display drop-in for the unit is optional for either OS user.
+- **A ref stays valid across every read of its document; its document generation advances when the main frame commits a new document.** A same-document navigation such as `pushState` keeps the nodes and so keeps refs, and expiring a ref that the agent read a moment ago would teach it to read before every click.
+- **Page-side code runs from script files under `server/page/` in the isolated world, and every script that judges visibility shares one definition of *hidden*: a failed `checkVisibility`, an empty box, or an `aria-hidden` ancestor, with an offscreen element counting as visible.** The shared definition keeps a read, a click, and phase 2's render in agreement, and `scroll`'s script carries over the extension's heuristic for a site that scrolls a container instead of the window.
+- **Each tool's description indexes every action with its argument names and a one-clause summary, and the tool's schema lists those arguments flat beside `action`.** Validation enforces each action's required arguments; an invalid argument list returns `schema_error` with the action's argument list. A tool's actions must agree on each argument's type, since the flat schema holds one type per argument name.
+
+> [!example]- **Alternatives considered** — a `oneOf` per action
+> A `oneOf` per action would cost more tokens, and clients enforce it unevenly.
+
+- **A full-page screenshot is up to four viewport-height PNG segments clipped with `captureBeyondViewport`, each its own image block.** Clipping leaves the scroll position unchanged. Capture works in a covered or minimized window, though it slows when the working tab isn't its window's active tab.
+
+> [!info]- **Rationale** — splitting full-page screenshots
+> Claude's API downsizes an image whose long edge exceeds about 1,568 px, so one tall image arrives illegible.
+
+- **The daemon dismisses `alert`, `confirm`, and `prompt` alike, and reports each dialog's message inside the wrapped payload.** The message is page text, so the note outside the delimiter names only the dialog type; a `dialog` action for answering dialogs is future work.
+- **The protocol fake models Chrome's targets, windows, and pages and runs in-process or as a child behind the real pipe.** The model is hand-written. Tests that depend on Chrome's behavior run against a live browser. These tests run headless and skip without a browser; window and focus cases run with a browser window on request.
+
+> [!example]- **Alternatives considered** — recorded protocol transcripts
+> Recorded transcripts would break on order and timing changes that a refactor can make harmlessly.
 
 **Key files:**
 - `server/cdp.js` (new — NUL-delimited framing on fds 3 and 4, request correlation, event dispatch, target auto-attach, window creation and grouping, browser lifecycle, orphan reap)
@@ -367,29 +397,9 @@ Against today, this phase adds buttons and `[role]` controls where reads returne
 - `test/cdp.test.js`, `test/envelope.test.js`, `test/dispatch.test.js`, `test/read.test.js` (new); `test/session-identity.test.js` (converted to the runner), `test/daemon-isolation.test.js` (rewritten against the Unix-socket boundary), `test/daemon-retry.test.js` (updated to the new surface)
 - `README.md`, `CLAUDE.md`, `.claude/settings.local.json`, `.claude/context/architecture.md`, `.claude/context/capabilities.md`, `.claude/context/docs.md`, `.claude/context/worktree.md` (modified — all describe the deleted architecture; `worktree.md` additionally documents `CLAUDESURF_DAEMON_PORT`, which the code no longer has)
 
-**Open questions:**
-
-1. How is the browser binary located — a fixed path, a `$PATH` probe, or an environment override — is Chromium acceptable, and what is the minimum version, given the `Accessibility` domain is experimental?
-2. What is the full launch flag set? A fresh profile needs first-run and default-browser suppression at minimum, and `--enable-automation` is deliberately excluded.
-3. Where does the dedicated profile live, and what environment variable overrides it for a worktree daemon?
-4. Is the CDP client hand-rolled over the pipe's NUL-delimited JSON, or does it take a dependency?
-5. Does `Target.createTarget({newWindow: true})` plus `Browser.getWindowForTarget` give enough control to group a session's targets into one window reliably?
-6. Does the pipe alone set `navigator.webdriver`?
-7. Without pinning, how does the human recognize the identity tab, how does it update when the session name changes, and what happens when she closes it?
-8. How do `DISPLAY`, `XAUTHORITY`, and `DBUS_SESSION_BUS_ADDRESS` reach a systemd user unit, given today's launch inherits them from the Claude Code process?
-9. How does the daemon distinguish a launch that handed off to a browser already holding the profile from a launch that crashed, so it can return `setup_error`?
-10. How does the flat walk convert its isolated-world results into a `backendDOMNodeId` per element? The walk yields remote objects, so a naive conversion costs a protocol round trip each, against the cold-start time budget.
-11. How is the document generation counter maintained, and what else invalidates a `backendDOMNodeId`?
-12. How does the flat walk filter invisible elements? It has to, since phase 2's accessibility-tree read filters them and the capability set may not shrink across that boundary.
-13. Where does `content.js`'s scrollable-container heuristic go? Sites that scroll a container rather than the window need it for `scroll`.
-14. How compact can the verb index in the tool description be before the agent starts guessing arguments?
-15. Does full-page capture use `captureBeyondViewport` or scroll-and-stitch, how does it behave on an occluded window, and what caps its output size?
-16. Does dismissing a dialog need to distinguish `confirm` from `prompt`, or is a uniform dismissal with a reported note enough until a page proves otherwise?
-17. What does the recorded-protocol fake look like, and which cases still need a real browser?
-
 ---
 
-### Phase 2 — Structured reads (18%)
+### Phase 2 — Structured reads (18%) · 6e53aba
 
 Reads move onto the accessibility tree for controls and structure, with prose rendered through Turndown in an isolated world — Readability ahead of it when no landmark scopes the page or on request — and controls placed by `backendDOMNodeId`. Output becomes interleaved markdown restricted to main content, deduplicated, visibility-filtered, following child frames, and reporting what it omitted, with `find`, `scope`, article extraction, and link presentation as parameters.
 
@@ -397,6 +407,17 @@ Phase 1's flat walk is replaced as the read's source and kept for the hidden lis
 
 **Key decisions:**
 - **Controls are placed into rendered prose by `backendDOMNodeId`, not by text matching.** Both passes derive from the same nodes, so the correspondence is a lookup.
+- **The daemon uses the tree to classify controls, landmarks, named groups, and frames, and leaves its container and text roles unread, since Turndown renders all structure from the DOM.** A named group or region carries its name in a boundary marker wherever it renders, and a landmark does so when the whole body renders; a generic container named only by `aria-label` loses that name.
+- **`scope=main` tries, in order, the first `main` landmark, an `article` node, and Readability's article when the page appears to contain an article, and renders the body when none applies; the `Scope:` line names which one rendered.** Landmarks come first because Readability drops the infobox and category links that an agent wants on a site like Wikipedia. The same line lists each omitted landmark by ref and control count, so the agent expands one with `scope=<ref>` in a single call.
+- **A control renders inline as a bracketed marker that opens with its ref, `[e13 button "Search" (disabled)]`, and a link keeps markdown's form with the ref after it, `[text](/path)[e1]`.** Role, name, and state come from the tree.
+- **The daemon reads Readability, Turndown, and the GFM plugin unmodified from `node_modules` and evaluates them with the renderer once per isolated world.** Each package ships a build that binds a browser global, so the daemon injects the files as published and `npm outdated` still reports on them; when a file is missing, the daemon returns `setup_error` naming the install command.
+- **Frames at one nesting level render in parallel, each under its own time budget inside the request's, and a frame that runs out renders as `(not readable)` while the rest of the read completes.** Latency on a frame-heavy page went unmeasured; the cap of eight frames over three nesting levels and the per-frame budget limit it.
+- **A control's marker carries its accessible name, so a `<label>` whose text matches that name is left out of the prose, and its text renders once, in the marker.** A `fieldset`'s legend stays as prose inside the group's boundary marker. When the comparison finds no match, the label prints twice.
+
+> [!example]- **Alternatives considered** — naming controls only when labels differ
+> Naming the control only when its name differs from the label would drop the name whenever the comparison erred.
+
+- **`article=true` on a page where Readability doesn't find an article falls back to the scope's render and says `Article: none found`.**
 
 **Key files:**
 - `server/snapshot.js` (new — pruning, control and landmark extraction, scope resolution)
@@ -407,19 +428,9 @@ Phase 1's flat walk is replaced as the read's source and kept for the hidden lis
 - `server/package.json` (modified — Readability, Turndown, and the Turndown GFM plugin, whose browser-global files are injectable as shipped)
 - `test/snapshot.test.js`, `test/render.test.js` (new — recorded trees and pure assembly functions), `test/live/render.test.js` (new — fixture pages through the renderer), `test/read.test.js` (modified — flat-walk assertions replaced)
 
-**Open questions:**
-
-1. Which accessibility roles are pruned as generic containers, and what keeps a container carrying the only accessible name for its subtree?
-2. Is main content identified by accessibility landmark roles, by Readability, or by landmarks with Readability as fallback?
-3. How is an inline ref marker rendered so it collides with neither page content nor the untrusted-content delimiters?
-4. How are Readability and Turndown bundled into sources injectable through `Runtime.evaluate`, and where does that artifact live?
-5. What is the latency across several frame targets on a heavy feed, and which pulls are narrowed into several commands?
-6. How do form field groupings render without the prose pass and the control pass duplicating them?
-7. What happens when Readability finds no article — does the accessibility-tree output stand as the fallback?
-
 ---
 
-### Phase 3 — Acting (20%)
+### Phase 3 — Acting (20%) · 7aa5bbf
 
 The daemon gates by host every route to a new top-level document in a session's working tab and the tabs that its pages opened, ships the `policy` action so approval is expressible, and logs every action with typed text redacted. The identity tab stays outside the gate. Typing, key presses, option select, history, and tab control arrive. Actions wait for the page to settle before returning and report what changed, and `since` returns a delta. Reads render open dialogs, and open menus and messages outside their scope, as blocks ahead of the region.
 
@@ -427,6 +438,26 @@ After this phase the agent has every action except capture and the challenge han
 
 **Key decisions:**
 - **The gate lands with the input actions rather than after them**, so the agent never holds the full action set ungated. Clicking has been available since phase 1, so this is not the first ungated acting — it is the point past which everything else arrives gated.
+- **An allowlist entry is a bare host that covers itself and every subdomain, and an IP address covers itself alone; the daemon inspects the file's metadata before every host check and re-reads it when its modification time or size has changed.** Covering subdomains takes the place of a wildcard form and lets the common `example.com` → `www.example.com` redirect through without a second prompt. One daemon serves every session, so a host that one session saves, or that the human adds by hand, applies to the next check in any session.
+- **The gate checks every route to a new top-level document in a session's tabs, the human's own navigation there included, and a read or an action on the document that a tab already shows runs whatever its host.** That document arrived through the gate or through the human. The daemon can't reliably tell the human's navigation from a page script's, so she browses an unlisted host in a tab of her own.
+- **The gate pauses each session tab's document requests with `Fetch` and refuses one with `Aborted`, which leaves the originating page loaded.** Stopping a load on Chrome's navigation event can come after the request has gone out, and `BlockedByClient` commits Chrome's error page over the page that the agent acted from. Arming only the session's tabs keeps the human's own tabs off the daemon's event loop, and the same arming enables `Network`, so settle detection and phase 4's capture can read its events alongside the gate.
+- **Session tabs bypass service workers and don't prerender, and when a gated tab commits a page from an unlisted host without passing the gate, a backstop sends the tab to `about:blank`, or closes it if the tab is new.** `Fetch` doesn't see a navigation that a service worker answers or that a prerender activates, and a back-forward cache restore commits without a request, so `history` also checks its entry's host before it navigates. As a result, a site's offline pages and its worker-only routes fail to load in a session tab.
+- **A call that causes a gate refusal returns `needs_confirmation` with its result lines intact.** Other refusals print as `Blocked by the page:` on the session's next response. A page-opened tab is closed if the gate refuses it before it loads a web page. The agent reads what happened before retrying. The refused host prints only inside the wrapped payload, since a hostname is page-chosen text.
+
+> [!info]- **Rationale** — retaining results after a gate refusal
+> The call has run, and a click may have submitted a form whose redirect the gate stopped.
+
+- **The action log is `$XDG_STATE_HOME/claudesurf/actions.jsonl`, mode `0600` in a `0700` directory, and the daemon renames it to `actions.jsonl.1` once a record would take it past 10 MiB; typed text is hashed with an HMAC under a key that the daemon generates at startup and keeps in memory.** Anyone holding the log could recover a short password from a plain hash with a dictionary lookup. A failed write logs a warning and the call proceeds, so a full disk doesn't stop every action.
+- **`type` replaces a text field's content: it focuses the field by script, selects everything with a select-all key event, and inserts the text with `Input.insertText`.** The insertion is one trusted input event that carries any Unicode, and a newline in it can't submit a single-line form, which leaves submitting to `press Enter`. A widget that listens only for key events is reached through `press`, and a per-key mode is future work.
+- **The trusted click is the only input action that uses coordinates.** `type` and `select` reach their element by script in its frame's world. The daemon sends key events and inserted text through the page target's session. Chrome routes that input to the focused element, including one inside a frame. Every page and frame target gets focus emulation, so input into a background tab, or into a frame inside one, avoids phase 1's five-second stall. A trusted click still resolves in a background tab, whose layout keeps running, and returns `error` naming the reason for an element that is hidden, lacks a box, or is covered at its centre.
+- **`select` sets a native `<select>` by script, matching an option by its label and then its value, and dispatches `input` and `change`; the agent drives a custom list with clicks, so a read gives each of its options a ref.** The events are untrusted, which most frameworks accept, and a widget that rejects untrusted events needs `click` and `press`.
+- **`press` sends up to 16 space-separated key presses to whatever holds focus and reports where the keys went and, when focus moved, where focus went.** Each press names a key with optional modifiers joined by `+`, as in `Control+Enter`. `press` takes keys alone, so the agent first focuses an element by clicking or typing into it. Keys go to the page when nothing is focused. Focus shows in neither a read nor the change summary, so `Tab` and the arrow keys would otherwise move it unseen.
+- **Settling requires 500 ms of quiet in both network activity and the DOM.** The network check covers document, script, stylesheet, XHR, and fetch requests; the DOM check covers structure and text. An acting call waits up to 5 s for the page to settle, and a fresh read waits up to 2 s. A call that runs out of time returns its full result as `unsettled`. Both budgets shrink to fit what remains of the request's deadline inside the bridge's 35-second timeout.
+
+> [!info]- **Rationale** — checking both network and DOM activity
+> Network quiet alone passes a page whose framework hasn't rendered its data yet, and DOM quiet alone passes a skeleton waiting on a slow request.
+
+- **The change summary is a line diff between the tab's retained render and a fresh render of the page with the same parameters, and `since=true` returns the same diff on request.** The agent sees the change in its reads' vocabulary, refs included, so a control that the action revealed is clickable without a read; a diff of accessibility nodes would miss the text through which a page says "Saved" or "3 results". A summary that can't be measured says so in its `Changed:` line and leaves the call's outcome alone, since the action has already run.
 
 **Key files:**
 1. `server/policy.js` (new — matching, persisted grants, and session once-grants)
@@ -459,30 +490,24 @@ After this phase the agent has every action except capture and the challenge han
 28. `test/policy.test.js`, `test/gate.test.js`, `test/overlays.test.js`, `test/changes.test.js`, `test/respond.test.js`, `test/refusals.test.js`, `test/action-log.test.js`, `test/settle.test.js`, `test/diff.test.js`, `test/keys.test.js`, `test/tabs.test.js`, `test/navigation.test.js`, `test/live/gate.test.js`, `test/live/act.test.js`, and `test/live/settle.test.js` (new)
 29. `test/input.test.js` (modified)
 
-**Open questions:**
-
-1. Does a listed host cover its subdomains, and how is a wildcard expressed?
-2. Does the allowlist gate reads on an already-open page, or only routes to a new document?
-3. Which interception mechanism cancels a navigation before content loads — `Fetch.enable` or navigation cancellation — and how does it coexist with phase 4's continuous network capture?
-4. How is a page-opened target held paused until its first navigation clears the gate, and what does the agent see when it is refused?
-5. How does a session pick up a host another session persisted — re-read per call, or cached with invalidation?
-6. Where does the log live, and does it rotate?
-7. Does typing use `Input.insertText` or per-key `dispatchKeyEvent`? The former is fast; the latter drives editors listening for individual key events.
-8. How are coordinates resolved reliably for a window that is backgrounded and therefore render-throttled, and what happens when an element cannot be brought into view?
-9. Native `<select>` cannot be driven through a synthetic dropdown. What is the mechanism?
-10. What establishes focus for `press`, which takes no ref, and what happens when nothing is focused?
-11. What does a key press accept — a literal such as `Enter`, or chords such as `Control+Enter`?
-12. How is input dispatched into an element inside a child frame target?
-13. Is settling defined by network quiescence, DOM mutation quiescence, or both, and what timeout keeps it inside the remaining transport budget?
-14. Is the diff computed over rendered markdown or over accessibility nodes?
-15. Does the domain gate intercept navigations of attached iframe targets, which phase 2 leaves `Page.enable`d and ungated, or name them as outside the gate?
-16. Which iframe targets get focus emulation, now that `type` and `press` reach into frames and phase 2 sent it to page targets only?
-
 ---
 
-### Phase 4 — Handoff and capture (8%)
+### Phase 4 — Handoff and capture (8%) · 7e0835d
 
 Challenges, login walls, and two-factor prompts are detected, returned as `needs_human`, and surfaced to the desktop by notification and a best-effort urgency hint. Network capture keeps response bodies readable and stores no headers or request bodies; console capture and a page-context fetch carrying the browser's cookies land alongside it. This completes the action inventory.
+
+**Key decisions:**
+- **Detection matches a short, strict list of signals for three types — a bot check, a two-factor code, and a sign-in — and a page that doesn't match any reads as ordinary content.** A CAPTCHA widget counts when its frame's URL matches a listed vendor, whether or not the frame is a target of its own, and only while the widget is visible and unsolved. Broader cues such as `/login` URLs and 401 statuses would fire on every login link and wear out the notification channel.
+- **Detection runs after each `page` read that renders and each acting call, and a challenge that may clear itself gets one wait per document before it counts.** An acting call waits up to 10 s for a check such as Cloudflare's header challenge to pass and reload the page, and the daemon waits up to 3 s for a CAPTCHA widget to clear, so the daemon doesn't notify the human of a check that clears without her.
+- **`needs_human` carries the call's full result and ranks below `needs_confirmation` and above `unsettled`.** The agent can still read the page and act on it, so a false alarm costs one notification and one question. A navigation that the gate stopped leaves the earlier page in place, so the host question comes first.
+- **A handoff lasts from a `needs_human` result until the session's next call other than `policy`.** Closing it clears the window's mark. `policy` leaves it open, since the agent calls it when the human asks it to allow a host partway through her sign-in.
+- **The daemon sends one `needs_human` notification per session, challenge type, and page in 10 minutes, comparing the page's URL by origin and path; each call still returns `needs_human`.** Sign-in and challenge retries change the query string on each attempt.
+- **The urgency hint marks the browser's X window whose title starts with the working tab's title, and the daemon skips the mark when no window or more than one matches.** The notification's summary still names the session. Window geometry can't tell two maximized windows apart.
+- **The gate stays in force during a handoff, and when it stops a navigation in the session's tabs, the daemon notifies the human with two ways forward: sign in from a tab of her own, which sits outside the gate and shares the cookies, or ask the agent to allow the host.** Lifting the gate would let any allowed page reach every host by showing a password field. The notices come once per host and at most three times per session in 10 minutes.
+- **Each of a session's tabs keeps its last 500 console entries and its last 500 ended requests, and when the daemon arms a tab, its `Network.enable` call has Chrome keep up to 10 MiB of response bodies per tab and 1 MiB per response.** Phase 3's zero-size buffers were enough for settle detection's counts and left every body evicted. Chrome drops bodies past those caps, and a dropped body prints `(body not kept)`.
+- **Console capture leaves out uncaught exceptions.** Chrome 157 reports them only through the `Runtime` domain, which page script can detect, and the daemon keeps `Runtime` off.
+- **`fetch` sends a GET from the working tab's isolated world as the page's own script would: with its cookies, under its CORS rules and content security policy, and without following a redirect.** A cross-origin fetch succeeds only when the server allows the page's origin; otherwise the agent navigates to that origin and fetches there. A followed redirect would carry the request and its cookies to a host that the gate never checked.
+- **`console` and `network` take an `after` cursor over numbers from one daemon-wide counter, and a request takes its number when it ends.** `page`'s `since` is a boolean and one tool's schema carries one type per argument name, so the cursor needs a name of its own. Assigning numbers when requests end lets a read with an earlier cursor include the outcomes of requests that were still in flight when that cursor was returned.
 
 **Key files:**
 - `server/challenge.js`, `server/page/detect.js`, and `server/page/visible.js` (new — detection), `server/handoff.js` (new — the open handoff and its notifications), `server/notify.js` (new — notification and urgency hint)
@@ -490,17 +515,6 @@ Challenges, login walls, and two-factor prompts are detected, returned as `needs
 - `server/daemon.js` (modified — the handoff's opening and closing, startup announcement, the new handlers), `server/act-result.js` and `server/read.js` (modified — detection), `server/arming.js` (modified — capture enablement and buffer sizes), `server/requests.js` (modified — the hand-over to capture)
 - `server/dispatch.js`, `server/envelope.js`, `server/respond.js`, `server/gate.js`, `server/sessions.js`, `server/browser.js` (modified)
 - `test/challenge.test.js`, `test/handoff.test.js`, `test/notify.test.js`, `test/network.test.js`, `test/console-capture.test.js`, `test/fetch.test.js`, `test/live/capture.test.js`, `test/live/challenge.test.js` (new)
-
-**Open questions:**
-
-1. What are the detection signals, given a turnstile is a child frame target, and what does a false positive cost the agent?
-2. How is the browser window located for the urgency hint, and what is the fallback when it cannot be found?
-3. How are repeated detections on one page rate-limited so the notification channel stays credible?
-4. What buffer cap balances usefulness against memory held for an instrumented target?
-5. How does a page-context fetch reach a cross-origin URL — a target on that origin first, or through the protocol directly?
-6. The gate stops the human's own navigation in a session tab as it stops the page's. How does a handoff proceed when clearing a login wall takes her through a sign-in host that the list does not name?
-7. What buffer sizes does capture pass to `Network.enable`, which the acting phase sends to every session tab with both buffers at zero for settle detection?
-8. What do `console` and `network` call their cursor, given that `page`'s `since` is a boolean and one tool's schema carries one type per argument name?
 
 ---
 
