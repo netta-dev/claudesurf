@@ -123,10 +123,10 @@ test("the tools' environment is the daemon's, plus each graphical variable the d
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const readable = path.join(dir, 'auth');
   fs.writeFileSync(readable, '');
-  const daemon = { PATH: '/bin', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/daemon-bus', HOME: '/home/z' };
+  const daemon = { PATH: '/bin', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/daemon-bus', HOME: '/home/you' };
   const request = { DISPLAY: ':1', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/bridge-bus', XAUTHORITY: readable, PATH: '/evil' };
   assert.deepStrictEqual(toolEnv(daemon, request), {
-    PATH: '/bin', HOME: '/home/z', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/daemon-bus', DISPLAY: ':1', XAUTHORITY: readable,
+    PATH: '/bin', HOME: '/home/you', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/daemon-bus', DISPLAY: ':1', XAUTHORITY: readable,
   }, "notify-send keeps the daemon's bus while xdotool takes the bridge's DISPLAY");
   assert.deepStrictEqual(toolEnv(daemon, { DISPLAY: ':1', XAUTHORITY: path.join(dir, 'missing') }), { ...daemon, DISPLAY: ':1' });
   assert.deepStrictEqual(toolEnv({ ...daemon, DISPLAY: ':0' }, { DISPLAY: ':1' }).DISPLAY, ':0', "the daemon's own value wins");

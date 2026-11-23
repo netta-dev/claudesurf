@@ -41,9 +41,9 @@ test('two respawns with neither env var get different ids', () => {
 
 test('same project dir => same id; different dir => different id', () => {
   const base = { CLAUDE_CODE_SESSION_ID: null };
-  const c1 = sessionIdOf({ ...base, CLAUDE_PROJECT_DIR: '/home/z/workspaces/claudesurf' });
-  const c2 = sessionIdOf({ ...base, CLAUDE_PROJECT_DIR: '/home/z/workspaces/claudesurf' });
-  const c3 = sessionIdOf({ ...base, CLAUDE_PROJECT_DIR: '/home/z/other' });
+  const c1 = sessionIdOf({ ...base, CLAUDE_PROJECT_DIR: '/home/you/workspaces/claudesurf' });
+  const c2 = sessionIdOf({ ...base, CLAUDE_PROJECT_DIR: '/home/you/workspaces/claudesurf' });
+  const c3 = sessionIdOf({ ...base, CLAUDE_PROJECT_DIR: '/home/you/other' });
   assert.strictEqual(c1.source, 'CLAUDE_PROJECT_DIR(hash)');
   assert.strictEqual(c1.id, c2.id, 'same dir => same id');
   assert.notStrictEqual(c1.id, c3.id, 'different dir => different id');

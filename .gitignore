@@ -11,3 +11,4 @@ node_modules/
 .claude/worktrees/
 .eng-provisioned
 /local
+.claude/settings.local.json

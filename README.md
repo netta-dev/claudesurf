@@ -4,6 +4,19 @@ An MCP server that lets Claude Code read and act on web pages in a dedicated Chr
 
 Each Claude Code session gets its **own Chrome window**, so Claude browses without taking over the window you are using. Claude's tabs load pages only from hosts on an allowlist you approve, and the daemon logs every call the bridge forwards to it.
 
+## Status
+
+A personal project. It runs on Linux, is tested on X11 only, and comes without support. Fork freely; pull requests aren't accepted.
+
+## Why not Claude in Chrome or Playwright MCP
+
+- **A dedicated browser.** Claude in Chrome acts in your own Chrome, with every site you're signed into. claudesurf's Chrome holds only the sign-ins you place in its profile.
+- **One browser for every session.** One Chrome and one profile serve every Claude Code session, each in its own window. Playwright MCP keeps a profile per project, and two sessions in one project conflict over it.
+- **A domain gate.** The daemon checks each page that Claude's tabs load against the allowlist, redirects and tabs that a page opens included. Playwright MCP's `--allowed-origins` doesn't cover redirects, and its docs say it isn't a security boundary.
+- **Compact results.** A read returns the page as markdown with inline element refs, and each action returns what it changed.
+- **Challenges go to you.** The daemon detects a sign-in, two-factor, or bot check and hands it to you on the desktop with a notification.
+- **Fewer automation tells.** Playwright turns on the DevTools `Runtime` domain in every page, and page script can detect it. claudesurf leaves `Runtime` off. Both clear `navigator.webdriver`.
+
 ## Architecture
 
 ```
@@ -439,3 +452,7 @@ The daemon and each bridge keep the code they started with, apart from what is r
 6. Replace the two systemd units with the one `claudesurf.service`, plus the optional display drop-in.
 7. Sign in again on each site inside the fresh profile.
 8. The allowlist starts empty: approve each host once when Claude asks, or list the hosts you use in the allowlist file first.
+
+## License
+
+0BSD. See `LICENSE`.
