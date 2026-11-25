@@ -10,6 +10,10 @@ Two processes in `server/`: `daemon.js` is one persistent process per OS user th
 
 See `README.md` for setup, systemd, the tool table, and troubleshooting.
 
+## GitHub
+
+`github` is `netta-dev/claudesurf`, public: push `main` by hand, only when the human asks. Commit messages and committed docs go public verbatim; keep users, the hub, the sync, and the NAS out of them.
+
 ---
 
 See `.claude/context/` for workspace context (conventions, capabilities, architecture, docs, etc.).
